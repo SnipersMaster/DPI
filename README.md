@@ -63,12 +63,14 @@ everything else is not touched by this engine at all yet.
 | TCP | RFC 9293 | `dpi_rfc_parser.c` | Checksum validation, options (MSS, window scale, SACK-permitted, timestamps). Per-flow overlap-resolution policy not yet implemented (see gaps below). |
 | TLS (ClientHello / SNI) | RFC 8446, RFC 6066 | `dpi_app_classifier.c` | SNI hostname from the ClientHello `server_name` extension. Does not parse the rest of the handshake (cipher suites, other extensions, certificates). |
 | RADIUS | RFC 2865, RFC 2866 | `dpi_radius_parser.c` | Packet code, identifier, User-Name, NAS-IP-Address, Calling-Station-ID, Acct-Status-Type. `User-Password` is detected as present but its value is deliberately never extracted (credential handling). |
+| DNS-over-TLS (DoT) | RFC 7858 | `dpi_doh_dot_detector.c` | Structural detection: port 853 + TLS ClientHello shape. Genuine structural signal, same discipline as the VPN detector. |
 
 ### Detected / scored, not fully dissected
 
 | Protocol | File | What it does |
 |---|---|---|
-| QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame. **Does not yet extract SNI from it** — needs a small refactor to hand the decrypted ClientHello (which lacks a TLS record-layer wrapper) to the existing SNI parser. See the file's TODO. |
+| QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame, and now extracts SNI from the enclosed ClientHello (wired to `extract_sni_from_clienthello_body()`, which was split out of the TLS-over-TCP SNI parser specifically because QUIC's CRYPTO frame has no TLS record-layer wrapper — RFC 9001 S4.1.3). Logic cross-checked against RFC 9001's own pseudocode line-by-line; **not yet validated against RFC 9001 Appendix A.2's byte-exact test vectors** — those are two different levels of confidence, see the file header. |
+| DNS-over-HTTPS (DoH) | `dpi_doh_dot_detector.c` | No structural fingerprint exists — DoH is indistinguishable from ordinary HTTPS at the wire level. Detection is entirely SNI-based, matching against `domain_rules.ini`'s `[dns_over_https]` category. This is stated plainly rather than implying a cleverer detection method exists. |
 | WireGuard | `dpi_vpn_detector.c` | Fingerprints handshake message types/sizes to produce a VPN-likelihood score. Does not parse WireGuard's actual handshake cryptographic fields or transport data. |
 | OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. |
 | IKE / IPsec (IKEv1/IKEv2) | `dpi_vpn_detector.c` | Validates the ISAKMP header shape and version for a VPN-likelihood score. No payload/SA parsing. |
@@ -115,13 +117,14 @@ than a growing special case inside one function.
 | `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant |
 | `dpi_rfc_parser.c` | No | No | Fragment reassembly cache has no timeout eviction or memory ceiling yet; TCP overlap-resolution policy is stated but lives in a not-yet-built flow-reassembly layer |
 | `dpi_app_classifier.c` | No | No | JA3 fallback is stubbed, not implemented |
-| `dpi_domain_rules_loader.c` | No | No | Reload swap is not thread-safe for the multi-core DPDK worker yet (noted in-code) |
-| `domain_rules.ini` | N/A | No | Seed list from general knowledge, not live-verified; will have stale/missing entries |
+| `dpi_domain_rules_loader.c` | No | No | Reload swap is now a lock-free atomic pointer exchange with a bounded 4-slot grace-period retirement list (not full RCU/hazard pointers — appropriate for infrequent config-file reloads, not a general-purpose concurrent data structure pattern) |
+| `domain_rules.ini` | N/A | No | Seed list from general knowledge, not live-verified; will have stale/missing entries. ~435 rules across 21 categories including `[dns_over_https]` |
 | `dpi_dga_detector.c` | No | No | Weights are literature-informed starting points, not tuned against a labeled dataset |
 | `dpi_vpn_detector.c` | No | No | Byte offsets for WireGuard/IKE unverified against real captures; largely blind to obfuscated/VPN-over-TLS traffic by design |
+| `dpi_doh_dot_detector.c` | No | No | DoT structural detection unverified against real captures; DoH detection is inherently limited to SNI-list matching (no structural fallback exists) |
 | `dpi_dissector_registry.c` | No | No | Framework only — O(n) dispatch noted as a possible future bottleneck at very high dissector counts |
 | `dpi_radius_parser.c` | No | No | Otherwise structurally complete for the core RFC 2865 fields covered |
-| `dpi_quic_parser.c` | No | No | **SNI extraction not wired up yet** (see above); no CRYPTO frame reassembly across multiple packets |
+| `dpi_quic_parser.c` | No | No | SNI extraction now wired end-to-end; logic cross-checked against RFC 9001 pseudocode but not run against the RFC's byte-exact test vectors; packet-number reconstruction is simplified (correct for a connection's first Initial packet only, see file header); no CRYPTO frame reassembly across multiple packets |
 
 ## Build order (once you have real dev headers and hardware)
 
@@ -151,20 +154,32 @@ reference/prototype stage but not for a maintained codebase.
 
 ## Suggested next steps, roughly in priority order
 
+**Done in this pass** (previously items 3 and 4 below): the QUIC → SNI
+handoff is wired up, and the domain-rules reload path is now a
+lock-free atomic swap with bounded grace-period retirement. RADIUS,
+QUIC, and DoT/DoH detection were also added since the original version
+of this list.
+
 1. **Compile everything against real dev headers** and fix whatever
    the compiler catches that a read-through couldn't (this has never
-   been through a compiler).
+   been through a compiler — that remains true for every file here).
 2. **Validate the QUIC module against RFC 9001 Appendix A.2's published
-   test vector** before anything else touches it — that's the standard
-   way to confirm a from-scratch crypto path is correct.
-3. **Wire up the QUIC → SNI handoff** (refactor `extract_sni()` to
-   separate record-header parsing from ClientHello-body parsing).
-4. **Make the domain-rules reload path thread-safe** (atomic pointer +
-   deferred free) before using it inside the multi-core DPDK worker.
-5. **Build a real flow-reassembly layer** on top of `dpi_rfc_parser.c`
+   test vector.** The module's *logic* has been cross-checked against
+   the RFC's own pseudocode section by section, but that is not the
+   same as confirming it produces byte-exact correct output against a
+   known input — that still needs to happen before this touches real
+   traffic.
+3. **Build a real flow-reassembly layer** on top of `dpi_rfc_parser.c`
    to actually implement the TCP overlap-resolution policy, rather than
    parsing individual segments in isolation.
-6. **Fuzz each dissector independently** (AFL++/libFuzzer), per the
+4. **Fuzz each dissector independently** (AFL++/libFuzzer), per the
    very first security checklist in this project — especially
    `dpi_rfc_parser.c` and `dpi_quic_parser.c`, since they parse the
    most attacker-influenced structure.
+5. **Add IPv6 support.** Flagged in the protocol table above as the
+   most significant coverage gap — the entire engine is IPv4-only
+   right now.
+6. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`'s
+   structural assumptions against real captures** (WireGuard, OpenVPN,
+   IKE, DoT sessions) — same "logic reviewed, not yet tested" caveat
+   as everything else here.

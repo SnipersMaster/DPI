@@ -16,17 +16,23 @@
  * REQUIRES OpenSSL (libssl-dev). Build:
  *   gcc -O2 -Wall -o dpi_quic_test dpi_quic_parser.c -lssl -lcrypto
  *
- * NOT COMPILED/TESTED against live QUIC traffic or the RFC 9001
- * Appendix A test vectors in this environment (no libssl-dev headers,
- * no network, in the sandbox this was written in). BEFORE trusting
- * this in your lab: RFC 9001 Appendix A.2 publishes a full worked
- * example (client Initial packet, DCID 0x8394c8f03e515708, with every
- * intermediate key and the final encrypted packet bytes). Feed that
- * exact test vector through this code and confirm you get the
- * published plaintext ClientHello back out, byte for byte, before
- * pointing this at real traffic. This is standard practice for any
- * hand-built crypto path — self-test against the spec's own vectors
- * first, always.
+ * VALIDATION STATUS: the logic in this file has been cross-checked
+ * line-by-line against RFC 9001's own pseudocode (S5.2 initial secrets,
+ * S5.3 AEAD/nonce/AAD construction, S5.4.1-5.4.3 header protection) —
+ * salt value, label lengths, AAD boundaries, and the sample-offset
+ * formula all match the spec text. This is NOT the same as validation
+ * against byte-exact test vectors — RFC 9001 Appendix A.2 publishes a
+ * full worked example (DCID 0x8394c8f03e515708) specifically for this
+ * purpose, and this code has not yet been run against those exact
+ * bytes. Do that before trusting this on real traffic.
+ *
+ * KNOWN SIMPLIFICATION: packet number reconstruction here just uses
+ * the truncated bytes directly as the value, not the full RFC 9000
+ * S17.1 algorithm (which reconstructs relative to the largest
+ * previously-acknowledged packet number in that space). This is
+ * correct for a connection's first Initial packet — the case that
+ * matters for SNI extraction — but would need the real algorithm for
+ * general-purpose QUIC packet handling beyond the first packet.
  *
  * -------------------------------------------------------------------
  * WHY OPENSSL AND NOT HAND-ROLLED AES/HKDF
@@ -401,23 +407,53 @@ static void quic_dissect(const uint8_t *payload, uint16_t len,
                 return;
             }
 
-            /* Hand off to the existing TLS ClientHello/SNI parser —
-             * extract_sni() from dpi_app_classifier.c expects a TLS
-             * record starting with the content-type byte; QUIC's
-             * CRYPTO frame carries the TLS Handshake message directly
-             * WITHOUT a TLS record layer wrapper (QUIC doesn't use
-             * TLS records at all — it has its own framing). Adapt by
-             * calling a ClientHello-body parser directly rather than
-             * the record-layer-aware extract_sni(); exposed here as
-             * a TODO since it requires a small refactor of
-             * extract_sni() to separate "parse TLS record header" from
-             * "parse ClientHello body" so QUIC can skip the former. */
-            dissect_result_add(out, "quic_version", "1");
-            dissect_result_add(out, "crypto_frame_found", "true");
-            dissect_result_add(out, "note",
-                "SNI extraction from this CRYPTO frame requires refactoring "
-                "extract_sni() to parse a bare ClientHello body (no TLS record "
-                "header present in QUIC's CRYPTO frame) — see comment above.");
+            /* Hand off to the existing TLS ClientHello/SNI parser.
+             * extract_sni_from_clienthello_body() (dpi_app_classifier.c)
+             * expects a bare ClientHello body with no TLS record-layer
+             * wrapper — which is exactly what a QUIC CRYPTO frame
+             * contains (RFC 9001 S4.1.3: "QUIC takes the unprotected
+             * content of TLS handshake records as the content of
+             * CRYPTO frames. TLS record protection is not used by
+             * QUIC."). Note this is the ClientHello BODY, not
+             * including the handshake message header (msg_type+length)
+             * that would normally precede it — skip those 4 bytes too. */
+            extern bool extract_sni_from_clienthello_body(const uint8_t *data, size_t len,
+                                                            struct sni_result *out);
+            /* struct sni_result mirrors the definition in
+             * dpi_app_classifier.c — kept in sync manually here since
+             * these files aren't yet split into proper shared headers
+             * (see the README's build-system note). A real build
+             * should replace this with #include "dpi_tls_sni.h". */
+            struct sni_result {
+                bool     found;
+                char     hostname[256];
+                uint16_t hostname_len;
+            };
+
+            if (crypto_len < 4) {
+                dissect_result_add(out, "parse_warning", "crypto_frame_too_short_for_handshake_header");
+                return;
+            }
+            /* Handshake message header inside the CRYPTO frame: msg_type(1) + length(3) */
+            const uint8_t *hs = plaintext + fp;
+            if (hs[0] != 0x01 /* ClientHello */) {
+                dissect_result_add(out, "quic_handshake_msg_type_not_clienthello", "true");
+                return;
+            }
+            uint32_t inner_hs_len = (hs[1]<<16)|(hs[2]<<8)|hs[3];
+            if (4 + inner_hs_len > crypto_len) {
+                dissect_result_add(out, "parse_warning", "clienthello_length_exceeds_crypto_frame");
+                return;
+            }
+
+            struct sni_result sni;
+            if (extract_sni_from_clienthello_body(hs + 4, inner_hs_len, &sni) && sni.found) {
+                dissect_result_add(out, "sni", sni.hostname);
+                dissect_result_add(out, "quic_version", "1");
+            } else {
+                dissect_result_add(out, "quic_version", "1");
+                dissect_result_add(out, "sni_absent", "true");   /* ECH, or no SNI sent */
+            }
             return;
         }
 

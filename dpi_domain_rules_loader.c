@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #define MAX_LINE_LEN      512
 #define MAX_SECTION_LEN   64
@@ -56,8 +57,44 @@ struct domain_rule_table {
     char   path[512];
 };
 
-/* The live, in-use table. Swapped atomically on reload. */
-static struct domain_rule_table *g_active_table = NULL;
+/* The live, in-use table. Swapped atomically on reload — see the
+ * thread-safety note above table_add and the swap logic in
+ * reload_domain_rules_if_changed() below. */
+static _Atomic(struct domain_rule_table *) g_active_table = NULL;
+
+/*
+ * RETIRED-TABLE GRACE PERIOD
+ * --------------------------
+ * A reader on another core may have just loaded g_active_table right
+ * before a reload swaps it out. Freeing the old table immediately
+ * would let that reader dereference freed memory. Rather than a full
+ * RCU implementation (hazard pointers, epoch reclamation), this uses
+ * a simple bounded retirement list: the last N retired tables are kept
+ * alive and only actually freed once N more reloads have happened.
+ * Since domain_rules.ini reloads are infrequent (config edits, not a
+ * per-packet event) and each in-flight classify_hostname() call is
+ * short (a single loop over a few hundred rules), a handful of reload
+ * cycles is a generous grace period in practice.
+ *
+ * This is NOT a substitute for proper RCU/hazard-pointer reclamation
+ * in a design that reloads frequently or has long-running readers —
+ * it's a pragmatic bound appropriate for "config file edited a few
+ * times a day," which is domain_rules.ini's actual use pattern.
+ */
+#define RETIRED_TABLE_GRACE_SLOTS 4
+static struct domain_rule_table *g_retired[RETIRED_TABLE_GRACE_SLOTS] = {0};
+static int g_retired_next = 0;
+
+static void retire_table(struct domain_rule_table *old) {
+    if (!old) return;
+    struct domain_rule_table *to_free = g_retired[g_retired_next];
+    g_retired[g_retired_next] = old;
+    g_retired_next = (g_retired_next + 1) % RETIRED_TABLE_GRACE_SLOTS;
+    if (to_free) {
+        free(to_free->rules);
+        free(to_free);
+    }
+}
 
 static char *trim(char *s) {
     while (isspace((unsigned char)*s)) s++;
@@ -271,7 +308,8 @@ static bool reload_domain_rules_if_changed(const char *path) {
     time_t mtime = file_mtime(path);
     if (mtime == 0) return false;   /* file missing/unreadable: keep serving old table */
 
-    if (g_active_table && g_active_table->loaded_mtime == mtime) {
+    struct domain_rule_table *current = atomic_load(&g_active_table);
+    if (current && current->loaded_mtime == mtime) {
         return false;   /* unchanged since last load */
     }
 
@@ -282,15 +320,14 @@ static bool reload_domain_rules_if_changed(const char *path) {
     }
     new_table->loaded_mtime = mtime;
 
-    /* Atomic-from-the-caller's-view swap. In a multi-threaded worker,
-     * make g_active_table a _Atomic pointer (C11 stdatomic.h) and use
-     * atomic_store/atomic_load here instead of a plain assignment, and
-     * defer table_free(old) via an RCU-style grace period or refcount
-     * so an in-flight reader on another core isn't freed out from
-     * under it. Single-threaded / single-writer callers can just do this: */
-    struct domain_rule_table *old = g_active_table;
-    g_active_table = new_table;
-    table_free(old);
+    /* Atomic swap: any reader calling classify_hostname() concurrently
+     * either sees the fully-old table or the fully-new table, never a
+     * half-updated one. The old table is retired (see retire_table's
+     * grace-period comment above), not freed immediately — a reader
+     * that loaded the pointer just before this store is still safe to
+     * finish its lookup against it. */
+    struct domain_rule_table *old = atomic_exchange(&g_active_table, new_table);
+    retire_table(old);
 
     return true;
 }
@@ -317,11 +354,18 @@ static bool hostname_has_suffix(const char *hostname, const char *suffix) {
 
 static void classify_hostname(const char *hostname, struct classification_result *out) {
     memset(out, 0, sizeof(*out));
-    if (!g_active_table) return;
+
+    /* Atomic load once, use this local copy for the whole lookup — if
+     * a reload swaps g_active_table concurrently, this call still
+     * completes safely against the table it started with (which the
+     * grace-period retirement in reload_domain_rules_if_changed keeps
+     * alive long enough for exactly this reason). */
+    struct domain_rule_table *table = atomic_load(&g_active_table);
+    if (!table) return;
 
     size_t best_len = 0;
-    for (size_t i = 0; i < g_active_table->count; i++) {
-        struct domain_rule *r = &g_active_table->rules[i];
+    for (size_t i = 0; i < table->count; i++) {
+        struct domain_rule *r = &table->rules[i];
         if (hostname_has_suffix(hostname, r->suffix)) {
             size_t rule_len = strlen(r->suffix);
             if (rule_len > best_len) {

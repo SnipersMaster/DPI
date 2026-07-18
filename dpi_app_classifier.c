@@ -60,6 +60,9 @@
 /* Provides: struct vpn_result, score_vpn_traffic(). */
 #include "dpi_vpn_detector.c"
 
+/* Provides: struct doh_dot_result, score_doh_dot(). */
+#include "dpi_doh_dot_detector.c"
+
 #define MAX_SNI_LEN        256
 #define MAX_CATEGORY_LEN   32
 #define MAX_DOMAIN_RULES   1024
@@ -103,29 +106,33 @@ struct sni_result {
 };
 
 /*
- * Walk a TLS ClientHello and extract the SNI, per RFC 8446 S4.1.2 for
- * the ClientHello structure and RFC 6066 S3 for the server_name
- * extension format. Every read is length-checked against `remaining`
- * before it happens — same discipline as the IPv4/TCP parser.
+ * Walk a bare TLS ClientHello BODY (no record-layer or handshake-header
+ * wrapper) and extract the SNI, per RFC 8446 S4.1.2 for the
+ * ClientHello structure and RFC 6066 S3 for the server_name extension
+ * format. Every read is length-checked against the buffer before it
+ * happens — same discipline as the IPv4/TCP parser.
+ *
+ * This is the shared core used by BOTH:
+ *   - extract_sni_from_record() below, for TLS-over-TCP, where the
+ *     ClientHello arrives wrapped in a TLS record + handshake header
+ *   - dpi_quic_parser.c's QUIC CRYPTO frame handling, where the
+ *     decrypted frame contents ARE the ClientHello body directly —
+ *     QUIC carries TLS handshake messages with no record-layer
+ *     wrapper at all (RFC 9001 S4.1.3: "QUIC takes the unprotected
+ *     content of TLS handshake records as the content of CRYPTO
+ *     frames. TLS record protection is not used by QUIC.")
  */
-static bool extract_sni(const uint8_t *data, size_t len, struct sni_result *out) {
+/* Non-static: called directly by dpi_quic_parser.c, since QUIC's CRYPTO
+ * frame contains a bare ClientHello body with no TLS record wrapper.
+ * In a real build with proper headers, this declaration would live in
+ * a shared dpi_tls_sni.h rather than being re-declared via extern in
+ * the QUIC file — see the note in dpi_quic_parser.c and the README's
+ * build-system caveat. */
+bool extract_sni_from_clienthello_body(const uint8_t *data, size_t len,
+                                        struct sni_result *out) {
     memset(out, 0, sizeof(*out));
     size_t pos = 0;
-
-    /* TLS record header: type(1) + version(2) + length(2) */
-    if (len < 5) return false;
-    if (data[0] != TLS_CONTENT_TYPE_HANDSHAKE) return false;
-    uint16_t record_len = (data[3] << 8) | data[4];
-    pos = 5;
-    if (pos + record_len > len) return false;  /* record claims more than we have */
-
-    /* Handshake header: msg_type(1) + length(3) */
-    if (pos + 4 > len) return false;
-    if (data[pos] != TLS_HANDSHAKE_CLIENT_HELLO) return false;
-    uint32_t hs_len = (data[pos+1] << 16) | (data[pos+2] << 8) | data[pos+3];
-    pos += 4;
-    size_t hs_end = pos + hs_len;
-    if (hs_end > len) return false;
+    size_t hs_end = len;
 
     /* ClientHello body: legacy_version(2) + random(32) +
      * session_id length(1) + session_id + cipher_suites length(2) +
@@ -193,6 +200,37 @@ static bool extract_sni(const uint8_t *data, size_t len, struct sni_result *out)
     return false;  /* well-formed ClientHello, but no SNI present (e.g. ECH) */
 }
 
+/*
+ * TLS-over-TCP entry point: strips the TLS record header and handshake
+ * header, then hands off to the shared ClientHello-body parser above.
+ * This is what dpi_app_classifier.c's classify_flow() calls for TCP flows.
+ */
+static bool extract_sni_from_record(const uint8_t *data, size_t len, struct sni_result *out) {
+    size_t pos = 0;
+
+    /* TLS record header: type(1) + version(2) + length(2) */
+    if (len < 5) return false;
+    if (data[0] != TLS_CONTENT_TYPE_HANDSHAKE) return false;
+    uint16_t record_len = (data[3] << 8) | data[4];
+    pos = 5;
+    if (pos + record_len > len) return false;  /* record claims more than we have */
+
+    /* Handshake header: msg_type(1) + length(3) */
+    if (pos + 4 > len) return false;
+    if (data[pos] != TLS_HANDSHAKE_CLIENT_HELLO) return false;
+    uint32_t hs_len = (data[pos+1] << 16) | (data[pos+2] << 8) | data[pos+3];
+    pos += 4;
+    size_t hs_end = pos + hs_len;
+    if (hs_end > len) return false;
+
+    return extract_sni_from_clienthello_body(data + pos, hs_len, out);
+}
+
+/* Backward-compatible name used elsewhere in this file. */
+static bool extract_sni(const uint8_t *data, size_t len, struct sni_result *out) {
+    return extract_sni_from_record(data, len, out);
+}
+
 /* Domain -> category classification now lives in
  * dpi_domain_rules_loader.c (classify_hostname + classification_result),
  * reading from the dynamically loaded, reloadable rule table. */
@@ -221,6 +259,10 @@ struct app_classification {
     double vpn_score;         /* 0.0 (not VPN-like) to 1.0 (very VPN-like) */
     const char *vpn_verdict;  /* "low" | "medium" | "high" */
     const char *vpn_protocol; /* "wireguard" | "openvpn" | "ike" | "commercial_vpn_app" | "unknown" | "none" */
+    double dot_score;
+    const char *dot_verdict;  /* "low" | "medium" | "high" */
+    double doh_score;
+    const char *doh_verdict;  /* "low" | "medium" | "high" */
 };
 
 /*
@@ -288,6 +330,18 @@ static void classify_flow(const uint8_t *l4_payload, size_t payload_len,
     result->vpn_score = vpn.score;
     result->vpn_verdict = vpn.verdict;
     result->vpn_protocol = vpn.detected_protocol;
+
+    /* DoH detection reuses the same resolved category as VPN scoring
+     * (an SNI match against domain_rules.ini's [dns_over_https]
+     * section); DoT scoring is purely structural (port 853 + TLS
+     * handshake shape) and runs regardless of SNI outcome. */
+    struct doh_dot_result doh_dot;
+    score_doh_dot(l4_payload, (uint16_t)payload_len, dst_port, l4_proto,
+                  have_sni ? result->category : NULL, &doh_dot);
+    result->dot_score = doh_dot.dot_score;
+    result->dot_verdict = doh_dot.dot_verdict;
+    result->doh_score = doh_dot.doh_score;
+    result->doh_verdict = doh_dot.doh_verdict;
 }
 
 /*
