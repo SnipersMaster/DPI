@@ -157,6 +157,101 @@ static size_t dns_decode_name(const uint8_t *packet, size_t packet_len,
                                            * returns 1, never 0. */
 }
 
+/*
+ * Walk one resource-record section (answer, authority, or additional
+ * — RFC 1035 §4.1.3, all three use the identical RR wire format) and
+ * extract A/AAAA/CNAME fields, prefixed by `section_name` so answer
+ * vs. authority vs. additional records don't collide in the output
+ * (e.g. "dns_answer_0_a" vs "dns_authority_0_a"). `pos` is updated
+ * in place so the caller can chain sections back-to-back.
+ */
+static int dns_walk_rr_section(const uint8_t *payload, uint16_t len, size_t *pos,
+                                uint16_t rrcount, const char *section_name,
+                                struct dissect_result *out) {
+    int records_parsed = 0;
+
+    for (uint16_t i = 0; i < rrcount && *pos < len; i++) {
+        if (records_parsed >= 32) {   /* sanity bound per section */
+            char w[64];
+            snprintf(w, sizeof(w), "%s_record_limit_reached", section_name);
+            dissect_result_add(out, "parse_warning", w);
+            break;
+        }
+
+        char rr_name[MAX_LABEL_OUTPUT];
+        size_t rr_name_consumed = dns_decode_name(payload, len, *pos, rr_name, sizeof(rr_name));
+        if (rr_name_consumed == 0) {
+            dissect_result_add(out, "parse_warning", "malformed_rr_name");
+            break;
+        }
+        *pos += rr_name_consumed;
+
+        if (*pos + 10 > len) {   /* TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2) */
+            dissect_result_add(out, "parse_warning", "truncated_rr_header");
+            break;
+        }
+        uint16_t rr_type = (payload[*pos] << 8) | payload[*pos + 1];
+        uint16_t rdlength = (payload[*pos + 8] << 8) | payload[*pos + 9];
+        *pos += 10;
+
+        if (*pos + rdlength > len) {
+            dissect_result_add(out, "parse_warning", "rdata_exceeds_available_length");
+            break;
+        }
+
+        char field_key[48], field_val[300];
+
+        switch (rr_type) {
+            case 1:   /* A */
+                if (rdlength == 4) {
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_a", section_name, records_parsed);
+                    snprintf(field_val, sizeof(field_val), "%u.%u.%u.%u",
+                             payload[*pos], payload[*pos+1], payload[*pos+2], payload[*pos+3]);
+                    dissect_result_add(out, field_key, field_val);
+                }
+                break;
+            case 28: {  /* AAAA */
+                if (rdlength == 16) {
+                    char v6buf[46];
+                    struct in6_addr addr;
+                    memcpy(&addr, payload + *pos, 16);
+                    if (inet_ntop(AF_INET6, &addr, v6buf, sizeof(v6buf))) {
+                        snprintf(field_key, sizeof(field_key), "dns_%s_%d_aaaa", section_name, records_parsed);
+                        dissect_result_add(out, field_key, v6buf);
+                    }
+                }
+                break;
+            }
+            case 5: {   /* CNAME — RDATA is itself a (possibly compressed) name */
+                char cname[MAX_LABEL_OUTPUT];
+                size_t cname_consumed = dns_decode_name(payload, len, *pos, cname, sizeof(cname));
+                if (cname_consumed != 0) {
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_cname", section_name, records_parsed);
+                    dissect_result_add(out, field_key, cname);
+                }
+                break;
+            }
+            case 2: {   /* NS — also a compressed name, common in authority sections */
+                char nsname[MAX_LABEL_OUTPUT];
+                size_t ns_consumed = dns_decode_name(payload, len, *pos, nsname, sizeof(nsname));
+                if (ns_consumed != 0) {
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_ns", section_name, records_parsed);
+                    dissect_result_add(out, field_key, nsname);
+                }
+                break;
+            }
+            default:
+                break;   /* unrecognized type: RDATA already bounds-validated
+                          * above, just skip over it via rdlength below */
+        }
+
+        *pos += rdlength;
+        records_parsed++;
+    }
+
+    return records_parsed;
+}
+
 static void dns_dissect(const uint8_t *payload, uint16_t len,
                          uint16_t dst_port, const char *l4_proto,
                          struct dissect_result *out) {
@@ -212,97 +307,25 @@ static void dns_dissect(const uint8_t *payload, uint16_t len,
     snprintf(buf, sizeof(buf), "%u", qclass);
     dissect_result_add(out, "dns_qclass", buf);
 
-    /* Answer section — the resolved IP addresses (A/AAAA) and CNAME
-     * chains, when this message is a response. This reuses the exact
-     * same dns_decode_name() used for the question above; RRs
-     * legitimately DO use compression pointers back to the question
-     * name (this is the case that wasn't representable in the
-     * question-only version — an RR's NAME field pointing back to
-     * offset 12 is completely normal, unlike a self-referential
-     * question). RDATA is parsed per-type for A/AAAA/CNAME; other
-     * types are skipped by their declared RDLENGTH rather than parsed
-     * — extending to more types follows the same pattern.
-     */
+
     uint16_t ancount = (payload[6] << 8) | payload[7];
-    int records_parsed = 0;
+    uint16_t nscount = (payload[8] << 8) | payload[9];
+    uint16_t arcount = (payload[10] << 8) | payload[11];
 
-    for (uint16_t i = 0; i < ancount && pos < len; i++) {
-        if (records_parsed >= 32) {   /* sanity bound on how many answer
-                                        * records we'll walk per message */
-            dissect_result_add(out, "parse_warning", "answer_record_limit_reached");
-            break;
-        }
-
-        char rr_name[MAX_LABEL_OUTPUT];
-        size_t rr_name_consumed = dns_decode_name(payload, len, pos, rr_name, sizeof(rr_name));
-        if (rr_name_consumed == 0) {
-            dissect_result_add(out, "parse_warning", "malformed_answer_rr_name");
-            break;
-        }
-        pos += rr_name_consumed;
-
-        if (pos + 10 > len) {   /* TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2) */
-            dissect_result_add(out, "parse_warning", "truncated_answer_rr_header");
-            break;
-        }
-        uint16_t rr_type = (payload[pos] << 8) | payload[pos + 1];
-        uint32_t rr_ttl = (payload[pos+4]<<24)|(payload[pos+5]<<16)|(payload[pos+6]<<8)|payload[pos+7];
-        uint16_t rdlength = (payload[pos + 8] << 8) | payload[pos + 9];
-        pos += 10;
-
-        if (pos + rdlength > len) {
-            dissect_result_add(out, "parse_warning", "rdata_exceeds_available_length");
-            break;
-        }
-
-        char field_key[32], field_val[300];
-
-        switch (rr_type) {
-            case 1:   /* A */
-                if (rdlength == 4) {
-                    snprintf(field_key, sizeof(field_key), "dns_answer_%d_a", records_parsed);
-                    snprintf(field_val, sizeof(field_val), "%u.%u.%u.%u",
-                             payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]);
-                    dissect_result_add(out, field_key, field_val);
-                }
-                break;
-            case 28: {  /* AAAA */
-                if (rdlength == 16) {
-                    char v6buf[46];
-                    struct in6_addr addr;
-                    memcpy(&addr, payload + pos, 16);
-                    if (inet_ntop(AF_INET6, &addr, v6buf, sizeof(v6buf))) {
-                        snprintf(field_key, sizeof(field_key), "dns_answer_%d_aaaa", records_parsed);
-                        dissect_result_add(out, field_key, v6buf);
-                    }
-                }
-                break;
-            }
-            case 5: {   /* CNAME — RDATA is itself a (possibly compressed) name */
-                char cname[MAX_LABEL_OUTPUT];
-                size_t cname_consumed = dns_decode_name(payload, len, pos, cname, sizeof(cname));
-                if (cname_consumed != 0) {
-                    snprintf(field_key, sizeof(field_key), "dns_answer_%d_cname", records_parsed);
-                    dissect_result_add(out, field_key, cname);
-                }
-                break;
-            }
-            default:
-                break;   /* unrecognized type: RDATA already bounds-validated
-                          * above, just skip over it via rdlength below */
-        }
-
-        (void)rr_ttl;   /* extracted but not currently surfaced as its own
-                          * field — TTL-based caching/expiry analysis is a
-                          * reasonable future addition, not done here */
-        pos += rdlength;
-        records_parsed++;
-    }
-
+    int answer_count = dns_walk_rr_section(payload, len, &pos, ancount, "answer", out);
     char count_buf[16];
-    snprintf(count_buf, sizeof(count_buf), "%d", records_parsed);
+    snprintf(count_buf, sizeof(count_buf), "%d", answer_count);
     dissect_result_add(out, "dns_answer_records_parsed", count_buf);
+
+    int authority_count = dns_walk_rr_section(payload, len, &pos, nscount, "authority", out);
+    snprintf(count_buf, sizeof(count_buf), "%d", authority_count);
+    dissect_result_add(out, "dns_authority_records_parsed", count_buf);
+
+    int additional_count = dns_walk_rr_section(payload, len, &pos, arcount, "additional", out);
+    snprintf(count_buf, sizeof(count_buf), "%d", additional_count);
+    dissect_result_add(out, "dns_additional_records_parsed", count_buf);
 }
+
 
 static const uint16_t dns_hint_ports[] = { DNS_PORT };
 

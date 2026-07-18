@@ -65,6 +65,9 @@
 #define MAX_STR_FIELD_LEN 64
 
 struct flow_log_record {
+    char     src_ip[46];   /* sized for the longest IPv6 text form;
+                             * IPv4 addresses are shorter and fit fine */
+    char     dst_ip[46];
     uint16_t src_port, dst_port;
     char     sni[MAX_SNI_LOG_LEN];
     char     category[MAX_STR_FIELD_LEN];
@@ -136,14 +139,16 @@ static void format_and_emit(const struct flow_log_record *rec) {
      * hot path — this is deliberately the same JSON shape the earlier
      * inline printf produced, so downstream tooling doesn't need to
      * change now that this goes to a real sink instead. */
-    char line[1024];
+    char line[1200];
     int n = snprintf(line, sizeof(line),
-           "{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
+           "{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+           "\"sni\":\"%s\",\"category\":\"%s\","
            "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
            "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
            "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
            "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
-           rec->src_port, rec->dst_port, rec->sni, rec->category, rec->app_name,
+           rec->src_ip, rec->dst_ip, rec->src_port, rec->dst_port,
+           rec->sni, rec->category, rec->app_name,
            rec->confidence, rec->dga_score, rec->vpn_score, rec->vpn_protocol,
            rec->dot_score, rec->doh_score, rec->out_of_order_segments,
            rec->retransmit_count, rec->overlap_conflict_count,

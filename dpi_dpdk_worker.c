@@ -217,12 +217,8 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
-    struct tcp_flow_key key = {
-        .src_ip = ip_result.src_addr,
-        .dst_ip = ip_result.dst_addr,
-        .src_port = tcp_result.src_port,
-        .dst_port = tcp_result.dst_port
-    };
+    struct tcp_flow_key key = tcp_flow_key_make_v4(
+        ip_result.src_addr, ip_result.dst_addr, tcp_result.src_port, tcp_result.dst_port);
 
     const uint8_t *contiguous_data = NULL;
     uint32_t contiguous_len = 0;
@@ -269,9 +265,14 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
      * work off-core. A full ring means this record is dropped and
      * counted, never blocks. */
     struct flow_log_record rec = {0};
+    snprintf(rec.src_ip, sizeof(rec.src_ip), "%u.%u.%u.%u",
+             (ip_result.src_addr >> 24) & 0xFF, (ip_result.src_addr >> 16) & 0xFF,
+             (ip_result.src_addr >> 8) & 0xFF, ip_result.src_addr & 0xFF);
+    snprintf(rec.dst_ip, sizeof(rec.dst_ip), "%u.%u.%u.%u",
+             (ip_result.dst_addr >> 24) & 0xFF, (ip_result.dst_addr >> 16) & 0xFF,
+             (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
     rec.src_port = tcp_result.src_port;
     rec.dst_port = tcp_result.dst_port;
-    strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
     strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
     strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
     strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
@@ -320,6 +321,12 @@ static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uin
      * not a lesser one just because it arrived via a different
      * capture branch. */
     struct flow_log_record rec = {0};
+    snprintf(rec.src_ip, sizeof(rec.src_ip), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(rec.dst_ip, sizeof(rec.dst_ip), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
     rec.src_port = udp_result.src_port;
     rec.dst_port = udp_result.dst_port;
     rec.vpn_score = vpn.score;
@@ -356,34 +363,30 @@ static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uin
 }
 
 /* -----------------------------------------------------------------
- * IPv6 entry point. UDP-over-IPv6 gets full treatment — dispatch_
- * dissection() and score_vpn_traffic() are IP-version-agnostic (they
- * operate on the L4 payload + port + protocol string, nothing IPv4-
- * specific), so RADIUS/QUIC/GTP/DNS/DHCP/SIP/RTP and VPN fingerprinting
- * all work over IPv6 exactly as they do over IPv4 with no extra code.
+ * IPv6 entry point. Both UDP and TCP get full treatment now.
  *
- * TCP-over-IPv6 is DELIBERATELY NOT wired to classification/reassembly
- * in this pass — see dpi_ipv6_parser.c's header comment for why:
- * dpi_tcp_flow_reassembly.c's flow key uses 32-bit fields sized for
- * IPv4 addresses, and extending that is a real, separate integration
- * task. TCP-over-IPv6 packets are parsed and checksum-verified here
- * (so a bug in that path would still be caught by fuzzing/testing),
- * but intentionally go no further — counted, not silently dropped
- * without a trace.
+ * UDP-over-IPv6: dispatch_dissection() and score_vpn_traffic() are
+ * IP-version-agnostic (they operate on the L4 payload + port +
+ * protocol string, nothing IPv4-specific), so RADIUS/QUIC/GTP/DNS/
+ * DHCP/SIP/RTP and VPN fingerprinting all work over IPv6 exactly as
+ * they do over IPv4 with no extra code.
+ *
+ * TCP-over-IPv6: previously deferred (an earlier version of this
+ * comment said so, at length) because dpi_tcp_flow_reassembly.c's
+ * flow key used 32-bit fields sized for IPv4 addresses only.
+ * struct tcp_flow_key was extended to hold 128-bit addresses with an
+ * explicit ip_version tag (see that file), so TCP-over-IPv6 now goes
+ * through the identical reassembly → classification pipeline as the
+ * IPv4 path below, just constructing the key via
+ * tcp_flow_key_make_v6() instead of _make_v4().
  * ----------------------------------------------------------------- */
-static _Atomic uint64_t g_ipv6_tcp_deferred_count = 0;   /* visibility into how much
-                                                    * TCP-over-IPv6 traffic
-                                                    * is currently NOT
-                                                    * reaching classification.
-                                                    * Atomic — incremented
-                                                    * concurrently from every
-                                                    * lcore, same reasoning as
-                                                    * the flow table race fixed
-                                                    * earlier in this project. */
-
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id) {
     struct ipv6_result ip6_result;
     if (!parse_ipv6(ip_start, ip_len, &ip6_result)) return;
+
+    char src_str[46], dst_str[46];
+    ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
+    ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
 
     if (ip6_result.next_header == 17 /* UDP */) {
         struct udp_result udp_result;
@@ -401,22 +404,9 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         score_vpn_traffic(udp_result.payload, udp_result.payload_len,
                            udp_result.dst_port, "UDP", NULL, &vpn);
 
-        /* IPv6 source/destination addresses are NOT currently surfaced
-         * in the flow record — flow_log_record's fields are sized for
-         * the IPv4-oriented JSON shape, and adding proper 128-bit
-         * address fields is a small, contained follow-up better done
-         * once the larger tcp_flow_key/IPv6 question above is
-         * resolved, rather than half-updating one struct while the
-         * other still can't represent IPv6 at all.
-         *
-         * IMPORTANT: this does NOT call fprintf() here — an earlier
-         * draft of this function did, which would have reintroduced
-         * exactly the hot-path blocking I/O problem dpi_async_output.c
-         * was built to eliminate. Caught before shipping: any per-
-         * packet visibility needs to go through the same lock-free
-         * ring buffer as everything else, not a direct stderr write on
-         * the RX/dissection path. */
         struct flow_log_record rec = {0};
+        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
+        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
         rec.src_port = udp_result.src_port;
         rec.dst_port = udp_result.dst_port;
         rec.vpn_score = vpn.score;
@@ -448,14 +438,57 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
 
     if (ip6_result.next_header == 6 /* TCP */) {
         struct tcp_result tcp_result;
-        if (parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
-                          ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
-            /* Parsed and checksum-verified successfully — but per this
-             * function's header comment, deliberately not carried any
-             * further in this pass. Counted for operational visibility
-             * rather than silently vanishing. */
-            g_ipv6_tcp_deferred_count++;   /* atomic: safe under concurrent lcore access */
+        if (!parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                           ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
+            return;
         }
+        if (tcp_result.payload_len == 0) return;   /* pure ACK/control segment */
+
+        /* This is the piece that was previously deferred — flagged
+         * repeatedly as the single largest gap in IPv6 support. Now
+         * wired identically to the IPv4 TCP path: same reassembly
+         * partition scheme (queue_id doubles as partition_id, same
+         * RSS-pinning argument as the v4 path), same is_first_delivery
+         * gating, same classification pipeline. The only difference is
+         * constructing the key via tcp_flow_key_make_v6() instead of
+         * _make_v4(). */
+        struct tcp_flow_key key = tcp_flow_key_make_v6(
+            ip6_result.src_addr, ip6_result.dst_addr, tcp_result.src_port, tcp_result.dst_port);
+
+        const uint8_t *contiguous_data = NULL;
+        uint32_t contiguous_len = 0;
+        struct tcp_reassembly_stats stats;
+
+        bool have_new_data = tcp_reassembly_insert(
+            queue_id, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+            TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
+
+        if (!have_new_data || !stats.is_first_delivery) return;
+
+        struct app_classification classification;
+        classify_flow(contiguous_data, contiguous_len,
+                      tcp_result.dst_port, "TCP", &classification);
+
+        struct flow_log_record rec = {0};
+        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
+        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        rec.src_port = tcp_result.src_port;
+        rec.dst_port = tcp_result.dst_port;
+        strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
+        strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
+        strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
+        rec.dga_score = classification.dga_score;
+        rec.vpn_score = classification.vpn_score;
+        strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
+        rec.dot_score = classification.dot_score;
+        rec.doh_score = classification.doh_score;
+        rec.out_of_order_segments = stats.out_of_order_segments;
+        rec.retransmit_count = stats.retransmit_count;
+        rec.overlap_conflict_count = stats.overlap_conflict_count;
+        rec.evasion_flag = stats.evasion_flag;
+
+        log_ring_try_push(queue_id, &rec);
         return;
     }
 

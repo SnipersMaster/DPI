@@ -99,16 +99,70 @@ enum tcp_overlap_policy {
     TCP_OVERLAP_LAST_WINS     /* new data overwrites existing bytes at the overlap */
 };
 
+/*
+ * struct tcp_flow_key — extended to support IPv6.
+ *
+ * An earlier version of this struct used plain uint32_t src_ip/dst_ip,
+ * which meant TCP-over-IPv6 flows had no way to be represented at all
+ * — flagged repeatedly elsewhere in this project as the single largest
+ * deliberately-deferred piece of IPv6 support. Fixed here: addresses
+ * are now a fixed 16-byte array regardless of IP version, with an
+ * explicit version tag rather than inferring version from address
+ * content (inferring is fragile — e.g. an IPv4-mapped IPv6 address
+ * would be ambiguous under a content-based scheme; an explicit tag
+ * is not).
+ *
+ * IPv4 addresses are stored in the FIRST 4 bytes of the 16-byte field,
+ * with the remaining 12 bytes zeroed (an arbitrary but consistent
+ * choice — NOT the standard ::ffff:a.b.c.d IPv4-mapped-IPv6 encoding,
+ * since that would make a real IPv6 flow using that literal mapped
+ * address collide with an IPv4 flow to the same numeric address,
+ * which the explicit ip_version tag already prevents without needing
+ * a "safe" encoding trick). Always construct keys via
+ * tcp_flow_key_make_v4()/_v6() below rather than hand-building them,
+ * so this convention stays consistent everywhere.
+ */
 struct tcp_flow_key {
-    uint32_t src_ip, dst_ip;
+    uint8_t  ip_version;      /* 4 or 6 */
+    uint8_t  src_addr[16];
+    uint8_t  dst_addr[16];
     uint16_t src_port, dst_port;
     /* Deliberately directional (src != dst symmetrically) — each
      * direction of a connection is reassembled independently, since
      * sequence numbers are direction-specific in TCP. */
 };
 
+static struct tcp_flow_key tcp_flow_key_make_v4(uint32_t src_ip, uint32_t dst_ip,
+                                                 uint16_t src_port, uint16_t dst_port) {
+    struct tcp_flow_key k;
+    memset(&k, 0, sizeof(k));
+    k.ip_version = 4;
+    k.src_addr[0] = (uint8_t)(src_ip >> 24); k.src_addr[1] = (uint8_t)(src_ip >> 16);
+    k.src_addr[2] = (uint8_t)(src_ip >> 8);  k.src_addr[3] = (uint8_t)src_ip;
+    k.dst_addr[0] = (uint8_t)(dst_ip >> 24); k.dst_addr[1] = (uint8_t)(dst_ip >> 16);
+    k.dst_addr[2] = (uint8_t)(dst_ip >> 8);  k.dst_addr[3] = (uint8_t)dst_ip;
+    k.src_port = src_port;
+    k.dst_port = dst_port;
+    return k;
+}
+
+static struct tcp_flow_key tcp_flow_key_make_v6(const uint8_t src_addr16[16],
+                                                 const uint8_t dst_addr16[16],
+                                                 uint16_t src_port, uint16_t dst_port) {
+    struct tcp_flow_key k;
+    memset(&k, 0, sizeof(k));
+    k.ip_version = 6;
+    memcpy(k.src_addr, src_addr16, 16);
+    memcpy(k.dst_addr, dst_addr16, 16);
+    k.src_port = src_port;
+    k.dst_port = dst_port;
+    return k;
+}
+
 static bool tcp_flow_key_equal(const struct tcp_flow_key *a, const struct tcp_flow_key *b) {
-    return a->src_ip == b->src_ip && a->dst_ip == b->dst_ip &&
+    return a->ip_version == b->ip_version &&
+           memcmp(a->src_addr, b->src_addr, 16) == 0 &&
+           memcmp(a->dst_addr, b->dst_addr, 16) == 0 &&
            a->src_port == b->src_port && a->dst_port == b->dst_port;
 }
 
@@ -381,7 +435,11 @@ static void tcp_reassembly_reset_partition_for_testing(uint16_t partition_id) {
 /*
  * Example integration with the rest of the engine:
  *
- *   struct tcp_flow_key key = { src_ip, dst_ip, src_port, dst_port };
+ *   // IPv4:
+ *   struct tcp_flow_key key = tcp_flow_key_make_v4(src_ip, dst_ip, src_port, dst_port);
+ *   // IPv6:
+ *   struct tcp_flow_key key = tcp_flow_key_make_v6(src_addr16, dst_addr16, src_port, dst_port);
+ *
  *   const uint8_t *contiguous;
  *   uint32_t contiguous_len;
  *   struct tcp_reassembly_stats stats;

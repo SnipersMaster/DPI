@@ -225,18 +225,20 @@ static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
 }
 
 /* -----------------------------------------------------------------
- * IPv6 entry point — same scope decision as dpi_dpdk_worker.c's
- * version: UDP-over-IPv6 gets full treatment, TCP-over-IPv6 is parsed
- * and checksum-verified but deliberately not carried into
- * classification/reassembly yet (see dpi_ipv6_parser.c's header
- * comment). Single-threaded here, so no atomic needed for the
- * deferred-count — unlike the DPDK worker's version of this function.
+ * IPv6 entry point. Both UDP and TCP get full treatment — see
+ * dpi_dpdk_worker.c's matching function for the fuller explanation of
+ * why TCP-over-IPv6 is no longer deferred (struct tcp_flow_key now
+ * supports 128-bit addresses via tcp_flow_key_make_v6()). Single-
+ * threaded here, so partition_id is always 0, same as the v4 TCP path
+ * above.
  * ----------------------------------------------------------------- */
-static uint64_t g_ipv6_tcp_deferred_count = 0;
-
 static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
     struct ipv6_result ip6_result;
     if (!parse_ipv6(ip_start, ip_len, &ip6_result)) return;
+
+    char src_str[46], dst_str[46];
+    ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
+    ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
 
     if (ip6_result.next_header == 17 /* UDP */) {
         struct udp_result udp_result;
@@ -253,10 +255,6 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
         struct vpn_result vpn;
         score_vpn_traffic(udp_result.payload, udp_result.payload_len,
                            udp_result.dst_port, "UDP", NULL, &vpn);
-
-        char src_str[46], dst_str[46];
-        ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
-        ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
 
         char sni_out[256] = "";
         char confidence_out[16] = "none";
@@ -275,10 +273,6 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
             }
         }
 
-        /* Unlike the DPDK worker, printf() here (including the IPv6
-         * addresses) is fine — single-threaded, non-hot-path scale,
-         * same reasoning already established for this file's other
-         * output. */
         printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
                "\"protocol\":\"%s\",\"sni\":\"%s\",\"confidence\":\"%s\","
                "\"dga_score\":%.2f,\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\"}\n",
@@ -290,10 +284,42 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
 
     if (ip6_result.next_header == 6 /* TCP */) {
         struct tcp_result tcp_result;
-        if (parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
-                          ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
-            g_ipv6_tcp_deferred_count++;
+        if (!parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                           ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
+            return;
         }
+        if (tcp_result.payload_len == 0) return;
+
+        struct tcp_flow_key key = tcp_flow_key_make_v6(
+            ip6_result.src_addr, ip6_result.dst_addr, tcp_result.src_port, tcp_result.dst_port);
+
+        const uint8_t *contiguous_data = NULL;
+        uint32_t contiguous_len = 0;
+        struct tcp_reassembly_stats stats;
+
+        bool have_new_data = tcp_reassembly_insert(
+            0, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+            TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
+
+        if (!have_new_data || !stats.is_first_delivery) return;
+
+        struct app_classification classification;
+        classify_flow(contiguous_data, contiguous_len,
+                      tcp_result.dst_port, "TCP", &classification);
+
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+               "\"sni\":\"%s\",\"category\":\"%s\","
+               "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
+               "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
+               "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
+               "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
+               src_str, dst_str, tcp_result.src_port, tcp_result.dst_port,
+               classification.sni, classification.category, classification.app_name,
+               classification.confidence, classification.dga_score,
+               classification.vpn_score, classification.vpn_protocol,
+               classification.dot_score, classification.doh_score,
+               stats.out_of_order_segments, stats.retransmit_count,
+               stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
         return;
     }
     /* Other next_header values: not handled. */
@@ -345,12 +371,8 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;   /* pure ACK/control segment, nothing to reassemble */
     }
 
-    struct tcp_flow_key key = {
-        .src_ip = ip_result.src_addr,
-        .dst_ip = ip_result.dst_addr,
-        .src_port = tcp_result.src_port,
-        .dst_port = tcp_result.dst_port
-    };
+    struct tcp_flow_key key = tcp_flow_key_make_v4(
+        ip_result.src_addr, ip_result.dst_addr, tcp_result.src_port, tcp_result.dst_port);
 
     const uint8_t *contiguous_data = NULL;
     uint32_t contiguous_len = 0;
@@ -380,12 +402,21 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
      * not a multi-core poll-mode hot loop. Still worth eventually
      * replacing with structured logging for anything beyond ad hoc
      * testing. */
-    printf("{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result.src_addr >> 24) & 0xFF, (ip_result.src_addr >> 16) & 0xFF,
+             (ip_result.src_addr >> 8) & 0xFF, ip_result.src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result.dst_addr >> 24) & 0xFF, (ip_result.dst_addr >> 16) & 0xFF,
+             (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+           "\"sni\":\"%s\",\"category\":\"%s\","
            "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
            "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
            "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
            "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
-           tcp_result.src_port, tcp_result.dst_port,
+           src_ip_str, dst_ip_str, tcp_result.src_port, tcp_result.dst_port,
            classification.sni, classification.category, classification.app_name,
            classification.confidence, classification.dga_score,
            classification.vpn_score, classification.vpn_protocol,

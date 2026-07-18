@@ -310,6 +310,60 @@ static double gtpv2_detect(const uint8_t *payload, uint16_t len,
     return confidence;
 }
 
+/*
+ * IMSI/MSISDN are encoded as "BCD digits, low nibble first" per
+ * TS 29.274 §8.3/§8.11 — each byte holds two decimal digits with the
+ * least-significant digit in the LOW nibble. 0xF is a filler nibble
+ * for odd-length numbers and is not itself a digit — encountering it
+ * ends the number, it doesn't get silently treated as digit "15".
+ *
+ * PRIVACY NOTE: IMSI and MSISDN are subscriber PII (the mobile
+ * network equivalents of a national ID number and phone number,
+ * respectively) — extracting them is legitimate for network
+ * diagnostics/correlation (the same reasoning as extracting IP
+ * addresses elsewhere in this project), but unlike an IP address
+ * they're long-lived, directly-identifying subscriber data. Whatever
+ * consumes this dissector's output should apply the same
+ * access-control and retention discipline it would to any other PII
+ * field, not treat it as casually loggable as a TEID or sequence
+ * number.
+ */
+static void gtpv2_decode_bcd_digits(const uint8_t *data, uint16_t len, char *out, size_t out_cap) {
+    size_t o = 0;
+    for (uint16_t i = 0; i < len && o + 1 < out_cap; i++) {
+        uint8_t lo = data[i] & 0x0F;
+        uint8_t hi = (data[i] >> 4) & 0x0F;
+        if (lo <= 9 && o + 1 < out_cap) out[o++] = (char)('0' + lo);
+        else break;   /* filler (0xF) or invalid nibble: number ends here */
+        if (hi <= 9 && o + 1 < out_cap) out[o++] = (char)('0' + hi);
+        else break;
+    }
+    out[o] = '\0';
+}
+
+/*
+ * APN, TS 23.003 §9.1: sequence of length-prefixed labels, same shape
+ * as DNS labels but WITHOUT compression pointers (GTPv2 IEs are
+ * self-contained, no cross-message back-references) — so this is
+ * deliberately a separate, simpler walker rather than reusing
+ * dpi_dns_parser.c's dns_decode_name(), which would be over-general
+ * for a format that never needs pointer-following at all.
+ */
+static void gtpv2_decode_apn(const uint8_t *data, uint16_t len, char *out, size_t out_cap) {
+    size_t pos = 0, o = 0;
+    while (pos < len) {
+        uint8_t label_len = data[pos];
+        if (label_len == 0 || pos + 1 + label_len > len) break;   /* malformed: stop, don't guess */
+        if (o > 0 && o + 1 < out_cap) out[o++] = '.';
+        size_t copy_len = label_len;
+        if (o + copy_len >= out_cap) copy_len = out_cap - o - 1;
+        memcpy(out + o, data + pos + 1, copy_len);
+        o += copy_len;
+        pos += 1 + label_len;
+    }
+    out[o] = '\0';
+}
+
 static void gtpv2_dissect(const uint8_t *payload, uint16_t len,
                            uint16_t dst_port, const char *l4_proto,
                            struct dissect_result *out) {
@@ -345,15 +399,65 @@ static void gtpv2_dissect(const uint8_t *payload, uint16_t len,
     snprintf(buf, sizeof(buf), "%u", seq);
     dissect_result_add(out, "gtpv2_sequence_number", buf);
 
-    /* Information Elements (IEs) — the actual session parameters
-     * (APN, IMSI, bearer QoS, etc.) — follow as TLV-encoded fields per
-     * TS 29.274 §8. Not walked in this reference version; the message
-     * type and TEID alone are already useful signals (e.g. correlating
-     * session establishment/teardown with the G-PDU tunnels it
-     * creates), and IE walking is a reasonable next addition following
-     * the same TLV-bounds-checking discipline used everywhere else in
-     * this project. */
-    dissect_result_add(out, "gtpv2_ie_walk_not_implemented", "true");
+    /* Information Elements (IEs), TS 29.274 §8.3: Type(1) + Length(2,
+     * length of Value only) + Instance(1, low 4 bits; high 4 bits
+     * spare) + Value(Length bytes). Same bounds-checked TLV discipline
+     * as every other dissector in this project. */
+    size_t ie_pos = pos;
+    int ie_count = 0;
+
+    while (ie_pos + 4 <= len && ie_count < 64) {
+        uint8_t ie_type = payload[ie_pos];
+        uint16_t ie_len = (payload[ie_pos + 1] << 8) | payload[ie_pos + 2];
+        /* instance nibble (payload[ie_pos+3] & 0x0F) extracted but not
+         * currently surfaced as its own field — distinguishing
+         * multiple instances of the same IE type (e.g. two F-TEID IEs
+         * for different interfaces) is a reasonable future addition */
+
+        if (ie_pos + 4 + ie_len > len) {
+            dissect_result_add(out, "parse_warning", "ie_length_exceeds_available");
+            break;
+        }
+        const uint8_t *ie_val = payload + ie_pos + 4;
+
+        char key[48], val[256];
+        switch (ie_type) {
+            case 1:   /* IMSI */
+                gtpv2_decode_bcd_digits(ie_val, ie_len, val, sizeof(val));
+                snprintf(key, sizeof(key), "gtpv2_ie_%d_imsi", ie_count);
+                dissect_result_add(out, key, val);
+                break;
+            case 76:  /* MSISDN */
+                gtpv2_decode_bcd_digits(ie_val, ie_len, val, sizeof(val));
+                snprintf(key, sizeof(key), "gtpv2_ie_%d_msisdn", ie_count);
+                dissect_result_add(out, key, val);
+                break;
+            case 71:  /* APN */
+                gtpv2_decode_apn(ie_val, ie_len, val, sizeof(val));
+                snprintf(key, sizeof(key), "gtpv2_ie_%d_apn", ie_count);
+                dissect_result_add(out, key, val);
+                break;
+            case 2:   /* Cause */
+                if (ie_len >= 1) {
+                    snprintf(val, sizeof(val), "%u", ie_val[0]);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_cause", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            default:
+                break;   /* unrecognized IE type: already bounds-validated
+                          * above, just skip over it via ie_len below —
+                          * F-TEID, PDN Address Allocation, Bearer QoS,
+                          * and others would follow the identical pattern */
+        }
+
+        ie_pos += 4 + ie_len;
+        ie_count++;
+    }
+
+    char ie_count_buf[16];
+    snprintf(ie_count_buf, sizeof(ie_count_buf), "%d", ie_count);
+    dissect_result_add(out, "gtpv2_ie_count", ie_count_buf);
 }
 
 static const uint16_t gtpv2_hint_ports[] = { GTPV2_C_PORT };
