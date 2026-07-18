@@ -51,12 +51,21 @@
  * need dpi_async_output.c, since single-threaded printf() is fine at
  * this scale (see the note where it's used below). */
 #include "dpi_rfc_parser.c"
+
+/* Provides: parse_ipv6(), struct ipv6_result, parse_tcp_v6(), parse_udp_v6(). */
+#include "dpi_ipv6_parser.c"
+
 #include "dpi_tcp_flow_reassembly.c"
 #include "dpi_app_classifier.c"
 #include "dpi_dissector_registry.c"
 #include "dpi_radius_parser.c"
 #include "dpi_gtp_parser.c"
 #include "dpi_dns_parser.c"
+#include "dpi_http1_parser.c"
+#include "dpi_http2_parser.c"
+#include "dpi_ssh_parser.c"
+#include "dpi_dhcp_parser.c"
+#include "dpi_sip_rtp_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -170,6 +179,9 @@ static int install_seccomp_filter(void) {
  *    trust a length field until it's validated against the buffer you
  *    actually have.
  * --------------------------------------------------------------------- */
+static void dissect_udp_datagram(const struct ipv4_result *ip_result);
+static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len);
+
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -212,6 +224,81 @@ static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
            sni_out, confidence_out, dga_score_out, vpn.score, vpn.detected_protocol);
 }
 
+/* -----------------------------------------------------------------
+ * IPv6 entry point — same scope decision as dpi_dpdk_worker.c's
+ * version: UDP-over-IPv6 gets full treatment, TCP-over-IPv6 is parsed
+ * and checksum-verified but deliberately not carried into
+ * classification/reassembly yet (see dpi_ipv6_parser.c's header
+ * comment). Single-threaded here, so no atomic needed for the
+ * deferred-count — unlike the DPDK worker's version of this function.
+ * ----------------------------------------------------------------- */
+static uint64_t g_ipv6_tcp_deferred_count = 0;
+
+static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
+    struct ipv6_result ip6_result;
+    if (!parse_ipv6(ip_start, ip_len, &ip6_result)) return;
+
+    if (ip6_result.next_header == 17 /* UDP */) {
+        struct udp_result udp_result;
+        if (!parse_udp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                           ip6_result.payload, ip6_result.payload_len, &udp_result)) {
+            return;
+        }
+        if (udp_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(udp_result.payload, udp_result.payload_len,
+                                            udp_result.dst_port, "UDP", &dissect_out);
+
+        struct vpn_result vpn;
+        score_vpn_traffic(udp_result.payload, udp_result.payload_len,
+                           udp_result.dst_port, "UDP", NULL, &vpn);
+
+        char src_str[46], dst_str[46];
+        ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
+        ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
+
+        char sni_out[256] = "";
+        char confidence_out[16] = "none";
+        double dga_score_out = 0.0;
+
+        if (matched) {
+            const char *sni = dissect_result_get(&dissect_out, "sni");
+            if (sni) {
+                strncpy(sni_out, sni, sizeof(sni_out) - 1);
+                struct classification_result cls;
+                classify_hostname(sni, &cls);
+                strncpy(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out) - 1);
+                struct dga_result dga;
+                score_dga(sni, &dga);
+                dga_score_out = dga.score;
+            }
+        }
+
+        /* Unlike the DPDK worker, printf() here (including the IPv6
+         * addresses) is fine — single-threaded, non-hot-path scale,
+         * same reasoning already established for this file's other
+         * output. */
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+               "\"protocol\":\"%s\",\"sni\":\"%s\",\"confidence\":\"%s\","
+               "\"dga_score\":%.2f,\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\"}\n",
+               src_str, dst_str, udp_result.src_port, udp_result.dst_port,
+               matched ? dissect_out.protocol_name : "unknown",
+               sni_out, confidence_out, dga_score_out, vpn.score, vpn.detected_protocol);
+        return;
+    }
+
+    if (ip6_result.next_header == 6 /* TCP */) {
+        struct tcp_result tcp_result;
+        if (parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                          ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
+            g_ipv6_tcp_deferred_count++;
+        }
+        return;
+    }
+    /* Other next_header values: not handled. */
+}
+
 static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     if (len < ETH_HDR_LEN) {
         /* Too short to even contain an Ethernet header. Drop, don't guess. */
@@ -222,9 +309,16 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     const unsigned char *payload = buf + ETH_HDR_LEN;
     ssize_t payload_len = len - ETH_HDR_LEN;
 
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
+    if (ethertype == ETH_P_IPV6) {
+        dissect_ipv6_packet((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
     if (ethertype != ETH_P_IP) {
-        return;   /* IPv6 and everything else: not handled yet, see the
-                   * README's protocol coverage table */
+        return;   /* not IPv4 or IPv6: not handled */
     }
 
     struct ipv4_result ip_result;

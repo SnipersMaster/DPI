@@ -88,6 +88,10 @@ static double gtp1_detect(const uint8_t *payload, uint16_t len,
     return confidence;
 }
 
+/* Forward declaration: gtp1_dissect() calls this before its definition appears. */
+static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
+                                       struct dissect_result *out);
+
 static void gtp1_dissect(const uint8_t *payload, uint16_t len,
                           uint16_t dst_port, const char *l4_proto,
                           struct dissect_result *out) {
@@ -132,9 +136,121 @@ static void gtp1_dissect(const uint8_t *payload, uint16_t len,
 
     if (msg_type == GTP1_MSG_TYPE_GPDU) {
         dissect_result_add(out, "gtp_inner_packet_present", "true");
-        /* See this file's header comment: the inner IP packet starting
-         * at (payload + hdr_len) is NOT recursively dissected here. */
-        (void)declared_len;
+
+        /* Bound the inner packet by GTP's OWN declared length, not
+         * just whatever bytes remain in the buffer — declared_len is
+         * "everything after the mandatory 8-byte header" per TS
+         * 29.281 §5.1, so the true end of the GTP message (and start
+         * of any trailing padding/garbage) is mandatory_hdr +
+         * declared_len, which may be less than what parse_udp() handed
+         * us if the UDP datagram was padded. */
+        size_t gtp_msg_end = GTP1_HDR_LEN_MANDATORY + declared_len;
+        size_t inner_start = hdr_len;
+        uint16_t inner_len = (inner_start < gtp_msg_end && gtp_msg_end <= len)
+                              ? (uint16_t)(gtp_msg_end - inner_start)
+                              : (uint16_t)(len - inner_start);   /* fall back to
+                                                                    remaining buffer
+                                                                    if declared_len
+                                                                    looks inconsistent */
+        gtp1_dissect_inner_packet(payload + inner_start, inner_len, out);
+    }
+}
+
+/*
+ * Recursively dissect the inner IP packet carried by a G-PDU message.
+ * BOUNDED TO EXACTLY ONE LEVEL — if the inner packet is itself GTP
+ * (a nested tunnel), this does NOT recurse again. That's a deliberate
+ * safety bound, not a missed case: unbounded recursion driven by
+ * attacker-controlled nested tunnel depth is exactly the kind of
+ * resource-exhaustion vector the very first security checklist in
+ * this project warned about ("cap recursion and nesting depth" under
+ * multi-protocol dissector risk). A legitimate GTP deployment doesn't
+ * nest GTP-in-GTP; an attacker crafting one to probe for a recursion
+ * bug gets a flag, not a crash or a hang.
+ */
+static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
+                                       struct dissect_result *out) {
+    if (inner_len < 1) return;
+
+    uint8_t version = inner[0] >> 4;
+    if (version != 4) {
+        /* Only IPv4 inner packets are recursed into in this pass — an
+         * IPv6 inner packet would need dpi_ipv6_parser.c wired here
+         * too, not done yet, flagged rather than silently skipped. */
+        dissect_result_add(out, "gtp_inner_packet_ipv6_not_dissected",
+                            version == 6 ? "true" : "false");
+        return;
+    }
+
+    struct ipv4_result inner_ip;
+    if (!parse_ipv4(inner, inner_len, &inner_ip)) {
+        dissect_result_add(out, "gtp_inner_packet_parse_failed", "true");
+        return;
+    }
+
+    char ipbuf[32];
+    snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+             (inner_ip.src_addr >> 24) & 0xFF, (inner_ip.src_addr >> 16) & 0xFF,
+             (inner_ip.src_addr >> 8) & 0xFF, inner_ip.src_addr & 0xFF);
+    dissect_result_add(out, "gtp_inner_src_ip", ipbuf);
+    snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+             (inner_ip.dst_addr >> 24) & 0xFF, (inner_ip.dst_addr >> 16) & 0xFF,
+             (inner_ip.dst_addr >> 8) & 0xFF, inner_ip.dst_addr & 0xFF);
+    dissect_result_add(out, "gtp_inner_dst_ip", ipbuf);
+
+    if (inner_ip.protocol == 6 /* TCP */) {
+        dissect_result_add(out, "gtp_inner_protocol", "TCP");
+        struct tcp_result inner_tcp;
+        if (parse_tcp(inner_ip.src_addr, inner_ip.dst_addr,
+                       inner_ip.payload, inner_ip.payload_len, &inner_tcp)) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%u", inner_tcp.dst_port);
+            dissect_result_add(out, "gtp_inner_dst_port", portbuf);
+
+            /* Attempt SNI extraction directly on this single G-PDU
+             * packet's inner payload — NOT going through TCP flow
+             * reassembly (dpi_tcp_flow_reassembly.c isn't wired into
+             * this recursive path). This means a ClientHello split
+             * across multiple G-PDU packets won't be caught — a real
+             * limitation, consistent with "bounded to one level, no
+             * further stateful tracking" for this reference
+             * implementation.
+             *
+             * extract_sni_from_record() and struct sni_result come
+             * from dpi_app_classifier.c, already visible here since
+             * that file is included before this one in both capture
+             * paths (same reasoning as parse_ipv4()/parse_tcp() above
+             * needing no extern declaration either — same translation
+             * unit via the #include chain). This does mean
+             * dpi_gtp_parser.c now genuinely depends on
+             * dpi_app_classifier.c being included first — true of the
+             * capture files already, and fuzz_gtp_parser.c has been
+             * updated to include it too. */
+            struct sni_result sni;
+            if (inner_tcp.payload_len > 0 &&
+                extract_sni_from_record(inner_tcp.payload, inner_tcp.payload_len, &sni)
+                && sni.found) {
+                dissect_result_add(out, "gtp_inner_sni", sni.hostname);
+            }
+        }
+    } else if (inner_ip.protocol == 17 /* UDP */) {
+        dissect_result_add(out, "gtp_inner_protocol", "UDP");
+        struct udp_result inner_udp;
+        if (parse_udp(inner_ip.src_addr, inner_ip.dst_addr,
+                       inner_ip.payload, inner_ip.payload_len, &inner_udp)) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%u", inner_udp.dst_port);
+            dissect_result_add(out, "gtp_inner_dst_port", portbuf);
+
+            if (inner_udp.dst_port == GTP_U_PORT || inner_udp.dst_port == GTPV2_C_PORT) {
+                /* Nested GTP tunnel detected — deliberately NOT
+                 * recursing further, see this function's header
+                 * comment. Flagged for visibility, not dissected. */
+                dissect_result_add(out, "gtp_nested_tunnel_detected", "true");
+            }
+        }
+    } else {
+        dissect_result_add(out, "gtp_inner_protocol", "other");
     }
 }
 

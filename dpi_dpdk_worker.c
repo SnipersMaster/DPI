@@ -63,6 +63,12 @@
  * file was written. */
 #include "dpi_rfc_parser.c"
 
+/* Provides: parse_ipv6(), struct ipv6_result, parse_tcp_v6(),
+ * parse_udp_v6(). Depends on checksum16()/struct tcp_result/
+ * struct udp_result/parse_tcp_options()/TCP_MIN_HDR_BYTES/UDP_HDR_LEN
+ * from dpi_rfc_parser.c above — must be included after it. */
+#include "dpi_ipv6_parser.c"
+
 /* Provides: struct tcp_flow_key, tcp_reassembly_insert(), TCP_OVERLAP_FIRST_WINS. */
 #include "dpi_tcp_flow_reassembly.c"
 
@@ -83,6 +89,11 @@
 #include "dpi_radius_parser.c"
 #include "dpi_gtp_parser.c"
 #include "dpi_dns_parser.c"
+#include "dpi_http1_parser.c"
+#include "dpi_http2_parser.c"
+#include "dpi_ssh_parser.c"
+#include "dpi_dhcp_parser.c"
+#include "dpi_sip_rtp_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -152,6 +163,7 @@ static int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool, uint16_t n
 /* Forward declaration: dissect_packet() calls this before its full
  * definition appears later in this file. */
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     uint16_t len = rte_pktmbuf_pkt_len(m);
@@ -162,15 +174,19 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t ethertype = rte_be_to_cpu_16(eth->ether_type);
+    const uint8_t *ip_start = (const uint8_t *)(eth + 1);
+    uint16_t ip_len = len - sizeof(struct rte_ether_hdr);
 
-    if (ethertype != RTE_ETHER_TYPE_IPV4) {
-        rte_pktmbuf_free(m);   /* IPv6 and everything else: not handled yet,
-                                 * see the README's protocol coverage table */
+    if (ethertype == RTE_ETHER_TYPE_IPV6) {
+        dissect_ipv6_packet(ip_start, ip_len, queue_id);
+        rte_pktmbuf_free(m);
         return;
     }
 
-    const uint8_t *ip_start = (const uint8_t *)(eth + 1);
-    uint16_t ip_len = len - sizeof(struct rte_ether_hdr);
+    if (ethertype != RTE_ETHER_TYPE_IPV4) {
+        rte_pktmbuf_free(m);   /* not IPv4 or IPv6: not handled */
+        return;
+    }
 
     struct ipv4_result ip_result;
     if (!parse_ipv4(ip_start, ip_len, &ip_result)) {
@@ -340,9 +356,111 @@ static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uin
 }
 
 /* -----------------------------------------------------------------
- * Per-core poll loop. Each lcore owns exactly one RX queue — no
- * shared state with other cores on this hot path.
+ * IPv6 entry point. UDP-over-IPv6 gets full treatment — dispatch_
+ * dissection() and score_vpn_traffic() are IP-version-agnostic (they
+ * operate on the L4 payload + port + protocol string, nothing IPv4-
+ * specific), so RADIUS/QUIC/GTP/DNS/DHCP/SIP/RTP and VPN fingerprinting
+ * all work over IPv6 exactly as they do over IPv4 with no extra code.
+ *
+ * TCP-over-IPv6 is DELIBERATELY NOT wired to classification/reassembly
+ * in this pass — see dpi_ipv6_parser.c's header comment for why:
+ * dpi_tcp_flow_reassembly.c's flow key uses 32-bit fields sized for
+ * IPv4 addresses, and extending that is a real, separate integration
+ * task. TCP-over-IPv6 packets are parsed and checksum-verified here
+ * (so a bug in that path would still be caught by fuzzing/testing),
+ * but intentionally go no further — counted, not silently dropped
+ * without a trace.
  * ----------------------------------------------------------------- */
+static _Atomic uint64_t g_ipv6_tcp_deferred_count = 0;   /* visibility into how much
+                                                    * TCP-over-IPv6 traffic
+                                                    * is currently NOT
+                                                    * reaching classification.
+                                                    * Atomic — incremented
+                                                    * concurrently from every
+                                                    * lcore, same reasoning as
+                                                    * the flow table race fixed
+                                                    * earlier in this project. */
+
+static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id) {
+    struct ipv6_result ip6_result;
+    if (!parse_ipv6(ip_start, ip_len, &ip6_result)) return;
+
+    if (ip6_result.next_header == 17 /* UDP */) {
+        struct udp_result udp_result;
+        if (!parse_udp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                           ip6_result.payload, ip6_result.payload_len, &udp_result)) {
+            return;
+        }
+        if (udp_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(udp_result.payload, udp_result.payload_len,
+                                            udp_result.dst_port, "UDP", &dissect_out);
+
+        struct vpn_result vpn;
+        score_vpn_traffic(udp_result.payload, udp_result.payload_len,
+                           udp_result.dst_port, "UDP", NULL, &vpn);
+
+        /* IPv6 source/destination addresses are NOT currently surfaced
+         * in the flow record — flow_log_record's fields are sized for
+         * the IPv4-oriented JSON shape, and adding proper 128-bit
+         * address fields is a small, contained follow-up better done
+         * once the larger tcp_flow_key/IPv6 question above is
+         * resolved, rather than half-updating one struct while the
+         * other still can't represent IPv6 at all.
+         *
+         * IMPORTANT: this does NOT call fprintf() here — an earlier
+         * draft of this function did, which would have reintroduced
+         * exactly the hot-path blocking I/O problem dpi_async_output.c
+         * was built to eliminate. Caught before shipping: any per-
+         * packet visibility needs to go through the same lock-free
+         * ring buffer as everything else, not a direct stderr write on
+         * the RX/dissection path. */
+        struct flow_log_record rec = {0};
+        rec.src_port = udp_result.src_port;
+        rec.dst_port = udp_result.dst_port;
+        rec.vpn_score = vpn.score;
+        strncpy(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol) - 1);
+
+        if (matched) {
+            strncpy(rec.category, dissect_out.protocol_name, sizeof(rec.category) - 1);
+            const char *sni = dissect_result_get(&dissect_out, "sni");
+            if (sni) {
+                strncpy(rec.sni, sni, sizeof(rec.sni) - 1);
+                struct classification_result cls;
+                classify_hostname(sni, &cls);
+                strncpy(rec.confidence, cls.matched ? "high" : "low", sizeof(rec.confidence) - 1);
+                if (cls.matched) strncpy(rec.app_name, cls.app_name, sizeof(rec.app_name) - 1);
+                struct dga_result dga;
+                score_dga(sni, &dga);
+                rec.dga_score = dga.score;
+            } else {
+                strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+            }
+        } else {
+            strncpy(rec.category, "unknown", sizeof(rec.category) - 1);
+            strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+        }
+
+        log_ring_try_push(queue_id, &rec);
+        return;
+    }
+
+    if (ip6_result.next_header == 6 /* TCP */) {
+        struct tcp_result tcp_result;
+        if (parse_tcp_v6(ip6_result.src_addr, ip6_result.dst_addr,
+                          ip6_result.payload, ip6_result.payload_len, &tcp_result)) {
+            /* Parsed and checksum-verified successfully — but per this
+             * function's header comment, deliberately not carried any
+             * further in this pass. Counted for operational visibility
+             * rather than silently vanishing. */
+            g_ipv6_tcp_deferred_count++;   /* atomic: safe under concurrent lcore access */
+        }
+        return;
+    }
+
+    /* Other next_header values (ICMPv6, ESP, AH, etc.): not handled. */
+}
 static int lcore_worker(void *arg) {
     uint16_t queue_id = *(uint16_t *)arg;
     uint16_t port_id = 0;

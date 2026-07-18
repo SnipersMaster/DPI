@@ -1,10 +1,9 @@
 /*
  * dpi_dns_parser.c
  *
- * DNS (RFC 1035) dissector — header + question section, with the
- * query name and type/class extracted. Answer/authority/additional
- * records are not walked in this reference version (see the note
- * near the bottom).
+ * DNS (RFC 1035) dissector — header + question section + answer
+ * record walking (A/AAAA/CNAME). Authority and additional sections are
+ * not walked in this reference version (see the note near the bottom).
  *
  * Standard ports: UDP/53 (primary), TCP/53 (large responses, zone
  * transfers) — this dissector's detect()/dissect() take an l4_proto
@@ -38,6 +37,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 
 #define DNS_PORT            53
 #define DNS_HDR_LEN         12
@@ -212,13 +212,96 @@ static void dns_dissect(const uint8_t *payload, uint16_t len,
     snprintf(buf, sizeof(buf), "%u", qclass);
     dissect_result_add(out, "dns_qclass", buf);
 
-    /* Answer/authority/additional records aren't walked here — for a
-     * query, they're typically absent anyway; for a response, the
-     * resolved IP addresses (A/AAAA records) would be the valuable
-     * next addition, following the same name-decompression routine
-     * above plus a TYPE-specific RDATA parser per record type. Flagged
-     * as a known gap, not silently incomplete. */
-    dissect_result_add(out, "dns_answer_records_not_parsed", "true");
+    /* Answer section — the resolved IP addresses (A/AAAA) and CNAME
+     * chains, when this message is a response. This reuses the exact
+     * same dns_decode_name() used for the question above; RRs
+     * legitimately DO use compression pointers back to the question
+     * name (this is the case that wasn't representable in the
+     * question-only version — an RR's NAME field pointing back to
+     * offset 12 is completely normal, unlike a self-referential
+     * question). RDATA is parsed per-type for A/AAAA/CNAME; other
+     * types are skipped by their declared RDLENGTH rather than parsed
+     * — extending to more types follows the same pattern.
+     */
+    uint16_t ancount = (payload[6] << 8) | payload[7];
+    int records_parsed = 0;
+
+    for (uint16_t i = 0; i < ancount && pos < len; i++) {
+        if (records_parsed >= 32) {   /* sanity bound on how many answer
+                                        * records we'll walk per message */
+            dissect_result_add(out, "parse_warning", "answer_record_limit_reached");
+            break;
+        }
+
+        char rr_name[MAX_LABEL_OUTPUT];
+        size_t rr_name_consumed = dns_decode_name(payload, len, pos, rr_name, sizeof(rr_name));
+        if (rr_name_consumed == 0) {
+            dissect_result_add(out, "parse_warning", "malformed_answer_rr_name");
+            break;
+        }
+        pos += rr_name_consumed;
+
+        if (pos + 10 > len) {   /* TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2) */
+            dissect_result_add(out, "parse_warning", "truncated_answer_rr_header");
+            break;
+        }
+        uint16_t rr_type = (payload[pos] << 8) | payload[pos + 1];
+        uint32_t rr_ttl = (payload[pos+4]<<24)|(payload[pos+5]<<16)|(payload[pos+6]<<8)|payload[pos+7];
+        uint16_t rdlength = (payload[pos + 8] << 8) | payload[pos + 9];
+        pos += 10;
+
+        if (pos + rdlength > len) {
+            dissect_result_add(out, "parse_warning", "rdata_exceeds_available_length");
+            break;
+        }
+
+        char field_key[32], field_val[300];
+
+        switch (rr_type) {
+            case 1:   /* A */
+                if (rdlength == 4) {
+                    snprintf(field_key, sizeof(field_key), "dns_answer_%d_a", records_parsed);
+                    snprintf(field_val, sizeof(field_val), "%u.%u.%u.%u",
+                             payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]);
+                    dissect_result_add(out, field_key, field_val);
+                }
+                break;
+            case 28: {  /* AAAA */
+                if (rdlength == 16) {
+                    char v6buf[46];
+                    struct in6_addr addr;
+                    memcpy(&addr, payload + pos, 16);
+                    if (inet_ntop(AF_INET6, &addr, v6buf, sizeof(v6buf))) {
+                        snprintf(field_key, sizeof(field_key), "dns_answer_%d_aaaa", records_parsed);
+                        dissect_result_add(out, field_key, v6buf);
+                    }
+                }
+                break;
+            }
+            case 5: {   /* CNAME — RDATA is itself a (possibly compressed) name */
+                char cname[MAX_LABEL_OUTPUT];
+                size_t cname_consumed = dns_decode_name(payload, len, pos, cname, sizeof(cname));
+                if (cname_consumed != 0) {
+                    snprintf(field_key, sizeof(field_key), "dns_answer_%d_cname", records_parsed);
+                    dissect_result_add(out, field_key, cname);
+                }
+                break;
+            }
+            default:
+                break;   /* unrecognized type: RDATA already bounds-validated
+                          * above, just skip over it via rdlength below */
+        }
+
+        (void)rr_ttl;   /* extracted but not currently surfaced as its own
+                          * field — TTL-based caching/expiry analysis is a
+                          * reasonable future addition, not done here */
+        pos += rdlength;
+        records_parsed++;
+    }
+
+    char count_buf[16];
+    snprintf(count_buf, sizeof(count_buf), "%d", records_parsed);
+    dissect_result_add(out, "dns_answer_records_parsed", count_buf);
 }
 
 static const uint16_t dns_hint_ports[] = { DNS_PORT };

@@ -32,6 +32,13 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Provides: load_protocol_config(), protocol_enabled() — the protocol
+ * "arsenal" config. Included unconditionally (not gated by
+ * DPI_SKIP_REGISTER_ALL) since it's small, self-contained, and doesn't
+ * add meaningful build cost even for single-dissector fuzz harnesses
+ * that don't call register_all_dissectors(). */
+#include "dpi_protocol_config.c"
+
 #define MAX_DISSECTORS      64
 #define MAX_PROTOCOL_NAME   32
 #define MAX_FIELD_KEY_LEN   32
@@ -193,22 +200,43 @@ static bool dispatch_dissection(const uint8_t *payload, uint16_t len,
  */
 #ifndef DPI_SKIP_REGISTER_ALL
 static void register_all_dissectors(void) {
+    /* Load the protocol "arsenal" config once, before registering
+     * anything — see dpi_protocol_config.c for why this is a
+     * startup-time-only config, not hot-reloaded like domain_rules.ini. */
+    load_protocol_config("protocols.ini");
+
     /* extern declarations for each protocol module's registration fn: */
     extern void register_radius_dissector(void);
     extern void register_quic_dissector(void);
     extern void register_gtp_dissector(void);
     extern void register_gtpv2_dissector(void);
     extern void register_dns_dissector(void);
-    /* future: register_ssh_dissector(); register_smtp_dissector();
-     * register_dhcp_dissector(); etc. */
+    extern void register_http1_dissector(void);
+    extern void register_http2_dissector(void);
+    extern void register_ssh_dissector(void);
+    extern void register_dhcp_dissector(void);
+    extern void register_sip_dissector(void);
+    extern void register_rtp_dissector(void);
 
-    register_radius_dissector();
-    register_quic_dissector();
-    register_gtp_dissector();
-    register_gtpv2_dissector();
-    register_dns_dissector();
+    /* Each registration is now gated by the arsenal config — a
+     * protocol disabled in protocols.ini is simply never registered,
+     * rather than registered-and-ignored. This is the actual "modular,
+     * one place to configure" behavior requested: register_all_
+     * dissectors() itself doesn't need editing to turn a protocol on
+     * or off anymore, protocols.ini does. */
+    if (protocol_enabled("radius")) register_radius_dissector();
+    if (protocol_enabled("quic"))   register_quic_dissector();
+    if (protocol_enabled("gtp"))    register_gtp_dissector();
+    if (protocol_enabled("gtpv2"))  register_gtpv2_dissector();
+    if (protocol_enabled("dns"))    register_dns_dissector();
+    if (protocol_enabled("http1"))  register_http1_dissector();
+    if (protocol_enabled("http2"))  register_http2_dissector();
+    if (protocol_enabled("ssh"))    register_ssh_dissector();
+    if (protocol_enabled("dhcp"))   register_dhcp_dissector();
+    if (protocol_enabled("sip"))    register_sip_dissector();
+    if (protocol_enabled("rtp"))    register_rtp_dissector();
 
-    fprintf(stderr, "dissector_registry: %d protocol dissector(s) registered\n",
-            g_n_dissectors);
+    fprintf(stderr, "dissector_registry: %d protocol dissector(s) registered "
+            "(per protocols.ini)\n", g_n_dissectors);
 }
 #endif /* DPI_SKIP_REGISTER_ALL */
