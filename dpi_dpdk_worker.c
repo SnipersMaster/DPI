@@ -102,6 +102,7 @@
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
+#include "dpi_smtp_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -339,6 +340,8 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
                 strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
                 const char *identity = dissect_result_get(&tcp_out, "http_host");
                 if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
+                if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
                 if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
                 strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
             }
@@ -654,6 +657,8 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                     strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
                     const char *identity = dissect_result_get(&tcp_out, "http_host");
                     if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
                     if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
                     strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
                 }

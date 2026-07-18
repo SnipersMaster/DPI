@@ -124,11 +124,56 @@ static void icmpv4_dissect(const uint8_t *payload, uint16_t len,
         dissect_result_add(out, "icmp_redirect_gateway", ipbuf);
     } else if ((type == 3 || type == 11) && len > ICMP_HDR_LEN) {
         /* Destination Unreachable / Time Exceeded: the original
-         * (offending) packet's IP header + first 8 bytes follow —
-         * flagged as present, not parsed further in this pass (would
-         * follow the same recursive-dissection pattern used for GTP-U
-         * inner packets if extended). */
+         * (offending) packet's IP header + at least the first 8 bytes
+         * of its L4 payload follow, per RFC 792. Same bounded (one
+         * level, no further recursion) pattern as GTP-U inner-packet
+         * dissection. IMPORTANT DIFFERENCE from GTP-U: RFC 792 only
+         * guarantees 8 bytes of the ORIGINAL packet's data — enough
+         * for a full UDP header (8 bytes) but NOT enough for a full
+         * TCP header (20 bytes minimum). So this deliberately extracts
+         * only what's always safe regardless of L4 protocol: the
+         * embedded IP header (via parse_ipv4(), which validates its
+         * own length independently) and, if there's room, just the
+         * source/destination PORT NUMBERS directly — the first 4
+         * bytes of ANY TCP or UDP header — rather than calling
+         * parse_tcp()/parse_udp(), which would fail or misbehave
+         * against a header that's likely truncated by design, not by
+         * malice. Modern implementations (RFC 1812) often include
+         * more than the original 8-byte minimum, but this dissector
+         * doesn't assume that. */
         dissect_result_add(out, "icmp_original_packet_present", "true");
+
+        const uint8_t *orig_pkt = payload + ICMP_HDR_LEN;
+        uint16_t orig_len = len - ICMP_HDR_LEN;
+
+        struct ipv4_result orig_ip;
+        if (parse_ipv4(orig_pkt, orig_len, &orig_ip)) {
+            char ipbuf[32];
+            snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+                     (orig_ip.src_addr >> 24) & 0xFF, (orig_ip.src_addr >> 16) & 0xFF,
+                     (orig_ip.src_addr >> 8) & 0xFF, orig_ip.src_addr & 0xFF);
+            dissect_result_add(out, "icmp_original_src_ip", ipbuf);
+            snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+                     (orig_ip.dst_addr >> 24) & 0xFF, (orig_ip.dst_addr >> 16) & 0xFF,
+                     (orig_ip.dst_addr >> 8) & 0xFF, orig_ip.dst_addr & 0xFF);
+            dissect_result_add(out, "icmp_original_dst_ip", ipbuf);
+
+            if ((orig_ip.protocol == 6 || orig_ip.protocol == 17) && orig_ip.payload_len >= 4) {
+                /* First 4 bytes of ANY TCP or UDP header are always
+                 * src_port(2)+dst_port(2) — safe to read directly
+                 * without calling the full parse_tcp()/parse_udp(),
+                 * which require more bytes than RFC 792 guarantees. */
+                uint16_t orig_src_port = (orig_ip.payload[0] << 8) | orig_ip.payload[1];
+                uint16_t orig_dst_port = (orig_ip.payload[2] << 8) | orig_ip.payload[3];
+                char portbuf[16];
+                snprintf(portbuf, sizeof(portbuf), "%u", orig_src_port);
+                dissect_result_add(out, "icmp_original_src_port", portbuf);
+                snprintf(portbuf, sizeof(portbuf), "%u", orig_dst_port);
+                dissect_result_add(out, "icmp_original_dst_port", portbuf);
+                dissect_result_add(out, "icmp_original_protocol",
+                                    orig_ip.protocol == 6 ? "TCP" : "UDP");
+            }
+        }
     }
 }
 
@@ -220,9 +265,65 @@ static void icmpv6_dissect(const uint8_t *payload, uint16_t len,
         }
     } else if ((type == 1 || type == 3) && len > ICMPV6_HDR_LEN) {
         /* Destination Unreachable / Time Exceeded: original packet
-         * follows, same "flagged, not recursively parsed" treatment
-         * as ICMPv4. */
+         * follows. UNLIKE ICMPv4's RFC 792 (which guarantees only 8
+         * bytes of the original packet's L4 data), RFC 4443 §2.4
+         * requires including "as much of the invoking packet as
+         * possible without the ICMPv6 packet exceeding the minimum
+         * IPv6 MTU" (1280 bytes) — so a full embedded TCP/UDP header
+         * is typically actually present, and parse_tcp_v6()/
+         * parse_udp_v6() are safe to call directly here (they
+         * validate their own length requirements internally and
+         * simply return false if truncated, same as anywhere else in
+         * this project — not assumed to succeed). */
         dissect_result_add(out, "icmpv6_original_packet_present", "true");
+
+        const uint8_t *orig_pkt = payload + ICMPV6_HDR_LEN;
+        uint16_t orig_len = len - ICMPV6_HDR_LEN;
+
+        struct ipv6_result orig_ip6;
+        if (parse_ipv6(orig_pkt, orig_len, &orig_ip6)) {
+            char src_buf[46], dst_buf[46];
+            ipv6_addr_to_string(orig_ip6.src_addr, src_buf, sizeof(src_buf));
+            ipv6_addr_to_string(orig_ip6.dst_addr, dst_buf, sizeof(dst_buf));
+            dissect_result_add(out, "icmpv6_original_src_ip", src_buf);
+            dissect_result_add(out, "icmpv6_original_dst_ip", dst_buf);
+
+            if (orig_ip6.next_header == 6 /* TCP */) {
+                struct tcp_result orig_tcp;
+                if (parse_tcp_v6(orig_ip6.src_addr, orig_ip6.dst_addr,
+                                  orig_ip6.payload, orig_ip6.payload_len, &orig_tcp)) {
+                    char portbuf[16];
+                    snprintf(portbuf, sizeof(portbuf), "%u", orig_tcp.src_port);
+                    dissect_result_add(out, "icmpv6_original_src_port", portbuf);
+                    snprintf(portbuf, sizeof(portbuf), "%u", orig_tcp.dst_port);
+                    dissect_result_add(out, "icmpv6_original_dst_port", portbuf);
+                    dissect_result_add(out, "icmpv6_original_protocol", "TCP");
+                } else if (orig_ip6.payload_len >= 4) {
+                    /* Full header parse failed (truncated after all) —
+                     * fall back to just the ports, same conservative
+                     * approach as ICMPv4 above. */
+                    uint16_t sp = (orig_ip6.payload[0] << 8) | orig_ip6.payload[1];
+                    uint16_t dp = (orig_ip6.payload[2] << 8) | orig_ip6.payload[3];
+                    char portbuf[16];
+                    snprintf(portbuf, sizeof(portbuf), "%u", sp);
+                    dissect_result_add(out, "icmpv6_original_src_port", portbuf);
+                    snprintf(portbuf, sizeof(portbuf), "%u", dp);
+                    dissect_result_add(out, "icmpv6_original_dst_port", portbuf);
+                    dissect_result_add(out, "icmpv6_original_protocol", "TCP");
+                }
+            } else if (orig_ip6.next_header == 17 /* UDP */) {
+                struct udp_result orig_udp;
+                if (parse_udp_v6(orig_ip6.src_addr, orig_ip6.dst_addr,
+                                  orig_ip6.payload, orig_ip6.payload_len, &orig_udp)) {
+                    char portbuf[16];
+                    snprintf(portbuf, sizeof(portbuf), "%u", orig_udp.src_port);
+                    dissect_result_add(out, "icmpv6_original_src_port", portbuf);
+                    snprintf(portbuf, sizeof(portbuf), "%u", orig_udp.dst_port);
+                    dissect_result_add(out, "icmpv6_original_dst_port", portbuf);
+                    dissect_result_add(out, "icmpv6_original_protocol", "UDP");
+                }
+            }
+        }
     }
 }
 

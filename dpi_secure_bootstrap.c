@@ -68,6 +68,7 @@
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
+#include "dpi_smtp_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -417,6 +418,8 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                     strncpy(effective_category, tcp_out.protocol_name, sizeof(effective_category) - 1);
                     const char *identity = dissect_result_get(&tcp_out, "http_host");
                     if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
                     if (identity) strncpy(effective_app_name, identity, sizeof(effective_app_name) - 1);
                     strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
                 }
