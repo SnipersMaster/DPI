@@ -118,7 +118,11 @@ than a growing special case inside one function.
 | `dpi_dpdk_worker.c` | Multi-core, DPDK-based capture worker for 100G line rate. RSS across cores, VFIO-based device binding (IOMMU-protected DMA). **Wired end-to-end for both TCP and UDP**, with 100G-specific care: classification gated to run once per flow (`is_first_delivery`), mbuf freed before classification runs, and output goes through `dpi_async_output.c`'s lock-free ring buffer — no blocking I/O on the hot path. Contains detailed lab setup instructions in its header comment (IOMMU, hugepages, core isolation) — read those before the code. | DPDK, VFIO-capable NIC/kernel, and (via `#include`) the RFC parser, flow reassembly, classifier, dissector registry, RADIUS, QUIC, async output |
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting/I/O happens only in the drain thread. Deliberately a plain pthread, not another DPDK lcore, since it does blocking I/O and shouldn't consume an isolated poll-mode core. | none (self-contained) |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
-| `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. | none (self-contained) |
+| `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
+| `fuzz_rfc_parser.c`, `fuzz_tcp_reassembly.c`, `fuzz_radius_parser.c`, `fuzz_quic_header.c`, `fuzz_quic_frames.c` | libFuzzer harnesses for the five highest-value fuzz targets. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
+| `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
+| `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
 | `dpi_app_classifier.c` | Orchestration layer. Extracts TLS SNI (RFC 8446 / RFC 6066), calls the domain classifier, DGA scorer, and VPN scorer, assembles one `app_classification` result per flow. | Includes the three files below directly |
 | `dpi_domain_rules_loader.c` | Loads `domain_rules.ini` into a dynamic, hot-reloadable table. Validates entries on load (rejects paths/whitespace/malformed suffixes, flags duplicates) and logs a skip count. | `domain_rules.ini` |
 | `domain_rules.ini` | ~420 domain→category rules across 20 categories (social media, streaming, messaging, cloud infra, productivity, e-commerce, gaming, finance, VPN providers, etc). Editable without a rebuild — reload is automatic on file change. | none |
@@ -175,53 +179,31 @@ reference/prototype stage but not for a maintained codebase.
 
 ## Suggested next steps, roughly in priority order
 
-**Done in this pass**: both capture files now have a UDP branch
-(RADIUS/QUIC via the dissector registry, plus WireGuard/IKE
-fingerprinting), and the DPDK worker's hot-path `printf()` is replaced
-with `dpi_async_output.c`'s lock-free per-lcore ring buffer + dedicated
-drain thread.
+**Done in this pass**: five libFuzzer harnesses (`fuzz_rfc_parser.c`,
+`fuzz_tcp_reassembly.c`, `fuzz_radius_parser.c`, `fuzz_quic_header.c`,
+`fuzz_quic_frames.c`), a seed corpus per harness, a build script, and
+`FUZZING.md` covering methodology and crash triage. **Not compiled or
+run** — no clang/libFuzzer in this sandbox. This is the single most
+important next step to actually do in your lab before anything here
+touches real traffic.
 
-**Wiring this in surfaced two real bugs, now fixed — worth knowing
-about even though they're resolved:**
-1. `dpi_tcp_flow_reassembly.c`'s flow table was a single array shared
-   across all lcores with **no locking** — a genuine data race, not a
-   theoretical one (two lcores could find and write the same "empty"
-   slot simultaneously). Fixed by partitioning the table per-lcore
-   (`partition_id` parameter, indexed by queue_id) — combined with RSS
-   already pinning each flow to one core, this needed zero locks once
-   partitioned correctly, rather than needing a mutex.
-2. `dpi_quic_parser.c`'s decrypted-payload buffer was declared
-   `static` — safe for a single caller, silently corrupting under
-   concurrent calls from multiple lcores. Fixed by making it a stack
-   variable (small enough — 1500 bytes — that this was always the
-   right call, not just a workaround).
-
-Neither bug would have been visible testing the single-core bootstrap
-alone — both only manifest under genuine concurrency, which is exactly
-why wiring into the actual multi-core capture path (rather than
-treating each module as "done" once it compiled in isolation) matters.
-
-1. **Compile everything against real dev headers** and fix whatever
+1. **Actually run the fuzzers** (see above — this is now possible, not
+   yet done). Start with a few CPU-hours per harness minimum; see
+   `FUZZING.md` for what "done" looks like and how to triage anything
+   found.
+2. **Compile everything against real dev headers** and fix whatever
    the compiler catches that a read-through couldn't (this has never
-   been through a compiler — that remains true for every file here,
-   and matters more now that up to 7 files get `#include`d together
-   into one translation unit in the DPDK worker).
-2. **Validate the QUIC module against RFC 9001 Appendix A.2's published
+   been through a compiler — that remains true for every file here).
+3. **Validate the QUIC module against RFC 9001 Appendix A.2's published
    test vector.** The module's *logic* has been cross-checked against
    the RFC's own pseudocode section by section, but that is not the
    same as confirming it produces byte-exact correct output against a
-   known input.
-3. **Load-test the async output ring buffer under realistic burst
+   known input. (Note: this is a different kind of check than fuzzing —
+   fuzzing finds crashes and memory-safety bugs, not protocol
+   correctness against the spec's own numbers.)
+4. **Load-test the async output ring buffer under realistic burst
    conditions** to see actual drop rates at `LOG_RING_SIZE=8192` per
-   lcore, and tune the constant against your real traffic mix rather
-   than the default — a burst of many simultaneous new flows (e.g. a
-   client opening dozens of connections at once) is the case most
-   likely to actually fill a ring.
-4. **Fuzz each dissector independently** (AFL++/libFuzzer), per the
-   very first security checklist in this project — especially
-   `dpi_rfc_parser.c`, `dpi_tcp_flow_reassembly.c`, and
-   `dpi_quic_parser.c`, since they parse the most attacker-influenced
-   structure.
+   lcore, and tune the constant against your real traffic mix.
 5. **Add IPv6 support.** Flagged in the protocol table above as the
    most significant coverage gap — the entire engine is IPv4-only
    right now.

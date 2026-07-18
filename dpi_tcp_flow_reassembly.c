@@ -364,6 +364,21 @@ report_stats:
 }
 
 /*
+ * Test/fuzzing-only helper: clears one partition's flows entirely.
+ * NOT for production use — real deployments rely on timeout eviction
+ * and the bounded table filling naturally under real traffic patterns.
+ * This exists because a long-running fuzz harness makes millions of
+ * calls in-process without ever exiting, which would otherwise
+ * eventually exhaust TCP_REASSEMBLY_FLOWS_PER_PARTITION and start
+ * silently dropping every subsequent test case rather than exercising
+ * fresh state each iteration.
+ */
+static void tcp_reassembly_reset_partition_for_testing(uint16_t partition_id) {
+    if (partition_id >= TCP_REASSEMBLY_NUM_PARTITIONS) return;
+    memset(g_tcp_flows[partition_id], 0, sizeof(g_tcp_flows[partition_id]));
+}
+
+/*
  * Example integration with the rest of the engine:
  *
  *   struct tcp_flow_key key = { src_ip, dst_ip, src_port, dst_port };

@@ -266,6 +266,11 @@ static double quic_detect(const uint8_t *payload, uint16_t len,
                     * derive keys for a version we don't have a salt for */
 }
 
+/* Forward declaration: quic_dissect() calls this before its full
+ * definition appears later in this file. */
+static void quic_process_decrypted_payload(const uint8_t *plaintext, int plaintext_len,
+                                            struct dissect_result *out);
+
 /* ------------------------------------------------------------------
  * dissect() — full path: parse header, derive keys, remove header
  * protection, AEAD-decrypt, find the CRYPTO frame, hand its contents
@@ -385,14 +390,35 @@ static void quic_dissect(const uint8_t *payload, uint16_t len,
         return;
     }
 
-    /* Walk decrypted QUIC frames looking for a CRYPTO frame (type
-     * 0x06). RFC 9000 S19.6: type(varint) + offset(varint) +
-     * length(varint) + data. A production implementation needs to
-     * handle CRYPTO frame reassembly (offset != 0, split across
-     * multiple Initial packets) — this reference version only handles
-     * the common case of the whole ClientHello fitting in one frame
-     * starting at offset 0, and flags anything else rather than
-     * guessing. */
+    /* Frame-walking, CRYPTO frame extraction, and SNI parsing all live
+     * in a standalone function below (quic_process_decrypted_payload),
+     * deliberately split out of this function at the AEAD trust
+     * boundary. This split matters for fuzzing: past this point every
+     * byte is attacker-controlled plaintext with no cryptographic gate
+     * in front of it, so it can and should be fuzzed directly with raw
+     * bytes (see fuzz_quic_frames.c) without needing to construct a
+     * validly-encrypted packet first — naive random-byte fuzzing of
+     * the WHOLE function would spend nearly all its time failing
+     * AES-GCM authentication and never reach this logic at all. */
+    quic_process_decrypted_payload(plaintext, plaintext_len, out);
+}
+
+/*
+ * Everything past AEAD decryption: walk decrypted QUIC frames looking
+ * for a CRYPTO frame (RFC 9000 S19.6: type(varint) + offset(varint) +
+ * length(varint) + data), then extract SNI from the ClientHello inside
+ * it. Split into its own function specifically so it can be fuzzed
+ * directly on raw bytes treated as already-decrypted plaintext — see
+ * the comment in quic_dissect() above for why that split matters.
+ *
+ * A production implementation needs to handle CRYPTO frame
+ * reassembly (offset != 0, split across multiple Initial packets) —
+ * this reference version only handles the common case of the whole
+ * ClientHello fitting in one frame starting at offset 0, and flags
+ * anything else rather than guessing.
+ */
+static void quic_process_decrypted_payload(const uint8_t *plaintext, int plaintext_len,
+                                            struct dissect_result *out) {
     size_t fp = 0;
     while (fp < (size_t)plaintext_len) {
         uint64_t frame_type = 0; size_t flen = 0;
