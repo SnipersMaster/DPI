@@ -172,16 +172,43 @@ static bool dispatch_dissection(const uint8_t *payload, uint16_t len,
  * that grows by one line per protocol, each protocol's logic fully
  * contained in its own file, independently fuzzable and testable.
  */
+/*
+ * register_all_dissectors() is guarded behind this macro so that a
+ * fuzz harness targeting ONE dissector in isolation (e.g.
+ * fuzz_radius_parser.c) can include this registry file for
+ * struct dissect_result / dissect_result_add() / register_dissector()
+ * WITHOUT being forced to also link every other protocol module (and
+ * their dependencies — QUIC alone pulls in OpenSSL) just to satisfy
+ * this function's extern references to registration functions the
+ * harness never calls. Define DPI_SKIP_REGISTER_ALL before including
+ * this file to get that isolation; the real capture paths
+ * (dpi_dpdk_worker.c, dpi_secure_bootstrap.c) do NOT define it, since
+ * they genuinely need every dissector registered.
+ *
+ * This preserves the "each dissector is independently fuzzable"
+ * design goal stated earlier in this file's own header comment —
+ * without this guard, that goal was quietly broken by every fuzz
+ * harness needing the full multi-protocol dependency graph just to
+ * link, which defeats the point of testing one dissector in isolation.
+ */
+#ifndef DPI_SKIP_REGISTER_ALL
 static void register_all_dissectors(void) {
     /* extern declarations for each protocol module's registration fn: */
     extern void register_radius_dissector(void);
     extern void register_quic_dissector(void);
-    /* future: register_dns_dissector(); register_ssh_dissector();
-     * register_smtp_dissector(); register_dhcp_dissector(); etc. */
+    extern void register_gtp_dissector(void);
+    extern void register_gtpv2_dissector(void);
+    extern void register_dns_dissector(void);
+    /* future: register_ssh_dissector(); register_smtp_dissector();
+     * register_dhcp_dissector(); etc. */
 
     register_radius_dissector();
     register_quic_dissector();
+    register_gtp_dissector();
+    register_gtpv2_dissector();
+    register_dns_dissector();
 
     fprintf(stderr, "dissector_registry: %d protocol dissector(s) registered\n",
             g_n_dissectors);
 }
+#endif /* DPI_SKIP_REGISTER_ALL */

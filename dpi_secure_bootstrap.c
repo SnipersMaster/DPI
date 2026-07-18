@@ -55,6 +55,8 @@
 #include "dpi_app_classifier.c"
 #include "dpi_dissector_registry.c"
 #include "dpi_radius_parser.c"
+#include "dpi_gtp_parser.c"
+#include "dpi_dns_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------

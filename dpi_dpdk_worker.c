@@ -81,6 +81,8 @@
  * included right below rather than compiled/linked separately. */
 #include "dpi_dissector_registry.c"
 #include "dpi_radius_parser.c"
+#include "dpi_gtp_parser.c"
+#include "dpi_dns_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -368,6 +370,17 @@ int main(int argc, char **argv) {
     }
     argc -= ret; argv += ret;
 
+    /* App-specific argument (after EAL's own args, which rte_eal_init
+     * already consumed above): the output sink config string, e.g.
+     *   ./dpi_dpdk_worker -l 0-7 -n 4 -- file:/var/log/dpi/flows.log
+     *   ./dpi_dpdk_worker -l 0-7 -n 4 -- syslog:daemon
+     *   ./dpi_dpdk_worker -l 0-7 -n 4 -- unix:/var/run/dpi/output.sock
+     * Defaults to a file sink in a conventional location if not given —
+     * chosen over defaulting to stdout so a real deployment doesn't
+     * accidentally end up writing flow records to whatever stdout
+     * happens to be redirected to. */
+    const char *sink_config = (argc > 1) ? argv[1] : "file:/var/log/dpi/flows.log";
+
     uint16_t n_queues = rte_lcore_count();
     if (n_queues > MAX_QUEUES) n_queues = MAX_QUEUES;
     if (n_queues > TCP_REASSEMBLY_NUM_PARTITIONS) {
@@ -384,18 +397,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Register RADIUS/QUIC dissectors ONCE, before any lcore starts.
-     * dpi_dissector_registry.c's g_registry array is read-only after
-     * this point — safe for concurrent lcore reads with no locking,
-     * but only because nothing writes to it after this call completes
-     * and before the RX loops begin. */
+    /* Register RADIUS/QUIC/GTP/DNS dissectors ONCE, before any lcore
+     * starts. dpi_dissector_registry.c's g_registry array is read-only
+     * after this point — safe for concurrent lcore reads with no
+     * locking, but only because nothing writes to it after this call
+     * completes and before the RX loops begin. */
     register_all_dissectors();
 
     /* Start the async output drain thread BEFORE workers begin
      * producing records — see dpi_async_output.c for why this is a
      * plain pthread rather than another DPDK lcore (it does blocking
      * I/O, which has no place on an isolated poll-mode core). */
-    if (!async_output_start()) {
+    if (!async_output_start(sink_config)) {
         fprintf(stderr, "failed to start async output thread\n");
         return 1;
     }

@@ -54,6 +54,10 @@
 #include <unistd.h>
 #include <stdatomic.h>
 
+/* Provides: struct output_sink, output_sink_create(), and the
+ * file/syslog/unix-socket backend implementations. */
+#include "dpi_output_sink.c"
+
 #define LOG_RING_SIZE     8192   /* MUST be a power of 2 — see the mask-based
                                     indexing below, which relies on this */
 #define MAX_LCORE_RINGS   16
@@ -87,6 +91,7 @@ struct log_ring {
 static struct log_ring g_log_rings[MAX_LCORE_RINGS];
 static _Atomic bool g_output_thread_running = false;
 static pthread_t g_output_thread;
+static const struct output_sink *g_active_sink = NULL;
 
 /* ------------------------------------------------------------------
  * Producer side — called from the hot path. Must never block.
@@ -130,10 +135,10 @@ static void format_and_emit(const struct flow_log_record *rec) {
     /* All formatting cost (snprintf-family work) lives here, off the
      * hot path — this is deliberately the same JSON shape the earlier
      * inline printf produced, so downstream tooling doesn't need to
-     * change when this replaces it. Swap this function's body for
-     * whatever your actual sink is (a file, syslog, a Kafka producer,
-     * etc.) — stdout here is a placeholder matching what came before. */
-    printf("{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
+     * change now that this goes to a real sink instead. */
+    char line[1024];
+    int n = snprintf(line, sizeof(line),
+           "{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
            "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
            "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
            "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
@@ -143,6 +148,19 @@ static void format_and_emit(const struct flow_log_record *rec) {
            rec->dot_score, rec->doh_score, rec->out_of_order_segments,
            rec->retransmit_count, rec->overlap_conflict_count,
            rec->evasion_flag ? "true" : "false");
+
+    if (n < 0) return;   /* formatting failure: drop rather than write garbage */
+    size_t len = (n >= (int)sizeof(line)) ? sizeof(line) - 1 : (size_t)n;
+
+    if (g_active_sink) {
+        g_active_sink->write_line(line, len);
+    } else {
+        /* No sink configured: this should not happen in normal
+         * operation (async_output_start() requires a sink to be
+         * chosen), but fail safe rather than silently discard if it
+         * somehow does. */
+        fwrite(line, 1, len, stdout);
+    }
 }
 
 /*
@@ -154,6 +172,14 @@ static void format_and_emit(const struct flow_log_record *rec) {
 static void *output_drain_thread(void *arg) {
     (void)arg;
     time_t last_drop_report = time(NULL);
+    time_t last_flush = time(NULL);
+    /* How long a record can sit buffered (e.g. in the file sink's
+     * stdio buffer) before it's guaranteed to actually hit disk. Not
+     * every record needs to be flushed immediately — that would
+     * reintroduce per-record I/O cost — but an unbounded delay risks
+     * losing more on a crash than is acceptable. 1 second is a
+     * reasonable default; tune against your durability requirements. */
+    const time_t FLUSH_INTERVAL_SECONDS = 1;
 
     while (atomic_load_explicit(&g_output_thread_running, memory_order_relaxed)) {
         bool any_popped = false;
@@ -171,6 +197,12 @@ static void *output_drain_thread(void *arg) {
         }
 
         time_t now = time(NULL);
+
+        if (now - last_flush >= FLUSH_INTERVAL_SECONDS) {
+            if (g_active_sink) g_active_sink->flush();
+            last_flush = now;
+        }
+
         if (now - last_drop_report >= 10) {
             uint64_t total_dropped = 0;
             for (int i = 0; i < MAX_LCORE_RINGS; i++) {
@@ -198,16 +230,24 @@ static void *output_drain_thread(void *arg) {
             format_and_emit(&rec);
         }
     }
+    if (g_active_sink) g_active_sink->flush();   /* final flush before exit */
 
     return NULL;
 }
 
-static bool async_output_start(void) {
+static bool async_output_start(const char *sink_config) {
+    if (!output_sink_create(sink_config, &g_active_sink)) {
+        fprintf(stderr, "dpi_async_output: failed to initialize output sink "
+                "from config '%s'\n", sink_config);
+        return false;
+    }
+
     atomic_store_explicit(&g_output_thread_running, true, memory_order_relaxed);
     int ret = pthread_create(&g_output_thread, NULL, output_drain_thread, NULL);
     if (ret != 0) {
         fprintf(stderr, "dpi_async_output: failed to start drain thread: %d\n", ret);
         atomic_store_explicit(&g_output_thread_running, false, memory_order_relaxed);
+        if (g_active_sink) g_active_sink->close_sink();
         return false;
     }
     return true;
@@ -216,4 +256,5 @@ static bool async_output_start(void) {
 static void async_output_stop(void) {
     atomic_store_explicit(&g_output_thread_running, false, memory_order_relaxed);
     pthread_join(g_output_thread, NULL);
+    if (g_active_sink) g_active_sink->close_sink();
 }

@@ -64,7 +64,21 @@ See the per-file status table below before trusting any specific piece.
 
 **Both diagrams above now reflect actual wiring, not just intended architecture** — both capture entry points genuinely call the full chain for TCP (RFC parser → flow reassembly → classifier) and UDP (RFC parser → dissector registry + VPN fingerprinting) as of this pass. DoT is TCP-based (RFC 7858), so it's covered by the TCP branch, not the UDP one — worth being precise about that distinction since it's easy to lump all "DNS-adjacent encrypted" protocols together.
 
-## Supported protocols
+## Deployment requirements (100G path)
+
+| Component | Recommendation | Why |
+|---|---|---|
+| NIC | Mellanox/NVIDIA ConnectX-6 Dx/7, or Intel E810 — with a mature DPDK PMD and SR-IOV/VFIO support | Matches `dpi_dpdk_worker.c`'s RSS + VFIO design directly |
+| CPU | Modern Xeon Scalable or EPYC, 16+ cores, prioritize per-core clock over raw core count | DPI work is distributed per-flow across cores via RSS; per-core throughput matters more than total count beyond your queue requirement |
+| Core allocation | Isolated cores (`isolcpus`/`nohz_full`) for RX/dissection lcores (matching `TCP_REASSEMBLY_NUM_PARTITIONS`, default 16) + one non-isolated core for the async output drain thread | Directly mirrors this project's architecture — the drain thread is deliberately NOT an isolated lcore, see `dpi_async_output.c` |
+| RAM | 64–128GB, with 1G hugepages (not 2MB) | Covers DPDK mbuf pools, the ~76MB TCP flow table, ~52MB output rings, and reduces TLB pressure at these packet rates |
+| IOMMU | VFIO-capable (Intel VT-d / AMD-Vi), enabled in BIOS + kernel | Hard requirement — this is the entire reason VFIO was chosen over UIO (DMA isolation), not optional |
+| NUMA | Single-socket preferred, or pin NIC/memory/cores to one node on dual-socket | Cross-NUMA access is a classic silent DPDK throughput killer |
+| PCIe | 4.0/5.0 x16 for the NIC | A 100G NIC needs ~12.5GB/s just for line-rate RX; an underprovisioned slot silently caps throughput |
+
+This is a sizing starting point, not a guarantee — actual capacity depends heavily on average packet size, active dissector count, and TLS/QUIC traffic ratio (crypto-touching code costs more per packet than plaintext parsing).
+
+
 
 Three tiers, and the distinction matters: "parsed" means structured
 fields are extracted and validated; "detected" means the engine can
@@ -81,6 +95,9 @@ everything else is not touched by this engine at all yet.
 | TLS (ClientHello / SNI) | RFC 8446, RFC 6066 | `dpi_app_classifier.c` | SNI hostname from the ClientHello `server_name` extension. Does not parse the rest of the handshake (cipher suites, other extensions, certificates). |
 | RADIUS | RFC 2865, RFC 2866 | `dpi_radius_parser.c` | Packet code, identifier, User-Name, NAS-IP-Address, Calling-Station-ID, Acct-Status-Type. `User-Password` is detected as present but its value is deliberately never extracted (credential handling). |
 | DNS-over-TLS (DoT) | RFC 7858 | `dpi_doh_dot_detector.c` | Structural detection: port 853 + TLS ClientHello shape. Genuine structural signal, same discipline as the VPN detector. |
+| DNS | RFC 1035 | `dpi_dns_parser.c` | Query name (with bounds-checked, cycle-safe compression pointer decoding — verified against a cyclic-pointer adversarial test case), opcode, rcode, qtype, qclass. Answer/authority/additional records not yet walked. |
+| GTP-U v1 | 3GPP TS 29.281 | `dpi_gtp_parser.c` | Message type, TEID, sequence number (if present). Does NOT recursively dissect the inner IP packet carried by G-PDU messages — see the file's scope note. |
+| GTPv2-C | 3GPP TS 29.274 | `dpi_gtp_parser.c` | Message type, TEID (if present), sequence number. Information Elements (APN, IMSI, QoS, etc.) not yet walked. |
 
 ### Detected / scored, not fully dissected
 
@@ -98,25 +115,39 @@ everything else is not touched by this engine at all yet.
 Everything else. Notably absent, roughly in order of likely value if
 you extend this: **IPv6** (the entire engine is IPv4-only right now —
 this is a significant gap, not a minor one, given IPv6 traffic share),
-**DNS** (high value — cheap to add, plaintext unless DoH/DoT, and
-useful both standalone and as a correlation signal for the DGA/VPN
-detectors), **HTTP/1.1 and HTTP/2** (Host header / `:authority`
-extraction, useful where TLS isn't in play or as a fallback), **SSH**,
-**FTP**, **SMTP/IMAP/POP3**, **SMB**, **SIP/RTP**, **MQTT**, **NTP**,
-**DHCP**, **SNMP**, and industrial/ICS protocols (Modbus, DNP3) if
-that's relevant to your deployment. All of these would plug into
-`dpi_dissector_registry.c` following the same `detect()`/`dissect()`
-pattern already used for RADIUS and QUIC — that registry is what makes
-adding each of these an isolated, independently-fuzzable module rather
-than a growing special case inside one function.
+**HTTP/1.1 and HTTP/2** (Host header / `:authority` extraction, useful
+where TLS isn't in play or as a fallback), **SSH** (version banner +
+key exchange algorithm negotiation, useful for detecting tunneling/
+port-forwarding abuse), **SMTP/IMAP/POP3**, **SMB**, **SIP/RTP**,
+**MQTT**, **NTP**, **DHCP**, **SNMP**, and industrial/ICS protocols
+(Modbus, DNP3) if that's relevant to your deployment. All of these
+would plug into `dpi_dissector_registry.c` following the same
+`detect()`/`dissect()` pattern already used for RADIUS, QUIC, GTP, and
+DNS — that registry is what makes adding each of these an isolated,
+independently-fuzzable module rather than a growing special case
+inside one function. See the recommendation table below for a fuller
+prioritized rationale.
+
+### Recommended next protocols to fully parse, and why
+
+| Protocol | Value | Effort relative to what's built |
+|---|---|---|
+| **IPv6** | Highest priority — the engine is currently blind to an entire IP version. Real-world IPv6 share is substantial and growing. | Moderate — needs its own header parser (fixed 40-byte header, extension header chain) plus rewiring the capture path's ethertype branch; TCP/UDP-over-IPv6 checksum uses the same pseudo-header pattern already built |
+| **HTTP/1.1** | High — Host header extraction gives app/domain visibility on any traffic not using TLS (internal services, legacy systems, some IoT) | Low — simpler than DNS name decompression; mostly line-based header parsing with bounds checks |
+| **DNS answer records** (extending `dpi_dns_parser.c`) | High — resolved IP addresses (A/AAAA) let you correlate a DNS answer with the actual flow that follows, strengthening both the DGA and VPN/DoH detectors | Low — same name-decompression routine already built, plus a type-specific RDATA parser per record type |
+| **SSH** | Medium — version banner and algorithm negotiation are plaintext before encryption begins (same "protocol negotiates in the clear first" pattern as TLS's ClientHello); useful for spotting SSH tunneling used to evade other controls | Low — banner is a simple newline-terminated string; KEXINIT parsing is TLV-ish, similar difficulty to RADIUS |
+| **HTTP/2** | Medium — increasingly what "HTTP/1.1-like" traffic actually is; `:authority` pseudo-header is the HTTP/2 equivalent of Host | Higher — HPACK header compression is a real, separate parsing subsystem, not a small addition |
+| **GTP-U inner-packet recursion** (extending `dpi_gtp_parser.c`) | Medium, mobile-network-specific — turns "this is a GTP tunnel" into "this tunnel carries a TLS connection to X" | Moderate — architecturally interesting rather than just more parsing: needs the dissector interface to support recursive dispatch back into the L3/L4 pipeline, which isn't cleanly supported by the current single-dissect()-call model |
+| **DHCP** | Lower, but cheap — plaintext, useful for asset/device visibility (vendor class identifiers, hostnames) on internal networks | Low |
+| **SIP/RTP** | Situational — high value specifically for VoIP-heavy environments, low value otherwise | Moderate — SIP is text-based (relatively easy); RTP itself carries no useful metadata beyond timing/codec info |
 
 
 
 | File | Role | Depends on |
 |---|---|---|
-| `dpi_secure_bootstrap.c` | Single-core reference capture loop: opens raw `AF_PACKET` socket as root, drops privileges, installs a seccomp filter. **Wired end-to-end for both TCP and UDP**: TCP → flow reassembly → classification; UDP → RADIUS/QUIC dissector registry + VPN fingerprinting, no reassembly (datagram-oriented). Prints one JSON record per flow/datagram to stdout — fine at this scale. Good starting point for lab testing at low traffic rates. | libseccomp, and (via `#include`) the RFC parser, flow reassembly, classifier, dissector registry, RADIUS, QUIC |
-| `dpi_dpdk_worker.c` | Multi-core, DPDK-based capture worker for 100G line rate. RSS across cores, VFIO-based device binding (IOMMU-protected DMA). **Wired end-to-end for both TCP and UDP**, with 100G-specific care: classification gated to run once per flow (`is_first_delivery`), mbuf freed before classification runs, and output goes through `dpi_async_output.c`'s lock-free ring buffer — no blocking I/O on the hot path. Contains detailed lab setup instructions in its header comment (IOMMU, hugepages, core isolation) — read those before the code. | DPDK, VFIO-capable NIC/kernel, and (via `#include`) the RFC parser, flow reassembly, classifier, dissector registry, RADIUS, QUIC, async output |
-| `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting/I/O happens only in the drain thread. Deliberately a plain pthread, not another DPDK lcore, since it does blocking I/O and shouldn't consume an isolated poll-mode core. | none (self-contained) |
+| `dpi_secure_bootstrap.c` | Single-core reference capture loop: opens raw `AF_PACKET` socket as root, drops privileges, installs a seccomp filter. **Wired end-to-end for both TCP and UDP**: TCP → flow reassembly → classification; UDP → RADIUS/QUIC/GTP/DNS dissector registry + VPN fingerprinting, no reassembly (datagram-oriented). Prints one JSON record per flow/datagram to stdout — fine at this scale. Good starting point for lab testing at low traffic rates. | libseccomp, and (via `#include`) the RFC parser, flow reassembly, classifier, dissector registry, RADIUS, QUIC, GTP, DNS |
+| `dpi_dpdk_worker.c` | Multi-core, DPDK-based capture worker for 100G line rate. RSS across cores, VFIO-based device binding (IOMMU-protected DMA). Wired end-to-end for both TCP and UDP, with 100G-specific care: classification gated to run once per flow (`is_first_delivery`), mbuf freed before classification runs, and output goes through `dpi_async_output.c`'s lock-free ring buffer **feeding a real, configurable sink** (file/syslog/Unix socket, chosen via a command-line argument after DPDK's own EAL args). Contains detailed lab setup instructions in its header comment (IOMMU, hugepages, core isolation) — read those before the code. | DPDK, VFIO-capable NIC/kernel, and (via `#include`) the RFC parser, flow reassembly, classifier, dissector registry, RADIUS, QUIC, GTP, DNS, async output, output sink |
+| `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
 | `fuzz_rfc_parser.c`, `fuzz_tcp_reassembly.c`, `fuzz_radius_parser.c`, `fuzz_quic_header.c`, `fuzz_quic_frames.c` | libFuzzer harnesses for the five highest-value fuzz targets. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
@@ -130,6 +161,9 @@ than a growing special case inside one function.
 | `dpi_vpn_detector.c` | VPN/tunnel scoring: WireGuard handshake fingerprint, OpenVPN opcode, IKE/ISAKMP header, known ports, SNI match against the `[vpn_proxy]` category, entropy fallback. | Reads `category` string produced by the domain classifier |
 | `dpi_dissector_registry.c` | Pluggable protocol dissector framework: `detect()`/`dissect()` interface, confidence-based dispatch, port hints as tiebreaker only. This is the scalable path to adding more protocols. | none (framework only) |
 | `dpi_radius_parser.c` | RADIUS (RFC 2865/2866) dissector: header + attribute TLVs. Deliberately never extracts `User-Password` value into output (credential handling). Fully structural, no crypto needed. | `dpi_dissector_registry.c` |
+| `dpi_gtp_parser.c` | GTP-U v1 (3GPP TS 29.281) + GTPv2-C (3GPP TS 29.274) dissectors — mobile network user-plane tunneling and control-plane signaling. Extracts TEID, message type, sequence number. Does NOT recursively dissect the inner IP packet inside G-PDU tunnels — flagged as a real scope limit, not silently incomplete. | `dpi_dissector_registry.c` |
+| `dpi_dns_parser.c` | DNS (RFC 1035) dissector: header + question section, with bounds-checked, cycle-safe name decompression — verified against an adversarial cyclic-pointer test case, since this is a classic real-world DNS parser bug source. Answer/authority/additional records not yet walked. | `dpi_dissector_registry.c` |
+| `dpi_output_sink.c` | Pluggable output backends for `dpi_async_output.c`'s drain thread: file (with SIGHUP/logrotate-compatible reopen), syslog (for alerting/SIEM integration, not recommended as sole high-volume sink), and Unix domain socket (the recommended path for feeding a real message queue — point a dedicated shipper like Fluentd/Vector at the socket rather than embedding a Kafka client in the DPI engine itself). | none (self-contained) |
 | `dpi_quic_parser.c` | QUIC (RFC 9000/9001) Initial packet dissector: HKDF key derivation (RFC 9001 §5.2, salt verified against the RFC), header protection removal, AES-128-GCM decryption. **Gets through decryption but SNI extraction is not yet wired up** — QUIC's CRYPTO frame has no TLS record-layer wrapper, so it needs a small refactor of `extract_sni()` before it can hand off to the existing SNI parser. See the TODO comment in the file. | OpenSSL (libssl/libcrypto) |
 
 ## Honest status per file — read before trusting any of it
@@ -212,6 +246,20 @@ touches real traffic.
    IKE, DoT sessions) — same "logic reviewed, not yet tested" caveat
    as everything else here.
 7. **Choose a real output sink for `dpi_async_output.c`'s drain
-   thread** — it currently just `printf`s the same JSON shape as
-   before, as a placeholder. A production deployment needs this to
-   write to a file, syslog, or a message queue instead.
+   thread** — DONE this pass: file (with SIGHUP/logrotate-compatible
+   reopen), syslog, and Unix domain socket (recommended path for
+   feeding a real message queue via a dedicated shipper) are all
+   implemented in `dpi_output_sink.c` and wired into
+   `dpi_dpdk_worker.c` via a command-line argument. Still worth
+   load-testing the file sink's flush interval and the Unix socket's
+   reconnect behavior under a real shipper restart before relying on
+   this in production.
+8. **Wire recursive dissection for GTP-U's G-PDU inner packets** — see
+   the scope note in `dpi_gtp_parser.c`. This is the natural next step
+   for real mobile-network visibility but needs the dissector registry
+   to support calling back into the L3/L4 pipeline, which the current
+   single-`dissect()`-call model doesn't cleanly support yet.
+9. **Extend `dpi_dns_parser.c` to walk answer records** — resolved
+   IP addresses would meaningfully strengthen the DGA/VPN detectors'
+   correlation ability, and the name-decompression routine needed is
+   already built and verified.
