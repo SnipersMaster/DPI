@@ -55,6 +55,22 @@
 #include <rte_ether.h>
 #include <rte_ip.h>
 
+/* Provides: parse_ipv4(), parse_tcp(), struct ipv4_result, struct tcp_result.
+ * These operate on raw uint8_t* byte buffers, not DPDK-specific struct
+ * types, so they plug in directly after the Ethernet header regardless
+ * of capture backend (DPDK here, or the AF_PACKET path in
+ * dpi_secure_bootstrap.c) — that portability was deliberate when this
+ * file was written. */
+#include "dpi_rfc_parser.c"
+
+/* Provides: struct tcp_flow_key, tcp_reassembly_insert(), TCP_OVERLAP_FIRST_WINS. */
+#include "dpi_tcp_flow_reassembly.c"
+
+/* Provides: classify_flow(), struct app_classification, and (via its
+ * own #includes) domain classification, DGA scoring, VPN scoring, and
+ * DoH/DoT scoring. */
+#include "dpi_app_classifier.c"
+
 #define RX_RING_SIZE      4096
 #define TX_RING_SIZE      1024
 #define NUM_MBUFS         (1 << 18)   /* size per your flow count / lab testing, not a guess */
@@ -124,24 +140,115 @@ static inline void dissect_packet(struct rte_mbuf *m) {
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t ethertype = rte_be_to_cpu_16(eth->ether_type);
 
-    if (ethertype == RTE_ETHER_TYPE_IPV4) {
-        if (len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)) {
-            rte_pktmbuf_free(m);
-            return;
-        }
-        struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-        uint8_t ihl = (ip->version_ihl & 0x0F) * 4;
-        uint16_t remaining = len - sizeof(struct rte_ether_hdr);
-        if (ihl < sizeof(struct rte_ipv4_hdr) || ihl > remaining) {
-            rte_pktmbuf_free(m);   /* malformed IHL: drop, don't clamp and continue */
-            return;
-        }
-        /* Hand off to protocol-specific dissector here, applying the
-         * same length-before-read discipline at every layer. */
+    if (ethertype != RTE_ETHER_TYPE_IPV4) {
+        rte_pktmbuf_free(m);   /* IPv6 and everything else: not handled yet,
+                                 * see the README's protocol coverage table */
+        return;
     }
 
+    const uint8_t *ip_start = (const uint8_t *)(eth + 1);
+    uint16_t ip_len = len - sizeof(struct rte_ether_hdr);
+
+    struct ipv4_result ip_result;
+    if (!parse_ipv4(ip_start, ip_len, &ip_result)) {
+        rte_pktmbuf_free(m);   /* malformed or not-yet-reassembled fragment: drop here */
+        return;
+    }
+
+    if (ip_result.protocol != 6 /* TCP */) {
+        rte_pktmbuf_free(m);   /* UDP-based protocols (QUIC, RADIUS, DoT/DoH,
+                                 * VPN fingerprints) go through a separate path —
+                                 * see the note below this function */
+        return;
+    }
+
+    struct tcp_result tcp_result;
+    if (!parse_tcp(ip_result.src_addr, ip_result.dst_addr,
+                    ip_result.payload, ip_result.payload_len, &tcp_result)) {
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (tcp_result.payload_len == 0) {
+        rte_pktmbuf_free(m);   /* pure ACK/control segment, no data to reassemble */
+        return;
+    }
+
+    struct tcp_flow_key key = {
+        .src_ip = ip_result.src_addr,
+        .dst_ip = ip_result.dst_addr,
+        .src_port = tcp_result.src_port,
+        .dst_port = tcp_result.dst_port
+    };
+
+    const uint8_t *contiguous_data = NULL;
+    uint32_t contiguous_len = 0;
+    struct tcp_reassembly_stats stats;
+
+    bool have_new_data = tcp_reassembly_insert(
+        &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+        TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
+
+    /* The mbuf itself can be freed now — tcp_reassembly_insert() already
+     * copied whatever it needed into the flow's own reassembly buffer,
+     * so nothing below this line depends on the mbuf staying alive.
+     * Free it BEFORE the (potentially non-trivial) classification work
+     * runs, not after, so the mbuf pool isn't held longer than needed
+     * under load. */
     rte_pktmbuf_free(m);
+
+    if (!have_new_data) return;
+
+    /* Gate the classification pipeline (SNI parse, domain lookup, DGA
+     * scoring, VPN scoring, DoH/DoT scoring) to run once per flow, on
+     * its first contiguous delivery — not on every later chunk of a
+     * long-lived connection. This matters at 100G: classify_flow()
+     * does an O(rule-count) domain table scan and several string/byte
+     * passes, which is fine once per flow but would be real waste if
+     * re-run for every additional in-order byte a multi-second
+     * connection delivers. The ClientHello (and therefore the SNI)
+     * essentially always arrives in a flow's first contiguous chunk,
+     * so this doesn't cost real detection coverage. */
+    if (!stats.is_first_delivery) return;
+
+    struct app_classification classification;
+    classify_flow(contiguous_data, contiguous_len,
+                  tcp_result.dst_port, "TCP", &classification);
+
+    /* IMPORTANT: printf here is for reference/lab visibility ONLY.
+     * Blocking, unbuffered stdout I/O on a poll-mode core at 100G is
+     * itself a severe performance bug — the RX burst loop must never
+     * block on I/O. A real deployment needs this to push onto a
+     * lock-free SPSC ring buffer (one per lcore) that a SEPARATE
+     * logging/export thread drains and writes/ships asynchronously.
+     * Wiring that up is a reasonable next step, not included here
+     * since it depends on your chosen output sink (file, Kafka,
+     * syslog, etc.) — but do not leave this printf() in a build meant
+     * for real traffic. */
+    printf("{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
+           "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
+           "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
+           "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
+           "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
+           tcp_result.src_port, tcp_result.dst_port,
+           classification.sni, classification.category, classification.app_name,
+           classification.confidence, classification.dga_score,
+           classification.vpn_score, classification.vpn_protocol,
+           classification.dot_score, classification.doh_score,
+           stats.out_of_order_segments, stats.retransmit_count,
+           stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
 }
+
+/*
+ * NOTE ON UDP-BASED PROTOCOLS: QUIC, RADIUS, DoT-on-853-is-TCP-so-that's
+ * covered-above-but-DoH-fallback, and the WireGuard/IKE fingerprints in
+ * dpi_vpn_detector.c all need a parallel UDP path — this function only
+ * wires up the TCP branch since that's where TCP flow reassembly (the
+ * thing this change set out to wire in) applies. A UDP equivalent would
+ * skip reassembly entirely (UDP is datagram-oriented, no stream to
+ * reassemble) and call dpi_dissector_registry.c's dispatch_dissection()
+ * directly per-datagram — that's a separate wiring task from this one.
+ */
 
 /* -----------------------------------------------------------------
  * Per-core poll loop. Each lcore owns exactly one RX queue — no

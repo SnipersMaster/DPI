@@ -20,6 +20,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -36,6 +38,16 @@
 #define UNPRIV_USER   "dpi-svc"     /* dedicated, shell-less service account */
 #define SNAPLEN       65535
 #define ETH_HDR_LEN   14
+
+/* Provides: parse_ipv4(), parse_tcp(), struct ipv4_result, struct tcp_result.
+ * Provides: struct tcp_flow_key, tcp_reassembly_insert(), TCP_OVERLAP_FIRST_WINS.
+ * Provides: classify_flow(), struct app_classification (+ domain/DGA/VPN/
+ * DoH-DoT scoring via app_classifier's own #includes).
+ * Same three-file pipeline as dpi_dpdk_worker.c — see that file's
+ * comments for the full rationale; not repeated here. */
+#include "dpi_rfc_parser.c"
+#include "dpi_tcp_flow_reassembly.c"
+#include "dpi_app_classifier.c"
 
 /* ---------------------------------------------------------------------
  * 1. Open the raw capture socket while still root.
@@ -158,16 +170,74 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     const unsigned char *payload = buf + ETH_HDR_LEN;
     ssize_t payload_len = len - ETH_HDR_LEN;
 
-    if (ethertype == ETH_P_IP) {
-        if (payload_len < 20) return;          /* min IPv4 header */
-        uint8_t ihl = (payload[0] & 0x0F) * 4;
-        if (ihl < 20 || ihl > payload_len) return;  /* malformed IHL: drop */
-        /* Hand off (payload + ihl, payload_len - ihl) to the next dissector.
-         * Every subsequent dissector applies this same discipline:
-         * check length before reading, reject rather than clamp-and-continue. */
+    if (ethertype != ETH_P_IP) {
+        return;   /* IPv6 and everything else: not handled yet, see the
+                   * README's protocol coverage table */
     }
-    /* else: unrecognized ethertype - drop or hand to a generic dissector,
-     * but never index into buf using an unvalidated offset. */
+
+    struct ipv4_result ip_result;
+    if (!parse_ipv4((const uint8_t *)payload, (uint16_t)payload_len, &ip_result)) {
+        return;   /* malformed, or a fragment still waiting on the rest */
+    }
+
+    if (ip_result.protocol != 6 /* TCP */) {
+        return;   /* UDP-based protocols need a separate path — see the
+                   * matching note in dpi_dpdk_worker.c */
+    }
+
+    struct tcp_result tcp_result;
+    if (!parse_tcp(ip_result.src_addr, ip_result.dst_addr,
+                    ip_result.payload, ip_result.payload_len, &tcp_result)) {
+        return;
+    }
+
+    if (tcp_result.payload_len == 0) {
+        return;   /* pure ACK/control segment, nothing to reassemble */
+    }
+
+    struct tcp_flow_key key = {
+        .src_ip = ip_result.src_addr,
+        .dst_ip = ip_result.dst_addr,
+        .src_port = tcp_result.src_port,
+        .dst_port = tcp_result.dst_port
+    };
+
+    const uint8_t *contiguous_data = NULL;
+    uint32_t contiguous_len = 0;
+    struct tcp_reassembly_stats stats;
+
+    bool have_new_data = tcp_reassembly_insert(
+        &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+        TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
+
+    if (!have_new_data || !stats.is_first_delivery) return;
+    /* Gating on is_first_delivery here is about avoiding redundant work
+     * per flow, same reasoning as dpi_dpdk_worker.c — not a hot-path
+     * necessity at single-core lab-testing scale the way it is at 100G,
+     * but keeping the two capture paths behaviorally consistent matters
+     * more than a small unneeded optimization here. */
+
+    struct app_classification classification;
+    classify_flow(contiguous_data, contiguous_len,
+                  tcp_result.dst_port, "TCP", &classification);
+
+    /* Unlike dpi_dpdk_worker.c, printf here is fine — this is a
+     * single-threaded, non-100G reference path meant for lab testing,
+     * not a multi-core poll-mode hot loop. Still worth eventually
+     * replacing with structured logging for anything beyond ad hoc
+     * testing. */
+    printf("{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
+           "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
+           "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
+           "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
+           "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
+           tcp_result.src_port, tcp_result.dst_port,
+           classification.sni, classification.category, classification.app_name,
+           classification.confidence, classification.dga_score,
+           classification.vpn_score, classification.vpn_protocol,
+           classification.dot_score, classification.doh_score,
+           stats.out_of_order_segments, stats.retransmit_count,
+           stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
 }
 
 int main(int argc, char **argv) {

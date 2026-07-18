@@ -25,27 +25,42 @@ See the per-file status table below before trusting any specific piece.
                                  ▼
                     ┌─────────────────────────┐
                     │    dpi_rfc_parser.c      │  IPv4 (RFC 791) + TCP
-                    │  (L3/L4 dissection)      │  (RFC 9293), checksums,
-                    │                          │  options, fragmentation
+                    │  (per-segment L3/L4      │  (RFC 9293), checksums,
+                    │   dissection)            │  options, fragmentation
                     └────────────┬─────────────┘
-                                 │ validated TCP/UDP payload
+                                 │ one TCP segment's payload
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ dpi_tcp_flow_reassembly.c│  per-flow reassembly,
+                    │  (stream reassembly)     │  overlap-resolution
+                    │                          │  policy, evasion detection
+                    └────────────┬─────────────┘
+                                 │ contiguous, in-order bytes
+                                 │ (only on each flow's first delivery —
+                                 │  see is_first_delivery gating)
                                  ▼
         ┌────────────────────────────────────────────────┐
         │              dpi_app_classifier.c                │
         │  orchestrates: SNI extraction, domain lookup,     │
-        │  DGA scoring, VPN scoring — produces one flow      │
-        │  record per connection                            │
+        │  DGA scoring, VPN scoring, DoH/DoT scoring —       │
+        │  produces one flow record per connection           │
         └───┬──────────┬──────────────┬─────────────────┬──┘
             │           │              │                 │
             ▼           ▼              ▼                 ▼
-  dpi_domain_rules_  dpi_dga_       dpi_vpn_        dpi_dissector_
-  loader.c           detector.c    detector.c       registry.c
-  (reads             (lexical      (protocol/port/  (pluggable
-  domain_rules.ini,  scoring on    entropy scoring) protocol modules,
-  hot-reloadable)    the SNI)                        currently:
-                                                      dpi_radius_parser.c
-                                                      dpi_quic_parser.c)
+  dpi_domain_rules_  dpi_dga_       dpi_vpn_        dpi_doh_dot_
+  loader.c           detector.c    detector.c       detector.c
+  (reads             (lexical      (protocol/port/  (port+TLS shape
+  domain_rules.ini,  scoring on    entropy scoring) for DoT, SNI-list
+  hot-reloadable)    the SNI)                        match for DoH)
+
+  Separately, dpi_dissector_registry.c + dpi_radius_parser.c +
+  dpi_quic_parser.c handle UDP-based protocols (RADIUS, QUIC) via a
+  pluggable detect()/dissect() interface — not yet wired into the two
+  capture files above, which currently only branch on TCP. See
+  "suggested next steps" for the UDP wiring task.
 ```
+
+**This diagram now reflects actual wiring, not just intended architecture** — as of this pass, both capture entry points genuinely call the RFC parser → flow reassembly → classifier chain in that order, with reassembled bytes (not raw per-segment payloads) reaching the classifier. The UDP-side protocols (bottom of the diagram) remain separate, self-contained modules not yet called from either capture loop.
 
 ## Supported protocols
 
@@ -97,10 +112,10 @@ than a growing special case inside one function.
 
 | File | Role | Depends on |
 |---|---|---|
-| `dpi_secure_bootstrap.c` | Single-core reference capture loop: opens raw `AF_PACKET` socket as root, drops privileges, installs a seccomp filter, does a bounds-checked Ethernet/IPv4 parse. Good starting point for lab testing at low traffic rates. | libseccomp |
-| `dpi_dpdk_worker.c` | Multi-core, DPDK-based capture worker for 100G line rate. RSS across cores, VFIO-based device binding (IOMMU-protected DMA). Contains detailed lab setup instructions in its header comment (IOMMU, hugepages, core isolation) — read those before the code. | DPDK, VFIO-capable NIC/kernel |
-| `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791) and TCP (RFC 9293) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — **implemented in `dpi_tcp_flow_reassembly.c`**, see below. | none (self-contained) |
-| `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included — a gap explicitly left open in the IPv4 fragment reassembly reference. | none (self-contained) |
+| `dpi_secure_bootstrap.c` | Single-core reference capture loop: opens raw `AF_PACKET` socket as root, drops privileges, installs a seccomp filter. **Now wired end-to-end**: IPv4/TCP parsing → flow reassembly → classification → prints one JSON flow record per flow to stdout. Good starting point for lab testing at low traffic rates. | libseccomp, and (via `#include`) the RFC parser, flow reassembly, and classifier |
+| `dpi_dpdk_worker.c` | Multi-core, DPDK-based capture worker for 100G line rate. RSS across cores, VFIO-based device binding (IOMMU-protected DMA). **Now wired end-to-end** for TCP flows the same way as the bootstrap file, with 100G-specific care taken: classification is gated to run once per flow (not per packet) via `is_first_delivery`, and the mbuf is freed before classification runs rather than after. Its `printf()` is explicitly marked lab-only — see next-steps item on replacing it. Contains detailed lab setup instructions in its header comment (IOMMU, hugepages, core isolation) — read those before the code. | DPDK, VFIO-capable NIC/kernel, and (via `#include`) the RFC parser, flow reassembly, and classifier |
+| `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791) and TCP (RFC 9293) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
+| `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included — a gap explicitly left open in the IPv4 fragment reassembly reference. Wired into both capture paths. | none (self-contained) |
 | `dpi_app_classifier.c` | Orchestration layer. Extracts TLS SNI (RFC 8446 / RFC 6066), calls the domain classifier, DGA scorer, and VPN scorer, assembles one `app_classification` result per flow. | Includes the three files below directly |
 | `dpi_domain_rules_loader.c` | Loads `domain_rules.ini` into a dynamic, hot-reloadable table. Validates entries on load (rejects paths/whitespace/malformed suffixes, flags duplicates) and logs a skip count. | `domain_rules.ini` |
 | `domain_rules.ini` | ~420 domain→category rules across 20 categories (social media, streaming, messaging, cloud infra, productivity, e-commerce, gaming, finance, VPN providers, etc). Editable without a rebuild — reload is automatic on file change. | none |
@@ -114,8 +129,8 @@ than a growing special case inside one function.
 
 | File | Compiled? | Tested against real data? | Known gaps |
 |---|---|---|---|
-| `dpi_secure_bootstrap.c` | No (missing dev headers in this sandbox) | No | None known beyond standard review — validate on your lab hardware |
-| `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant |
+| `dpi_secure_bootstrap.c` | No (missing dev headers in this sandbox) | No | Now includes 3 other files as one translation unit — a real compile is more likely to surface something here than before. `printf`-per-flow is fine at this scale. |
+| `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant. TCP-only — no UDP branch yet (QUIC/RADIUS/VPN-fingerprint/DoT need one, see next steps). `printf()` is explicitly lab-only, not safe for the real 100G hot path as written. |
 | `dpi_rfc_parser.c` | No | No | Fragment reassembly cache still has no timeout eviction or memory ceiling (unlike the TCP flow reassembly layer, which does — this remains a real gap specific to the IPv4 fragment cache); TCP overlap-resolution policy is now implemented in `dpi_tcp_flow_reassembly.c` rather than being an open item |
 | `dpi_tcp_flow_reassembly.c` | No | No | O(n) flow table scan (documented tradeoff, same as elsewhere in this project); no hole-splitting for a segment landing fully inside an existing hole (documented gap, matches the same limitation already present in the IPv4 fragment reassembly); ~76 MB static memory footprint at default sizing — deliberate and documented, but worth tuning `TCP_REASSEMBLY_MAX_FLOWS`/`BUFFER_BYTES` for your deployment |
 | `dpi_app_classifier.c` | No | No | JA3 fallback is stubbed, not implemented |
@@ -162,32 +177,53 @@ domain-rules reload path is a lock-free atomic swap with bounded
 grace-period retirement, and TCP flow reassembly with a real
 overlap-resolution policy (and overlap-conflict/evasion detection,
 distinct from benign retransmission) is implemented in
-`dpi_tcp_flow_reassembly.c`. RADIUS, QUIC, and DoT/DoH detection were
-also added since the original version of this list.
+`dpi_tcp_flow_reassembly.c` **and is now wired into both capture paths**
+(`dpi_dpdk_worker.c` and `dpi_secure_bootstrap.c`) — reassembled,
+in-order bytes are what feeds SNI extraction and classification, not
+raw per-segment payloads. RADIUS, QUIC, and DoT/DoH detection were also
+added since the original version of this list.
+
+While wiring the bootstrap file in, found and fixed a latent gap in
+`dpi_secure_bootstrap.c`: it used `uint16_t`/`uint8_t` throughout
+without ever including `<stdint.h>` (or `<stdbool.h>`, now that `bool`
+is used too) — it likely "worked" before only by accident, via
+whatever those types transitively pulled in on a given system. Fixed
+by including both explicitly.
 
 1. **Compile everything against real dev headers** and fix whatever
    the compiler catches that a read-through couldn't (this has never
-   been through a compiler — that remains true for every file here).
+   been through a compiler — that remains true for every file here,
+   and matters more now that four files get `#include`d together into
+   one translation unit in each capture path).
 2. **Validate the QUIC module against RFC 9001 Appendix A.2's published
    test vector.** The module's *logic* has been cross-checked against
    the RFC's own pseudocode section by section, but that is not the
    same as confirming it produces byte-exact correct output against a
    known input — that still needs to happen before this touches real
    traffic.
-3. **Wire `dpi_tcp_flow_reassembly.c` into the actual capture path**
-   (the DPDK worker or the single-core bootstrap) so reassembled bytes,
-   not raw per-segment payloads, are what feeds SNI extraction and the
-   rest of the classifier — right now it's a complete, self-contained
-   module that isn't yet called from the main packet loop.
-4. **Fuzz each dissector independently** (AFL++/libFuzzer), per the
+3. **Add a UDP path** — the TCP wiring in both capture files handles
+   TCP flows only; QUIC, RADIUS, WireGuard/IKE fingerprinting, and DoT
+   all need a parallel UDP branch that skips reassembly (UDP is
+   datagram-oriented — nothing to reassemble) and calls
+   `dpi_dissector_registry.c`'s `dispatch_dissection()` directly
+   per-datagram. Both capture files have a comment marking exactly
+   where this branch goes.
+4. **Replace the DPDK worker's `printf()` with a real async output
+   path** before this touches production traffic — it's marked in-code
+   as reference/lab-only. Blocking stdout I/O on a poll-mode core at
+   100G is itself a performance bug; production needs a lock-free
+   per-lcore ring buffer drained by a separate logging/export thread.
+   (The single-core bootstrap's `printf()` is fine as-is — it's not on
+   a hot path the way the DPDK worker is.)
+5. **Fuzz each dissector independently** (AFL++/libFuzzer), per the
    very first security checklist in this project — especially
    `dpi_rfc_parser.c`, `dpi_tcp_flow_reassembly.c`, and
    `dpi_quic_parser.c`, since they parse the most attacker-influenced
    structure.
-5. **Add IPv6 support.** Flagged in the protocol table above as the
+6. **Add IPv6 support.** Flagged in the protocol table above as the
    most significant coverage gap — the entire engine is IPv4-only
    right now.
-6. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`'s
+7. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`'s
    structural assumptions against real captures** (WireGuard, OpenVPN,
    IKE, DoT sessions) — same "logic reviewed, not yet tested" caveat
    as everything else here.

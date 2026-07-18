@@ -218,6 +218,12 @@ struct tcp_reassembly_stats {
     uint32_t retransmit_count;
     uint32_t overlap_conflict_count;
     bool     evasion_flag;   /* true if overlap_conflict_count > 0 for this flow */
+    bool     is_first_delivery;  /* true if this call produced this flow's FIRST
+                                   * contiguous data delivery — lets the caller
+                                   * gate expensive per-flow work (SNI parsing,
+                                   * classification) to run once per flow instead
+                                   * of on every subsequent contiguous chunk as
+                                   * more of a long-lived connection arrives */
 };
 
 static bool tcp_reassembly_insert(const struct tcp_flow_key *key,
@@ -227,6 +233,7 @@ static bool tcp_reassembly_insert(const struct tcp_flow_key *key,
                                    struct tcp_reassembly_stats *out_stats) {
     if (out_data) *out_data = NULL;
     if (out_len) *out_len = 0;
+    if (out_stats) out_stats->is_first_delivery = false;
 
     struct tcp_reassembly_flow *f = tcp_flow_find_or_create(key, policy);
     if (!f) return false;   /* flow table full: drop this segment's contribution */
@@ -310,9 +317,11 @@ static bool tcp_reassembly_insert(const struct tcp_flow_key *key,
     }
 
     if (contiguous_end > f->delivered_offset) {
+        bool was_first = (f->delivered_offset == 0);
         if (out_data) *out_data = f->buffer + f->delivered_offset;
         if (out_len) *out_len = contiguous_end - f->delivered_offset;
         f->delivered_offset = contiguous_end;
+        if (out_stats) out_stats->is_first_delivery = was_first;
     }
 
 report_stats:
