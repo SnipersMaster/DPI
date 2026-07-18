@@ -63,6 +63,18 @@ static void dissect_result_add(struct dissect_result *r, const char *key, const 
     strncpy(f->value, val, MAX_FIELD_VAL_LEN - 1);
 }
 
+/* Look up a field by key. Returns NULL if not present — e.g. QUIC's
+ * dissector adds an "sni" field only when it actually found one (not
+ * ECH, not a non-ClientHello handshake message); callers must handle
+ * the NULL case rather than assume the field exists just because the
+ * protocol matched. */
+static const char *dissect_result_get(const struct dissect_result *r, const char *key) {
+    for (int i = 0; i < r->n_fields; i++) {
+        if (strcmp(r->fields[i].key, key) == 0) return r->fields[i].value;
+    }
+    return NULL;
+}
+
 /* ------------------------------------------------------------------
  * Dissector interface. Function pointers, not inheritance — this is C.
  *   detect():  payload, len, dst_port, l4_proto ("TCP"/"UDP") -> confidence 0.0-1.0

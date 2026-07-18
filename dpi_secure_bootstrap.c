@@ -39,15 +39,23 @@
 #define SNAPLEN       65535
 #define ETH_HDR_LEN   14
 
-/* Provides: parse_ipv4(), parse_tcp(), struct ipv4_result, struct tcp_result.
+/* Provides: parse_ipv4(), parse_tcp(), parse_udp(), struct ipv4_result,
+ * struct tcp_result, struct udp_result.
  * Provides: struct tcp_flow_key, tcp_reassembly_insert(), TCP_OVERLAP_FIRST_WINS.
  * Provides: classify_flow(), struct app_classification (+ domain/DGA/VPN/
  * DoH-DoT scoring via app_classifier's own #includes).
- * Same three-file pipeline as dpi_dpdk_worker.c — see that file's
- * comments for the full rationale; not repeated here. */
+ * Provides: struct dissect_result, dispatch_dissection(),
+ * register_all_dissectors(), dissect_result_get() (RADIUS + QUIC).
+ * Same file set as dpi_dpdk_worker.c — see that file's comments for
+ * the full rationale on each; not repeated here. This file doesn't
+ * need dpi_async_output.c, since single-threaded printf() is fine at
+ * this scale (see the note where it's used below). */
 #include "dpi_rfc_parser.c"
 #include "dpi_tcp_flow_reassembly.c"
 #include "dpi_app_classifier.c"
+#include "dpi_dissector_registry.c"
+#include "dpi_radius_parser.c"
+#include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
  * 1. Open the raw capture socket while still root.
@@ -160,6 +168,48 @@ static int install_seccomp_filter(void) {
  *    trust a length field until it's validated against the buffer you
  *    actually have.
  * --------------------------------------------------------------------- */
+static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
+    struct udp_result udp_result;
+    if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
+                    ip_result->payload, ip_result->payload_len, &udp_result)) {
+        return;
+    }
+    if (udp_result.payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(udp_result.payload, udp_result.payload_len,
+                                        udp_result.dst_port, "UDP", &dissect_out);
+
+    struct vpn_result vpn;
+    score_vpn_traffic(udp_result.payload, udp_result.payload_len,
+                       udp_result.dst_port, "UDP", NULL, &vpn);
+
+    char sni_out[256] = "";
+    char confidence_out[16] = "none";
+    double dga_score_out = 0.0;
+
+    if (matched) {
+        const char *sni = dissect_result_get(&dissect_out, "sni");
+        if (sni) {
+            strncpy(sni_out, sni, sizeof(sni_out) - 1);
+            struct classification_result cls;
+            classify_hostname(sni, &cls);
+            strncpy(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out) - 1);
+
+            struct dga_result dga;
+            score_dga(sni, &dga);
+            dga_score_out = dga.score;
+        }
+    }
+
+    printf("{\"src_port\":%u,\"dst_port\":%u,\"protocol\":\"%s\",\"sni\":\"%s\","
+           "\"confidence\":\"%s\",\"dga_score\":%.2f,\"vpn_score\":%.2f,"
+           "\"vpn_protocol\":\"%s\"}\n",
+           udp_result.src_port, udp_result.dst_port,
+           matched ? dissect_out.protocol_name : "unknown",
+           sni_out, confidence_out, dga_score_out, vpn.score, vpn.detected_protocol);
+}
+
 static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     if (len < ETH_HDR_LEN) {
         /* Too short to even contain an Ethernet header. Drop, don't guess. */
@@ -180,9 +230,13 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;   /* malformed, or a fragment still waiting on the rest */
     }
 
+    if (ip_result.protocol == 17 /* UDP */) {
+        dissect_udp_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* UDP-based protocols need a separate path — see the
-                   * matching note in dpi_dpdk_worker.c */
+        return;   /* neither TCP nor UDP: not handled */
     }
 
     struct tcp_result tcp_result;
@@ -206,8 +260,12 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     uint32_t contiguous_len = 0;
     struct tcp_reassembly_stats stats;
 
+    /* partition_id is always 0 here — single-threaded, so there's no
+     * concurrent-access concern the way there is in the DPDK worker's
+     * multi-lcore design (see dpi_tcp_flow_reassembly.c's concurrency
+     * note for why that file's flow table is partitioned at all). */
     bool have_new_data = tcp_reassembly_insert(
-        &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+        0, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
         TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
 
     if (!have_new_data || !stats.is_first_delivery) return;
@@ -258,6 +316,12 @@ int main(int argc, char **argv) {
         close(sock);
         return 1;
     }
+
+    /* Register RADIUS/QUIC dissectors once, before the capture loop
+     * starts. Single-threaded here, so there's no ordering hazard the
+     * way there is in the DPDK worker — just needs to happen before
+     * the first packet could possibly need it. */
+    register_all_dissectors();
 
     unsigned char buf[SNAPLEN];
     for (;;) {

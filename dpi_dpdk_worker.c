@@ -71,6 +71,23 @@
  * DoH/DoT scoring. */
 #include "dpi_app_classifier.c"
 
+/* Provides: struct dissect_result, dispatch_dissection(),
+ * register_all_dissectors(), dissect_result_get(). register_all_dissectors()
+ * calls register_radius_dissector() / register_quic_dissector() via
+ * `extern` declarations — those resolve correctly as long as
+ * dpi_radius_parser.c and dpi_quic_parser.c are included into this
+ * same translation unit too (matching the single-TU #include pattern
+ * used everywhere else in this project), which is why they're
+ * included right below rather than compiled/linked separately. */
+#include "dpi_dissector_registry.c"
+#include "dpi_radius_parser.c"
+#include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
+                                 * the -lssl -lcrypto build requirement */
+
+/* Provides the lock-free per-lcore output ring buffer + drain thread
+ * that replaces the hot-path printf() used before this change. */
+#include "dpi_async_output.c"
+
 #define RX_RING_SIZE      4096
 #define TX_RING_SIZE      1024
 #define NUM_MBUFS         (1 << 18)   /* size per your flow count / lab testing, not a guess */
@@ -130,7 +147,11 @@ static int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool, uint16_t n
  * for speed; a validated-length check costs nanoseconds, a heap
  * overflow at 100G costs you the whole engine.
  * ----------------------------------------------------------------- */
-static inline void dissect_packet(struct rte_mbuf *m) {
+/* Forward declaration: dissect_packet() calls this before its full
+ * definition appears later in this file. */
+static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+
+static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     uint16_t len = rte_pktmbuf_pkt_len(m);
     if (len < sizeof(struct rte_ether_hdr)) {
         rte_pktmbuf_free(m);
@@ -155,10 +176,14 @@ static inline void dissect_packet(struct rte_mbuf *m) {
         return;
     }
 
+    if (ip_result.protocol == 17 /* UDP */) {
+        dissect_udp_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* UDP-based protocols (QUIC, RADIUS, DoT/DoH,
-                                 * VPN fingerprints) go through a separate path —
-                                 * see the note below this function */
+        rte_pktmbuf_free(m);   /* neither TCP nor UDP: not handled */
         return;
     }
 
@@ -185,8 +210,13 @@ static inline void dissect_packet(struct rte_mbuf *m) {
     uint32_t contiguous_len = 0;
     struct tcp_reassembly_stats stats;
 
+    /* queue_id doubles as the TCP reassembly partition_id — RSS
+     * guarantees a flow's packets all land on this queue, so this
+     * lcore never touches another lcore's partition of the flow
+     * table. See the concurrency note in dpi_tcp_flow_reassembly.c
+     * for why that matters (a real data race existed here before). */
     bool have_new_data = tcp_reassembly_insert(
-        &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
+        queue_id, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
         TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
 
     /* The mbuf itself can be freed now — tcp_reassembly_insert() already
@@ -215,40 +245,97 @@ static inline void dissect_packet(struct rte_mbuf *m) {
     classify_flow(contiguous_data, contiguous_len,
                   tcp_result.dst_port, "TCP", &classification);
 
-    /* IMPORTANT: printf here is for reference/lab visibility ONLY.
-     * Blocking, unbuffered stdout I/O on a poll-mode core at 100G is
-     * itself a severe performance bug — the RX burst loop must never
-     * block on I/O. A real deployment needs this to push onto a
-     * lock-free SPSC ring buffer (one per lcore) that a SEPARATE
-     * logging/export thread drains and writes/ships asynchronously.
-     * Wiring that up is a reasonable next step, not included here
-     * since it depends on your chosen output sink (file, Kafka,
-     * syslog, etc.) — but do not leave this printf() in a build meant
-     * for real traffic. */
-    printf("{\"src_port\":%u,\"dst_port\":%u,\"sni\":\"%s\",\"category\":\"%s\","
-           "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
-           "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
-           "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
-           "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
-           tcp_result.src_port, tcp_result.dst_port,
-           classification.sni, classification.category, classification.app_name,
-           classification.confidence, classification.dga_score,
-           classification.vpn_score, classification.vpn_protocol,
-           classification.dot_score, classification.doh_score,
-           stats.out_of_order_segments, stats.retransmit_count,
-           stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
+    /* Build the fixed-size record and push it onto THIS lcore's ring —
+     * no I/O, no formatting, no blocking on this hot path. The drain
+     * thread (dpi_async_output.c) does the actual printf-equivalent
+     * work off-core. A full ring means this record is dropped and
+     * counted, never blocks. */
+    struct flow_log_record rec = {0};
+    rec.src_port = tcp_result.src_port;
+    rec.dst_port = tcp_result.dst_port;
+    strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
+    strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
+    strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
+    strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
+    rec.dga_score = classification.dga_score;
+    rec.vpn_score = classification.vpn_score;
+    strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
+    rec.dot_score = classification.dot_score;
+    rec.doh_score = classification.doh_score;
+    rec.out_of_order_segments = stats.out_of_order_segments;
+    rec.retransmit_count = stats.retransmit_count;
+    rec.overlap_conflict_count = stats.overlap_conflict_count;
+    rec.evasion_flag = stats.evasion_flag;
+
+    log_ring_try_push(queue_id, &rec);
 }
 
-/*
- * NOTE ON UDP-BASED PROTOCOLS: QUIC, RADIUS, DoT-on-853-is-TCP-so-that's
- * covered-above-but-DoH-fallback, and the WireGuard/IKE fingerprints in
- * dpi_vpn_detector.c all need a parallel UDP path — this function only
- * wires up the TCP branch since that's where TCP flow reassembly (the
- * thing this change set out to wire in) applies. A UDP equivalent would
- * skip reassembly entirely (UDP is datagram-oriented, no stream to
- * reassemble) and call dpi_dissector_registry.c's dispatch_dissection()
- * directly per-datagram — that's a separate wiring task from this one.
- */
+/* -----------------------------------------------------------------
+ * UDP path: no reassembly (UDP is datagram-oriented — each datagram
+ * is independent, nothing to reassemble across packets), so this goes
+ * straight to the pluggable dissector registry, which tries RADIUS
+ * and QUIC's detect() functions and dissects with whichever matches.
+ * VPN protocol fingerprinting (WireGuard/IKE, also UDP) is layered in
+ * alongside the registry's result rather than through it, since
+ * dpi_vpn_detector.c is a scoring overlay, not a dissect_result-
+ * producing dissector in the registry's sense.
+ * ----------------------------------------------------------------- */
+static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    struct udp_result udp_result;
+    if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
+                    ip_result->payload, ip_result->payload_len, &udp_result)) {
+        return;
+    }
+    if (udp_result.payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(udp_result.payload, udp_result.payload_len,
+                                        udp_result.dst_port, "UDP", &dissect_out);
+
+    struct vpn_result vpn;
+    score_vpn_traffic(udp_result.payload, udp_result.payload_len,
+                       udp_result.dst_port, "UDP", NULL, &vpn);
+
+    /* If QUIC matched and extracted an SNI, run it through the same
+     * domain classification and DGA scoring the TCP path uses — a
+     * QUIC flow deserves the same treatment as a TLS-over-TCP flow,
+     * not a lesser one just because it arrived via a different
+     * capture branch. */
+    struct flow_log_record rec = {0};
+    rec.src_port = udp_result.src_port;
+    rec.dst_port = udp_result.dst_port;
+    rec.vpn_score = vpn.score;
+    strncpy(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol) - 1);
+
+    if (matched) {
+        strncpy(rec.category, dissect_out.protocol_name, sizeof(rec.category) - 1);
+
+        const char *sni = dissect_result_get(&dissect_out, "sni");
+        if (sni) {
+            strncpy(rec.sni, sni, sizeof(rec.sni) - 1);
+
+            struct classification_result cls;
+            classify_hostname(sni, &cls);
+            if (cls.matched) {
+                strncpy(rec.app_name, cls.app_name, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else {
+                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            }
+
+            struct dga_result dga;
+            score_dga(sni, &dga);
+            rec.dga_score = dga.score;
+        } else {
+            strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+        }
+    } else {
+        strncpy(rec.category, "unknown", sizeof(rec.category) - 1);
+        strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
 
 /* -----------------------------------------------------------------
  * Per-core poll loop. Each lcore owns exactly one RX queue — no
@@ -264,7 +351,7 @@ static int lcore_worker(void *arg) {
     while (!force_quit) {
         uint16_t nb_rx = rte_eth_rx_burst(port_id, queue_id, bufs, BURST_SIZE);
         for (uint16_t i = 0; i < nb_rx; i++) {
-            dissect_packet(bufs[i]);
+            dissect_packet(bufs[i], queue_id);
         }
     }
     return 0;
@@ -283,17 +370,48 @@ int main(int argc, char **argv) {
 
     uint16_t n_queues = rte_lcore_count();
     if (n_queues > MAX_QUEUES) n_queues = MAX_QUEUES;
+    if (n_queues > TCP_REASSEMBLY_NUM_PARTITIONS) {
+        /* Each queue_id doubles as a flow-table partition index — see
+         * the concurrency note in dpi_tcp_flow_reassembly.c. Running
+         * with more queues than partitions would mean two lcores
+         * sharing a partition, reintroducing the exact race that
+         * partitioning was added to eliminate. Fail loudly rather
+         * than silently degrade into unsafe behavior. */
+        fprintf(stderr, "FATAL: %u queues exceeds TCP_REASSEMBLY_NUM_PARTITIONS (%d) — "
+                "either reduce lcore count or increase that constant and its "
+                "memory footprint accordingly (see dpi_tcp_flow_reassembly.c)\n",
+                n_queues, TCP_REASSEMBLY_NUM_PARTITIONS);
+        return 1;
+    }
+
+    /* Register RADIUS/QUIC dissectors ONCE, before any lcore starts.
+     * dpi_dissector_registry.c's g_registry array is read-only after
+     * this point — safe for concurrent lcore reads with no locking,
+     * but only because nothing writes to it after this call completes
+     * and before the RX loops begin. */
+    register_all_dissectors();
+
+    /* Start the async output drain thread BEFORE workers begin
+     * producing records — see dpi_async_output.c for why this is a
+     * plain pthread rather than another DPDK lcore (it does blocking
+     * I/O, which has no place on an isolated poll-mode core). */
+    if (!async_output_start()) {
+        fprintf(stderr, "failed to start async output thread\n");
+        return 1;
+    }
 
     struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create(
         "MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
         RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
     if (!mbuf_pool) {
         fprintf(stderr, "mbuf pool creation failed\n");
+        async_output_stop();
         return 1;
     }
 
     if (port_init(0, mbuf_pool, n_queues) != 0) {
         fprintf(stderr, "port_init failed\n");
+        async_output_stop();
         return 1;
     }
 
@@ -310,6 +428,12 @@ int main(int argc, char **argv) {
     RTE_LCORE_FOREACH_WORKER(lcore_id) {
         rte_eal_wait_lcore(lcore_id);
     }
+
+    /* Stop the drain thread AFTER all producer lcores have exited, so
+     * any records still in flight at shutdown get flushed rather than
+     * silently dropped — see output_drain_thread()'s final drain pass
+     * in dpi_async_output.c. */
+    async_output_stop();
 
     rte_eal_cleanup();
     return 0;

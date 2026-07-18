@@ -478,12 +478,90 @@ static bool parse_tcp(uint32_t ip_src, uint32_t ip_dst,
 }
 
 /*
- * NOTE on the "overlap resolution policy" referenced in the header
- * comment: that logic belongs in your PER-FLOW STREAM REASSEMBLY
- * layer (tracking expected next-seq per flow across many segments
- * over the life of a connection), which is a separate, stateful
- * component from this per-packet parser. This file gives you a
- * correctly-parsed segment (seq, payload, flags); the flow-level
- * reassembler is the next module to build, and it's where you commit
- * to first-wins vs last-wins for overlapping seq ranges.
+ * NOTE ON UDP (RFC 768): added when wiring the UDP capture path (see
+ * dpi_dpdk_worker.c / dpi_secure_bootstrap.c). UDP's header is fixed
+ * and trivial by comparison to IPv4/TCP — 8 bytes, no options, no
+ * fragmentation concerns of its own (UDP relies on IP fragmentation).
+ * Included here rather than a separate file since it's a natural
+ * extension of this file's existing L3/L4 scope, not a new module.
+ */
+#define UDP_HDR_LEN 8
+
+struct udp_result {
+    uint16_t src_port, dst_port;
+    bool     checksum_valid;     /* UDP checksum is OPTIONAL over IPv4 (a
+                                   * value of 0 means "not computed" per
+                                   * RFC 768) — checksum_present distinguishes
+                                   * that case from an actually-invalid one */
+    bool     checksum_present;
+    const uint8_t *payload;
+    uint16_t payload_len;
+};
+
+static bool parse_udp(uint32_t ip_src, uint32_t ip_dst,
+                       const uint8_t *seg, uint16_t seg_len, struct udp_result *out) {
+    if (seg_len < UDP_HDR_LEN) return false;
+
+    uint16_t declared_len = (seg[4] << 8) | seg[5];
+    if (declared_len < UDP_HDR_LEN || declared_len > seg_len) return false;
+
+    out->src_port = (seg[0] << 8) | seg[1];
+    out->dst_port = (seg[2] << 8) | seg[3];
+    uint16_t checksum_field = (seg[6] << 8) | seg[7];
+
+    out->checksum_present = (checksum_field != 0);
+    if (out->checksum_present) {
+        /* Same pseudo-header construction as TCP's checksum, but with
+         * UDP length in place of TCP segment length and protocol=17. */
+        struct {
+            uint32_t src, dst;
+            uint8_t  zero, proto;
+            uint16_t len;
+        } pseudo;
+        pseudo.src = ip_src;
+        pseudo.dst = ip_dst;
+        pseudo.zero = 0;
+        pseudo.proto = 17;   /* UDP */
+        pseudo.len = htons(declared_len);
+
+        uint32_t partial = 0;
+        const uint8_t *p = (const uint8_t *)&pseudo;
+        for (size_t i = 0; i < sizeof(pseudo); i += 2) {
+            partial += (p[i] << 8) | p[i + 1];
+        }
+
+        uint8_t scratch[1500];
+        if (declared_len > sizeof(scratch)) {
+            out->checksum_valid = false;   /* can't verify, but not necessarily wrong —
+                                             * treat unverifiable as untrusted, not fatal */
+        } else {
+            memcpy(scratch, seg, declared_len);
+            scratch[6] = 0; scratch[7] = 0;   /* zero the checksum field for recompute */
+            uint16_t computed = checksum16(scratch, declared_len, partial);
+            out->checksum_valid = (computed == checksum_field);
+        }
+    } else {
+        out->checksum_valid = false;   /* not applicable — see checksum_present */
+    }
+
+    out->payload = seg + UDP_HDR_LEN;
+    out->payload_len = declared_len - UDP_HDR_LEN;
+    return true;
+}
+
+/*
+ * NOTE on the "overlap resolution policy" referenced in the TCP
+ * header comment above: that logic lives in the PER-FLOW STREAM
+ * REASSEMBLY layer (dpi_tcp_flow_reassembly.c), which tracks expected
+ * next-seq per flow across many segments over the life of a
+ * connection — a separate, stateful component from this per-packet
+ * parser. This file gives you a correctly-parsed segment (seq,
+ * payload, flags); dpi_tcp_flow_reassembly.c is where first-wins vs
+ * last-wins for overlapping seq ranges is actually decided.
+ *
+ * UDP has no equivalent reassembly concern — it's datagram-oriented,
+ * each datagram is independent, so the UDP capture path calls
+ * dpi_dissector_registry.c's dispatch_dissection() directly per
+ * datagram rather than going through anything like
+ * dpi_tcp_flow_reassembly.c.
  */

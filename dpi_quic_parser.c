@@ -368,7 +368,16 @@ static void quic_dissect(const uint8_t *payload, uint16_t len,
     const uint8_t *ciphertext = payload + ct_offset;
     const uint8_t *tag = payload + ct_offset + ct_len;
 
-    static uint8_t plaintext[MAX_QUIC_PACKET];
+    /* Stack-allocated, NOT static — this function is called concurrently
+     * from multiple lcores in dpi_dpdk_worker.c's multi-core design. A
+     * `static` buffer here would be shared across all callers and
+     * corrupt each other's decrypted output under concurrent access.
+     * This was a real bug in an earlier version of this file, caught
+     * when wiring QUIC into the multi-core capture path — the
+     * single-core bootstrap would never have exposed it, since it only
+     * ever has one caller at a time. 1500 bytes is small enough that
+     * the stack is the right place for this regardless. */
+    uint8_t plaintext[MAX_QUIC_PACKET];
     int plaintext_len = 0;
     if (!aes_gcm_decrypt(keys.key, nonce, aad, pn_offset + pn_len,
                           ciphertext, ct_len, tag, plaintext, &plaintext_len)) {

@@ -71,6 +71,29 @@
  * reason. Worth actually computing this number after any future
  * change to these constants rather than assuming it stayed small. */
 
+/*
+ * CONCURRENCY NOTE — caught while wiring this into the multi-core DPDK
+ * worker: an earlier version of this file used ONE shared global flow
+ * table scanned and written by every lcore with no locking at all. RSS
+ * pins same-FLOW traffic to the same core, but that does NOT make the
+ * shared TABLE itself safe — multiple lcores doing unsynchronized
+ * linear scans and writes into the same array concurrently is a real
+ * data race (two lcores finding the same empty slot and both writing
+ * to it, e.g.), not just a theoretical one.
+ *
+ * Fixed by partitioning the table per-lcore instead: each lcore gets
+ * its own slice, indexed by partition_id (its queue_id). Combined with
+ * RSS actually guaranteeing a given flow's packets all land on one
+ * queue/core, this means no lcore ever touches another's partition —
+ * zero shared mutable state on this hot path, no locks needed at all.
+ * This mirrors the "no shared state with other cores" comment already
+ * on dpi_dpdk_worker.c's lcore_worker function; the flow table just
+ * hadn't actually been made to honor that yet.
+ */
+#define TCP_REASSEMBLY_NUM_PARTITIONS      16   /* must be >= your actual RX
+                                                   queue/lcore count */
+#define TCP_REASSEMBLY_FLOWS_PER_PARTITION (TCP_REASSEMBLY_MAX_FLOWS / TCP_REASSEMBLY_NUM_PARTITIONS)
+
 enum tcp_overlap_policy {
     TCP_OVERLAP_FIRST_WINS,   /* keep existing data, discard new overlapping bytes (BSD-style) */
     TCP_OVERLAP_LAST_WINS     /* new data overwrites existing bytes at the overlap */
@@ -125,7 +148,7 @@ struct tcp_reassembly_flow {
     uint32_t overlap_conflict_count;  /* overlap with DIFFERENT bytes: evasion signal */
 };
 
-static struct tcp_reassembly_flow g_tcp_flows[TCP_REASSEMBLY_MAX_FLOWS];
+static struct tcp_reassembly_flow g_tcp_flows[TCP_REASSEMBLY_NUM_PARTITIONS][TCP_REASSEMBLY_FLOWS_PER_PARTITION];
 
 /* ------------------------------------------------------------------
  * Flow lookup / creation, with timeout eviction and a hard ceiling.
@@ -134,13 +157,17 @@ static struct tcp_reassembly_flow g_tcp_flows[TCP_REASSEMBLY_MAX_FLOWS];
  * tradeoff for the general pattern if this becomes a bottleneck at
  * very high flow counts.
  * ------------------------------------------------------------------ */
-static struct tcp_reassembly_flow *tcp_flow_find_or_create(const struct tcp_flow_key *key,
+static struct tcp_reassembly_flow *tcp_flow_find_or_create(uint16_t partition_id,
+                                                             const struct tcp_flow_key *key,
                                                              enum tcp_overlap_policy policy) {
+    if (partition_id >= TCP_REASSEMBLY_NUM_PARTITIONS) return NULL;
+
     time_t now = time(NULL);
     struct tcp_reassembly_flow *free_slot = NULL;
+    struct tcp_reassembly_flow *partition = g_tcp_flows[partition_id];
 
-    for (int i = 0; i < TCP_REASSEMBLY_MAX_FLOWS; i++) {
-        struct tcp_reassembly_flow *f = &g_tcp_flows[i];
+    for (int i = 0; i < TCP_REASSEMBLY_FLOWS_PER_PARTITION; i++) {
+        struct tcp_reassembly_flow *f = &partition[i];
 
         if (f->in_use && (now - f->last_activity) > TCP_FLOW_TIMEOUT_SECONDS) {
             /* Idle past the timeout: evict. This closes the gap the
@@ -226,7 +253,8 @@ struct tcp_reassembly_stats {
                                    * more of a long-lived connection arrives */
 };
 
-static bool tcp_reassembly_insert(const struct tcp_flow_key *key,
+static bool tcp_reassembly_insert(uint16_t partition_id,
+                                   const struct tcp_flow_key *key,
                                    uint32_t seq, const uint8_t *data, uint32_t len,
                                    enum tcp_overlap_policy policy,
                                    const uint8_t **out_data, uint32_t *out_len,
@@ -235,7 +263,7 @@ static bool tcp_reassembly_insert(const struct tcp_flow_key *key,
     if (out_len) *out_len = 0;
     if (out_stats) out_stats->is_first_delivery = false;
 
-    struct tcp_reassembly_flow *f = tcp_flow_find_or_create(key, policy);
+    struct tcp_reassembly_flow *f = tcp_flow_find_or_create(partition_id, key, policy);
     if (!f) return false;   /* flow table full: drop this segment's contribution */
 
     if (!f->base_seq_set) {
@@ -343,8 +371,12 @@ report_stats:
  *   uint32_t contiguous_len;
  *   struct tcp_reassembly_stats stats;
  *
- *   if (tcp_reassembly_insert(&key, tcp_seq, tcp_payload, tcp_payload_len,
- *                              TCP_OVERLAP_FIRST_WINS,
+ *   // partition_id MUST be a value that's stable per-flow and unique
+ *   // per-lcore — in the DPDK worker, that's the RX queue_id (RSS
+ *   // already guarantees a flow's packets all land on one queue). In
+ *   // the single-core bootstrap, it's always 0.
+ *   if (tcp_reassembly_insert(partition_id, &key, tcp_seq, tcp_payload,
+ *                              tcp_payload_len, TCP_OVERLAP_FIRST_WINS,
  *                              &contiguous, &contiguous_len, &stats)) {
  *       // contiguous now holds newly-available in-order bytes —
  *       // feed to extract_sni_from_record(), classify_flow(), etc.
