@@ -63,9 +63,11 @@
 #include "dpi_dns_parser.c"
 #include "dpi_http1_parser.c"
 #include "dpi_http2_parser.c"
+#include "dpi_hpack_connection_state.c"
 #include "dpi_ssh_parser.c"
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
+#include "dpi_icmp_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -181,6 +183,34 @@ static int install_seccomp_filter(void) {
  * --------------------------------------------------------------------- */
 static void dissect_udp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len);
+static void dissect_icmp_datagram(const struct ipv4_result *ip_result);
+
+static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "ICMP", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    const char *icmp_type = dissect_result_get(&dissect_out, "icmp_type");
+    const char *icmp_code = dissect_result_get(&dissect_out, "icmp_code");
+    const char *checksum_valid = dissect_result_get(&dissect_out, "icmp_checksum_valid");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"ICMP\","
+           "\"icmp_type\":\"%s\",\"icmp_code\":\"%s\",\"icmp_checksum_valid\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           icmp_type ? icmp_type : "", icmp_code ? icmp_code : "",
+           checksum_valid ? checksum_valid : "");
+}
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
     struct udp_result udp_result;
@@ -239,6 +269,39 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
     char src_str[46], dst_str[46];
     ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
     ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
+
+    if (ip6_result.next_header == 58 /* ICMPv6 */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "ICMPv6", &dissect_out);
+        if (!matched) return;
+
+        /* Checksum computed here, not inside icmpv6_dissect() — same
+         * reasoning as the DPDK worker's version: needs the IPv6
+         * pseudo-header, which requires src/dst addresses the generic
+         * dissector interface doesn't pass through. */
+        bool icmpv6_checksum_valid = false;
+        if (ip6_result.payload_len >= 4 && ip6_result.payload_len <= 1500) {
+            uint8_t scratch[1500];
+            memcpy(scratch, ip6_result.payload, ip6_result.payload_len);
+            uint16_t orig_checksum = (scratch[2] << 8) | scratch[3];
+            scratch[2] = 0; scratch[3] = 0;
+            uint32_t partial = ipv6_pseudo_header_partial(
+                ip6_result.src_addr, ip6_result.dst_addr, ip6_result.payload_len, 58);
+            uint16_t computed = checksum16(scratch, ip6_result.payload_len, partial);
+            icmpv6_checksum_valid = (computed == orig_checksum);
+        }
+
+        const char *icmpv6_type = dissect_result_get(&dissect_out, "icmpv6_type");
+        const char *icmpv6_code = dissect_result_get(&dissect_out, "icmpv6_code");
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"ICMPv6\","
+               "\"icmpv6_type\":\"%s\",\"icmpv6_code\":\"%s\",\"icmpv6_checksum_valid\":\"%s\"}\n",
+               src_str, dst_str, icmpv6_type ? icmpv6_type : "", icmpv6_code ? icmpv6_code : "",
+               icmpv6_checksum_valid ? "true" : "false");
+        return;
+    }
 
     if (ip6_result.next_header == 17 /* UDP */) {
         struct udp_result udp_result;
@@ -307,6 +370,59 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
         classify_flow(contiguous_data, contiguous_len,
                       tcp_result.dst_port, "TCP", &classification);
 
+        /* Effective category/app_name/confidence, possibly overridden
+         * below by a TCP-based dissector match (HTTP/1.1, HTTP/2, SSH)
+         * when classify_flow() found no TLS ClientHello. Same gap-fix
+         * and HTTP/2-persistent-state reasoning as the DPDK worker's
+         * matching code — see that file's comment for the full
+         * rationale. partition_id is 0 here, same as everywhere else
+         * in this single-threaded file.
+         *
+         * These are FIXED BUFFERS, not pointers into h2_out/tcp_out —
+         * those structs are declared inside the nested blocks below and
+         * go out of scope before the printf() call that uses these
+         * values runs. Keeping raw pointers into them would be a
+         * dangling-pointer bug (caught while writing this, not after
+         * the fact). */
+        char effective_category[MAX_PROTOCOL_NAME];
+        char effective_app_name[MAX_FIELD_VAL_LEN];
+        char effective_confidence[16];
+        strncpy(effective_category, classification.category, sizeof(effective_category) - 1);
+        strncpy(effective_app_name, classification.app_name, sizeof(effective_app_name) - 1);
+        strncpy(effective_confidence, classification.confidence, sizeof(effective_confidence) - 1);
+
+        if (strcmp(classification.category, "unknown") == 0) {
+            double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
+                                                    tcp_result.dst_port, "TCP");
+            if (http2_confidence > 0.3) {
+                struct hpack_dynamic_table *persistent_dyn = hpack_get_connection_table(0, &key);
+                struct dissect_result h2_out;
+                memset(&h2_out, 0, sizeof(h2_out));
+                http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                               persistent_dyn, &h2_out);
+
+                strncpy(effective_category, "HTTP/2", sizeof(effective_category) - 1);
+                const char *authority = dissect_result_get(&h2_out, "http2_authority");
+                if (authority) {
+                    strncpy(effective_app_name, authority, sizeof(effective_app_name) - 1);
+                    strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                } else {
+                    strncpy(effective_confidence, "low", sizeof(effective_confidence) - 1);
+                }
+            } else {
+                struct dissect_result tcp_out;
+                bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
+                                                        tcp_result.dst_port, "TCP", &tcp_out);
+                if (tcp_matched) {
+                    strncpy(effective_category, tcp_out.protocol_name, sizeof(effective_category) - 1);
+                    const char *identity = dissect_result_get(&tcp_out, "http_host");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                    if (identity) strncpy(effective_app_name, identity, sizeof(effective_app_name) - 1);
+                    strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                }
+            }
+        }
+
         printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
                "\"sni\":\"%s\",\"category\":\"%s\","
                "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
@@ -314,8 +430,8 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
                "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
                src_str, dst_str, tcp_result.src_port, tcp_result.dst_port,
-               classification.sni, classification.category, classification.app_name,
-               classification.confidence, classification.dga_score,
+               classification.sni, effective_category, effective_app_name,
+               effective_confidence, classification.dga_score,
                classification.vpn_score, classification.vpn_protocol,
                classification.dot_score, classification.doh_score,
                stats.out_of_order_segments, stats.retransmit_count,
@@ -352,13 +468,18 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;   /* malformed, or a fragment still waiting on the rest */
     }
 
+    if (ip_result.protocol == 1 /* ICMP */) {
+        dissect_icmp_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP nor UDP: not handled */
+        return;   /* neither TCP, UDP, nor ICMP: not handled */
     }
 
     struct tcp_result tcp_result;

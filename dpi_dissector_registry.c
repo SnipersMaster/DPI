@@ -217,6 +217,8 @@ static void register_all_dissectors(void) {
     extern void register_dhcp_dissector(void);
     extern void register_sip_dissector(void);
     extern void register_rtp_dissector(void);
+    extern void register_icmp_dissector(void);
+    extern void register_icmpv6_dissector(void);
 
     /* Each registration is now gated by the arsenal config — a
      * protocol disabled in protocols.ini is simply never registered,
@@ -235,6 +237,8 @@ static void register_all_dissectors(void) {
     if (protocol_enabled("dhcp"))   register_dhcp_dissector();
     if (protocol_enabled("sip"))    register_sip_dissector();
     if (protocol_enabled("rtp"))    register_rtp_dissector();
+    if (protocol_enabled("icmp"))   register_icmp_dissector();
+    if (protocol_enabled("icmpv6")) register_icmpv6_dissector();
 
     fprintf(stderr, "dissector_registry: %d protocol dissector(s) registered "
             "(per protocols.ini)\n", g_n_dissectors);

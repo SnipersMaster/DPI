@@ -125,11 +125,13 @@ everything else is not touched by this engine at all yet.
 | TCP | RFC 9293 | `dpi_rfc_parser.c` | Checksum validation, options (MSS, window scale, SACK-permitted, timestamps). Overlap-resolution policy implemented in `dpi_tcp_flow_reassembly.c`. |
 | TLS (ClientHello / SNI) | RFC 8446, RFC 6066 | `dpi_app_classifier.c` | SNI hostname from the ClientHello `server_name` extension. Does not parse the rest of the handshake (cipher suites, other extensions, certificates). |
 | HTTP/1.1 | RFC 9110-9112 | `dpi_http1_parser.c` | Request/status line, method, path, status code, Host and User-Agent headers. No chunked transfer-encoding reassembly or body parsing. |
-| HTTP/2 | RFC 9113, RFC 7541 (HPACK) | `dpi_http2_parser.c`, `dpi_hpack_decoder.c` | Connection preface, frame-level metadata (type, stream ID, length, RST_STREAM ratio), **and now HPACK-decoded header fields** — `:authority`, `:method`, `:path`, `:status` specifically extracted. The Huffman table was verified against three real RFC 7541 Appendix C test vectors before being used (see `dpi_hpack_decoder.c`'s header comment). Dynamic table is fresh per HEADERS frame, not persisted across a connection's frames — a cross-frame dynamic-table reference is flagged (`http2_hpack_dynamic_table_miss`) rather than guessed at. CONTINUATION frames (multi-frame header blocks) are detected but not reassembled. |
+| HTTP/2 | RFC 9113, RFC 7541 (HPACK) | `dpi_http2_parser.c`, `dpi_hpack_decoder.c`, `dpi_hpack_connection_state.c` | Connection preface, frame-level metadata (type, stream ID, length, RST_STREAM ratio), HPACK-decoded header fields (`:authority`, `:method`, `:path`, `:status`). **CONTINUATION frames are now reassembled** when they arrive in the same buffer as their HEADERS frame (the common case) — a CONTINUATION split across a TCP reassembly boundary into a separate call still isn't covered, flagged via `http2_continuation_incomplete_in_buffer`. **The HPACK dynamic table is now connection-persistent**, not fresh-per-frame — kept per TCP flow (keyed the same way `dpi_tcp_flow_reassembly.c` keys TCP state) via `dpi_hpack_connection_state.c`, so cross-frame dynamic-table references resolve correctly for the life of a connection. The Huffman table was verified against three real RFC 7541 Appendix C test vectors before being used. |
 | SSH | RFC 4253 | `dpi_ssh_parser.c` | Identification string (protocol/software version), KEXINIT algorithm name-lists (kex, host key, encryption, MAC — 8 of the 10 defined lists). Nothing past key exchange (genuinely encrypted from there). |
 | DHCP | RFC 2131/2132 | `dpi_dhcp_parser.c` | Message type, requested IP, hostname, vendor class identifier. |
 | SIP | RFC 3261 | `dpi_sip_rtp_parser.c` | Request/status line, method, status code, Call-ID/From/To headers. |
 | RTP | RFC 3550 | `dpi_sip_rtp_parser.c` | Payload type, sequence number, timestamp, SSRC, marker bit. No port hint (RTP has no registered port — negotiated per-call via SDP). |
+| ICMP | RFC 792 | `dpi_icmp_parser.c` | Type, code, checksum (verified — no pseudo-header needed for ICMPv4). Echo Request/Reply identifier+sequence; Redirect gateway address; Destination Unreachable/Time Exceeded flagged as carrying an embedded original packet (not recursively parsed). Runs directly over IP protocol 1, not TCP/UDP — see the file's header comment on how this fits the dissector interface. |
+| ICMPv6 | RFC 4443, RFC 4861 (Neighbor Discovery) | `dpi_icmp_parser.c` | Type, code. Echo Request/Reply identifier+sequence; **Neighbor Solicitation/Advertisement target address extraction** (genuinely useful for on-link host discovery / spoofing detection). Checksum verification happens in the capture path, not inside the dissector — it needs the IPv6 pseudo-header (src/dst addresses), which the generic dissector interface doesn't pass through; same pattern as other protocols whose needs don't fit that shared signature. |
 | RADIUS | RFC 2865, RFC 2866 | `dpi_radius_parser.c` | Packet code, identifier, User-Name, NAS-IP-Address, Calling-Station-ID, Acct-Status-Type. `User-Password` is detected as present but its value is deliberately never extracted (credential handling). |
 | DNS-over-TLS (DoT) | RFC 7858 | `dpi_doh_dot_detector.c` | Structural detection: port 853 + TLS ClientHello shape. Genuine structural signal, same discipline as the VPN detector. |
 | GTP-U v1 | 3GPP TS 29.281 | `dpi_gtp_parser.c` | Message type, TEID, sequence number. **G-PDU inner IP packets are now recursively dissected** (IPv4 only, bounded to exactly one level of nesting — a nested GTP-in-GTP tunnel is detected and flagged, deliberately NOT recursed into further, since unbounded recursion driven by attacker-controlled tunnel depth is exactly the resource-exhaustion vector this project's first security checklist warned about). Inner TCP flows get single-packet SNI extraction (not full flow reassembly — a ClientHello split across multiple G-PDU packets won't be caught). |
@@ -151,13 +153,13 @@ everything else is not touched by this engine at all yet.
 
 Everything not in the fully-parsed table above. Most of what was
 recommended in earlier versions of this README (IPv6, HTTP/1.1, DNS
-answer records, SSH, HTTP/2 at the frame level + now HPACK, GTP
-inner-packet recursion, DHCP, SIP/RTP, GTPv2-C IEs) is now implemented.
-Here's a fresh prioritized list for what's genuinely still missing:
+answer records, SSH, HTTP/2 at the frame level + HPACK + CONTINUATION
+reassembly + connection persistence, GTP inner-packet recursion, DHCP,
+SIP/RTP, GTPv2-C IEs, ICMP/ICMPv6) is now implemented. Here's a fresh
+prioritized list for what's genuinely still missing:
 
 | Protocol | Value | Effort relative to what's built |
 |---|---|---|
-| **ICMP/ICMPv6** | High — currently the engine silently drops all ICMP, meaning it's blind to traceroute, ping sweeps, PMTU discovery, and (for ICMPv6) Neighbor Discovery — genuinely basic network visibility that's missing | Low — fixed 8-byte header, type/code/checksum, no TLV parsing needed for the common types |
 | **SMTP** | Medium-high — mail server visibility (HELO/EHLO, MAIL FROM, RCPT TO), useful for detecting mail relay abuse/spam | Low-medium — text-based command/response protocol, similar shape to SIP's request/response line parsing already built |
 | **SMB/CIFS** | Medium — significant for internal/enterprise network visibility (file share access, lateral movement detection) | Higher — SMB2/3 has a more complex, binary, multi-command structure than the text protocols built so far |
 | **MQTT** | Medium, IoT-specific — connect/publish/subscribe visibility for IoT deployments | Low — compact binary protocol, simpler than most already built (RADIUS-level complexity) |
@@ -169,26 +171,28 @@ Here's a fresh prioritized list for what's genuinely still missing:
 
 All of these would plug into `dpi_dissector_registry.c` following the
 same `detect()`/`dissect()` pattern already used throughout — register
-the new dissector, add it to `protocols.ini`, done. ICMP/ICMPv6 is
-probably the single best next addition: it's cheap, and "the engine
-can't see ICMP at all" is a real, basic gap for a tool whose whole
-point is network visibility.
+the new dissector, add it to `protocols.ini`, done. SMTP or ARP are
+probably the cheapest next additions if you want another quick win
+before tackling something larger like SMB or SNMP.
 
 ### Real gaps within what's now "supported" — don't over-read the table above
 
 A protocol appearing in the fully-parsed table doesn't mean it has no
 limitations. Most of what was in this table in the previous README
 revision (TCP-over-IPv6 classification, DNS authority/additional
-sections, GTPv2-C Information Elements, GTP-U inner-packet recursion)
-is now closed — see the fully-parsed table above. What remains:
+sections, GTPv2-C Information Elements, GTP-U inner-packet recursion,
+HPACK per-connection persistence, HTTP/2 CONTINUATION reassembly) is
+now closed — see the fully-parsed table above. What remains:
 
 | Gap | Where | Why it wasn't fully closed this pass |
 |---|---|---|
-| HPACK dynamic table is per-frame, not per-connection | `dpi_hpack_decoder.c` | Persisting the dynamic table across a connection's multiple HEADERS frames needs connection-level state, the same way `dpi_tcp_flow_reassembly.c` persists TCP state per flow — genuinely the next integration step for HPACK, not a small addition. A cross-frame reference is flagged (`http2_hpack_dynamic_table_miss`), not guessed at. |
-| HTTP/2 CONTINUATION frame reassembly | `dpi_http2_parser.c` | A header block split across HEADERS + CONTINUATION frames is detected but not reassembled — flagged via `http2_headers_continued_not_reassembled` |
 | GTP-in-GTP nested tunnels | `dpi_gtp_parser.c` | Deliberately capped at one level of recursion — unbounded recursion driven by attacker-controlled tunnel depth is a resource-exhaustion vector, not a missing feature |
 | GTPv2-C: only 4 IE types decoded | `dpi_gtp_parser.c` | IMSI, MSISDN, APN, and Cause are walked; F-TEID, Bearer QoS, and other IE types are skipped by length rather than parsed — same bounds-checking pattern, just not extended to every IE type yet |
 | GTP-U inner-packet IPv6 | `dpi_gtp_parser.c` | Inner-packet recursion only handles an IPv4 inner packet — an IPv6 inner packet is detected but not dissected (would need `dpi_ipv6_parser.c` wired into the same recursive call) |
+| ICMP/ICMPv6 original-packet embedding not parsed | `dpi_icmp_parser.c` | Destination Unreachable/Time Exceeded messages carry the offending original packet — flagged as present, not recursively dissected (would follow the same pattern as GTP-U inner-packet recursion) |
+| HTTP/2 CONTINUATION across a TCP reassembly boundary | `dpi_http2_parser.c` | Reassembly only works when CONTINUATION frames arrive in the SAME buffer as their HEADERS frame (the common case, since implementations typically send them back-to-back). A CONTINUATION split across a separate `dissect()` call isn't covered — flagged via `http2_continuation_incomplete_in_buffer` |
+| HPACK's default table size is hardcoded to 4096 | `dpi_hpack_connection_state.c`, `dpi_http2_parser.c` | Real HTTP/2 negotiates `SETTINGS_HEADER_TABLE_SIZE` per-connection via SETTINGS frames; this reference implementation doesn't track that negotiation, so a connection that negotiates a non-default size could be decoded against the wrong table size limit |
+
 
 
 | File | Role | Depends on |
@@ -198,7 +202,7 @@ is now closed — see the fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (14 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, ssh, dhcp, sip_rtp, hpack_decoder) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component this pass, worth prioritizing. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (15 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, ssh, dhcp, sip_rtp, hpack_decoder, icmp) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -220,6 +224,8 @@ is now closed — see the fully-parsed table above. What remains:
 | `dpi_ssh_parser.c` | SSH identification string + KEXINIT algorithm name-list extraction (plaintext, sent before encryption begins — same pattern as TLS's ClientHello). | `dpi_dissector_registry.c` |
 | `dpi_dhcp_parser.c` | DHCP message type, requested IP, hostname, vendor class — plaintext TLV options. | `dpi_dissector_registry.c` |
 | `dpi_sip_rtp_parser.c` | SIP (text-based signaling) + RTP (fixed binary media header) in one file, since they're the two halves of a VoIP call though structurally very different. | `dpi_dissector_registry.c` |
+| `dpi_icmp_parser.c` | ICMP (RFC 792) + ICMPv6 (RFC 4443/4861) dissectors. Runs directly over IP, not TCP/UDP — the capture path has dedicated branches for IP protocol 1 / IPv6 next_header 58, since there's no port to dispatch on. ICMPv6 checksum verification happens in the capture path (needs IPv6 addresses the generic interface doesn't pass through), not inside the dissector. | `dpi_dissector_registry.c` |
+| `dpi_hpack_connection_state.c` | Per-flow persistent HPACK dynamic table, keyed by the same `tcp_flow_key` `dpi_tcp_flow_reassembly.c` uses — closes the "HPACK dynamic table is per-frame, not per-connection" gap. Partitioned per-lcore (reuses `TCP_REASSEMBLY_NUM_PARTITIONS`), with its own (longer) timeout since HTTP/2 connections are typically longer-lived than raw TCP flows. | `dpi_tcp_flow_reassembly.c`, `dpi_hpack_decoder.c` |
 | `dpi_hpack_decoder.c` | HPACK (RFC 7541) decoder for HTTP/2: static table (61 entries), integer/string decoding, Huffman decoding, and a per-call dynamic table. The 257-entry Huffman table was verified before use — transcribed to Python, checked structurally (complete prefix code, no duplicates), then used to correctly decode three independent real byte sequences from RFC 7541 Appendix C, and the C table was generated programmatically from that verified source rather than hand-retyped. | none (self-contained) |
 
 ## Honest status per file — read before trusting any of it
@@ -247,6 +253,9 @@ is now closed — see the fully-parsed table above. What remains:
 | `dpi_ssh_parser.c` | No | No | Only 8 of RFC 4253's 10 KEXINIT name-lists extracted (languages lists omitted, almost always empty in practice); nothing past KEXINIT is parsed (correctly — it's encrypted from there) |
 | `dpi_dhcp_parser.c` | No | No | Only a handful of the most useful options extracted (message type, requested IP, hostname, vendor class), not a general option map |
 | `dpi_sip_rtp_parser.c` | No | No | SIP: only Call-ID/From/To headers extracted, not a general header map. RTP: no port hint exists by protocol design (negotiated via SDP), so `dst_port` is unused in `rtp_detect()` |
+| `dpi_icmp_parser.c` | No | No | Original-packet embedding in Destination Unreachable/Time Exceeded not recursively parsed (flagged, not dissected) |
+| `dpi_hpack_connection_state.c` | No | No | Hardcoded 4096-byte default dynamic table size (see gap table above) — no real SETTINGS_HEADER_TABLE_SIZE negotiation tracking |
+| `dpi_http2_parser.c` (updated) | No | No | CONTINUATION reassembly only works within one buffer (documented gap); dynamic table size still hardcoded at connection-creation time |
 | `dpi_hpack_decoder.c` | No | No | Huffman table verified against 3 real RFC test vectors (high confidence); dynamic table is per-call only, not connection-persistent (see gap table above) — this is the most novel, least-precedented code in this project, worth prioritizing for fuzzing |
 | `dpi_tcp_flow_reassembly.c` (updated) | No | No | Flow key now supports IPv6 (128-bit addresses, explicit version tag) via `tcp_flow_key_make_v4()`/`_v6()` constructors — all call sites updated; verify this compiles cleanly given the struct layout change touched multiple files |
 
@@ -352,6 +361,21 @@ shape, not aspirational.
  "rtp_csrc_count":"0"}
 ```
 
+**ICMP** (Echo Request — ping):
+```json
+{"src_ip":"10.0.4.17","dst_ip":"8.8.8.8","protocol":"ICMP",
+ "icmp_type":"Echo Request","icmp_code":"0","icmp_checksum_valid":"true",
+ "icmp_echo_identifier":"4660","icmp_echo_sequence":"1"}
+```
+
+**ICMPv6** (Neighbor Solicitation):
+```json
+{"src_ip":"2001:db8::1","dst_ip":"2001:db8::2","protocol":"ICMPv6",
+ "icmpv6_type":"Neighbor Solicitation","icmpv6_code":"0",
+ "icmpv6_checksum_valid":"true",
+ "icmpv6_nd_target_address":"2001:db8::1"}
+```
+
 ## Build order (once you have real dev headers and hardware)
 
 ```
@@ -380,61 +404,96 @@ reference/prototype stage but not for a maintained codebase.
 
 ## Suggested next steps, roughly in priority order
 
-**Done in this pass**: `dpi_tcp_flow_reassembly.c`'s flow key extended
-to hold IPv6 (128-bit) addresses with an explicit version tag —
-TCP-over-IPv6 now goes through full reassembly and classification, not
-just parsing. HPACK decoding (RFC 7541) for HTTP/2, including
-`:authority` extraction — the Huffman table was verified against three
-real RFC test vectors before use. GTPv2-C Information Element walking
-(IMSI/MSISDN/APN/Cause). DNS authority and additional record sections
-(reusing the answer-record walker). A JSON output sample for every
-fully-parsed protocol, added to this README. 2 new fuzz harnesses
-(`fuzz_hpack_decoder.c` plus updates to existing ones for the flow-key
-change) — 14 harnesses total now.
+**Done in this pass**: ICMP/ICMPv6 (including Neighbor Discovery target
+extraction). HTTP/2 CONTINUATION frame reassembly (same-buffer case).
+HPACK connection-level persistence via `dpi_hpack_connection_state.c`,
+keyed by the same `tcp_flow_key` TCP reassembly uses. Two attempts made
+to fetch RFC 9001 Appendix A.2's exact test vector for QUIC validation
+— both unsuccessful (see below) — genuinely still open. 2 new fuzz
+harnesses (`fuzz_icmp_parser.c`, plus the HPACK decoder's signature
+refactor propagated through `fuzz_hpack_decoder.c`) — 15 total now.
 
-**One real bug caught while doing this work**: an early draft of
-`dpi_dns_parser.c`'s answer/authority/additional-section refactor
-accidentally nested a new function definition *inside* `dns_dissect()`
-— illegal in C, and it broke the file's brace balance in a way that
-would have been an immediate, obvious compile error. Caught by the
-same balance-checking discipline used throughout this project, fixed
-by moving the function before `dns_dissect()` and properly restoring
-the call structure. Worth mentioning because it's a different *kind*
-of bug than the concurrency issues caught in earlier passes — a
-structural mistake from careless editing, not a subtle race — and
-both kinds are worth catching the same way: mechanically, not by
-assuming a written comment matches the code below it.
+**Real bugs found and fixed while doing this work** — this pass found
+more of these than most, worth listing individually rather than
+glossing over:
 
-1. **Actually run the fuzzers.** Now 14 harnesses, still zero executed
-   — no clang/libFuzzer in this sandbox. `fuzz_hpack_decoder.c` is
-   probably the single highest-priority target to run first: it's the
-   most novel, least-precedented parsing logic added across every pass
-   so far (a 257-entry Huffman table, integer/string decoding, dynamic
-   table insertion/eviction) — verified by hand against real test
-   vectors, but hand-verification of a few cases is never a substitute
-   for actual fuzzing across the input space.
+1. **A previously-unnoticed, significant gap**: `dpi_http1_parser.c`,
+   `dpi_http2_parser.c`, and `dpi_ssh_parser.c` were all registered
+   into the dissector registry but **nothing on the TCP capture path
+   ever actually called `dispatch_dissection()` against reassembled
+   TCP data** — only `classify_flow()`'s TLS/SNI-specific path was
+   ever invoked. They were registered dead code until this pass wired
+   TCP-based dissector dispatch into both capture files (gated to only
+   run when no TLS ClientHello was found, so it doesn't cost anything
+   on the already-working TLS path).
+2. **A genuinely missing field**: the primary IPv4-TCP flow record
+   construction in `dpi_dpdk_worker.c` never copied the classified SNI
+   into `rec.sni` — every OTHER path (IPv6 TCP, IPv6 UDP, QUIC-over-
+   UDP) did this correctly, but the original, most-used path silently
+   dropped it. Found while reviewing that same code block for the
+   HTTP/2 wiring above, fixed immediately.
+3. **A duplicate `#include` in `dpi_http2_parser.c`** — `#include
+   "dpi_hpack_decoder.c"` appeared twice, which would have caused a
+   redefinition compile error for every symbol in that file. Left over
+   from an earlier edit; caught on a routine re-read before shipping.
+4. **A dangling-pointer bug caught before it shipped**: an early draft
+   of the IPv6 TCP path's HTTP/2 wiring in `dpi_secure_bootstrap.c`
+   kept `const char *` pointers into `dissect_result` structs that were
+   declared inside a nested `if` block — those structs go out of scope
+   before the `printf()` that used the pointers runs. Fixed by copying
+   into fixed-size buffers that outlive the block, instead of holding
+   pointers into stack memory that's no longer valid.
+5. **The same static-buffer concurrency pattern caught for QUIC
+   earlier in this project almost recurred**: an early draft of the
+   HTTP/2 CONTINUATION-reassembly buffer was declared `static uint8_t
+   combined_block[16384]` — exactly the kind of shared-across-
+   concurrent-lcore-calls bug already found and fixed once before.
+   Caught immediately this time (the pattern was already known) and
+   made a stack variable instead.
+
+None of these would have been caught by reviewing any single file in
+isolation — all five surfaced specifically while wiring components
+together and re-reading code that had already "worked" in a narrower
+sense.
+
+1. **Actually run the fuzzers.** Now 15 harnesses, still zero executed
+   — no clang/libFuzzer in this sandbox, unchanged from every previous
+   version of this list. `fuzz_hpack_decoder.c` remains the single
+   highest-priority target: the most novel, least-precedented parsing
+   logic in the project, verified by hand against real RFC test
+   vectors but never actually fuzzed.
 2. **Compile everything against real dev headers.** Still true for
-   every file — unchanged from every previous version of this list.
-3. **Validate the QUIC module against RFC 9001 Appendix A.2's test
-   vector.** Unchanged from before, still not done — worth noting this
-   is now the *only* remaining "verified via hand-checked logic, not
-   byte-exact test vectors" item in the project; everything else with
-   that caveat (DNS decompression, IPv6 extension chains, HPACK
-   Huffman/header-block decoding) has since been checked against real
-   test vectors or adversarial cases.
-4. **Give HPACK's dynamic table connection-level persistence.** The
-   single largest deliberately-deferred piece from this pass — same
-   category of gap as TCP-over-IPv6 was before this pass fixed it.
-   Needs per-flow HPACK state analogous to what
-   `dpi_tcp_flow_reassembly.c` does for TCP, keyed by the same flow
-   identity.
-5. **Reassemble HTTP/2 CONTINUATION frames** — a header block split
-   across multiple frames is currently detected, not reassembled.
+   every file. This is worth stating plainly at this point: an
+   enormous amount of care has gone into logic verification (Python
+   models, RFC cross-checks, adversarial test cases) specifically
+   *because* nothing here can be compiled in this sandbox — but that
+   verification is a substitute for testing, not equivalent to it.
+   Compiling and running this for real remains the top unconditional
+   priority regardless of how much logic review precedes it.
+3. **Get RFC 9001 Appendix A.2's exact test vector.** Two documented
+   attempts this pass — a direct RFC fetch that truncated before the
+   appendix's hex content (twice, at two different URL anchors), and a
+   search that only surfaced fragments from pre-final IETF drafts
+   using mismatched version identifiers (`0xff000020` instead of the
+   final `0x00000001`), which wouldn't produce byte-matching results
+   even if fully assembled. This remains the *only* item in the
+   project still at "logic cross-checked against RFC pseudocode" rather
+   than "verified against real test vectors or adversarial cases" —
+   everything else that once carried that caveat (DNS decompression,
+   IPv6 extension chains, HPACK Huffman/header-block decoding) has
+   since been checked against real published examples. Get the actual
+   RFC text (a PDF or a non-truncating fetch) and this becomes a
+   short, mechanical validation.
+4. **Track real SETTINGS_HEADER_TABLE_SIZE negotiation** for HPACK,
+   instead of the hardcoded 4096-byte default — see the gap table
+   above.
+5. **Recursively dissect ICMP/ICMPv6's embedded original packet**
+   (Destination Unreachable / Time Exceeded messages carry it) — same
+   pattern as GTP-U inner-packet recursion, not yet extended here.
 6. **Load-test the async output ring buffer** under realistic burst
    conditions — unchanged from before.
 7. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`**
    against real captures — unchanged from before.
-8. **Add ICMP/ICMPv6.** Flagged as the single best next protocol
-   addition above — cheap, and a real basic visibility gap for a tool
-   whose whole point is network visibility.
+8. **Add SMTP or ARP** as the next protocol additions — see the
+   recommendation table above for the fuller prioritized list.
 

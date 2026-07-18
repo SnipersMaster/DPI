@@ -91,9 +91,17 @@
 #include "dpi_dns_parser.c"
 #include "dpi_http1_parser.c"
 #include "dpi_http2_parser.c"
+
+/* Provides: hpack_get_connection_table() — per-flow persistent HPACK
+ * dynamic table, keyed by the same tcp_flow_key TCP reassembly uses.
+ * Must come after both dpi_tcp_flow_reassembly.c (struct tcp_flow_key)
+ * and dpi_http2_parser.c (struct hpack_dynamic_table, via
+ * dpi_hpack_decoder.c). */
+#include "dpi_hpack_connection_state.c"
 #include "dpi_ssh_parser.c"
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
+#include "dpi_icmp_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -163,6 +171,7 @@ static int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool, uint16_t n
 /* Forward declaration: dissect_packet() calls this before its full
  * definition appears later in this file. */
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -194,6 +203,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 1 /* ICMP */) {
+        dissect_icmp_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -201,7 +216,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP nor UDP: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, nor ICMP: not handled */
         return;
     }
 
@@ -273,6 +288,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
              (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
     rec.src_port = tcp_result.src_port;
     rec.dst_port = tcp_result.dst_port;
+    strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
     strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
     strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
     strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
@@ -281,6 +297,54 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
     rec.dot_score = classification.dot_score;
     rec.doh_score = classification.doh_score;
+
+    /* If no TLS ClientHello was found (category still "unknown"), this
+     * might be plaintext HTTP/1.1, HTTP/2 (h2c), or SSH — try those
+     * TCP-based dissectors now. THIS FIXES A REAL GAP found while
+     * wiring HPACK connection persistence: dpi_http1_parser.c,
+     * dpi_http2_parser.c, and dpi_ssh_parser.c were all registered
+     * into the dissector registry, but nothing on this TCP path ever
+     * actually called dispatch_dissection() against reassembled TCP
+     * data — only classify_flow()'s TLS/SNI-specific path was called.
+     * They were registered dead code. HTTP/2 gets special-cased (not
+     * routed through the generic registry dispatch) specifically so it
+     * can use the per-flow PERSISTENT HPACK table instead of a fresh
+     * one — the same "handle outside the generic interface when the
+     * generic interface doesn't fit" pattern used for TLS/SNI and for
+     * ICMPv6's checksum. */
+    if (strcmp(classification.category, "unknown") == 0) {
+        double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
+                                                tcp_result.dst_port, "TCP");
+        if (http2_confidence > 0.3) {
+            struct hpack_dynamic_table *persistent_dyn =
+                hpack_get_connection_table(queue_id, &key);
+            struct dissect_result h2_out;
+            memset(&h2_out, 0, sizeof(h2_out));
+            http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                           persistent_dyn, &h2_out);
+
+            strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+            const char *authority = dissect_result_get(&h2_out, "http2_authority");
+            if (authority) {
+                strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else {
+                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            }
+        } else {
+            struct dissect_result tcp_out;
+            bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
+                                                    tcp_result.dst_port, "TCP", &tcp_out);
+            if (tcp_matched) {
+                strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
+                const char *identity = dissect_result_get(&tcp_out, "http_host");
+                if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            }
+        }
+    }
+
     rec.out_of_order_segments = stats.out_of_order_segments;
     rec.retransmit_count = stats.retransmit_count;
     rec.overlap_conflict_count = stats.overlap_conflict_count;
@@ -299,6 +363,39 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
  * dpi_vpn_detector.c is a scoring overlay, not a dissect_result-
  * producing dissector in the registry's sense.
  * ----------------------------------------------------------------- */
+static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "ICMP", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    struct flow_log_record rec = {0};
+    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
+    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
+    strncpy(rec.category, "ICMP", sizeof(rec.category) - 1);
+    /* flow_log_record's fixed fields don't have a dedicated slot for
+     * every ICMP-specific field (type/code/echo id-seq/etc) — same
+     * limitation every dissector with more fields than the fixed
+     * record has hits. app_name is repurposed here to carry the ICMP
+     * type name specifically, since that's the single most useful
+     * summary field for this protocol. */
+    const char *icmp_type = dissect_result_get(&dissect_out, "icmp_type");
+    if (icmp_type) strncpy(rec.app_name, icmp_type, sizeof(rec.app_name) - 1);
+    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+
+    log_ring_try_push(queue_id, &rec);
+}
+
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -387,6 +484,47 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
     char src_str[46], dst_str[46];
     ipv6_addr_to_string(ip6_result.src_addr, src_str, sizeof(src_str));
     ipv6_addr_to_string(ip6_result.dst_addr, dst_str, sizeof(dst_str));
+
+    if (ip6_result.next_header == 58 /* ICMPv6 */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "ICMPv6", &dissect_out);
+        if (!matched) return;
+
+        /* ICMPv6 checksum verification happens HERE, not inside
+         * icmpv6_dissect() — see dpi_icmp_parser.c's header comment
+         * for why: it needs the IPv6 pseudo-header (RFC 8200 S8.1),
+         * which requires the src/dst addresses this capture-path
+         * function has but the generic dissector interface doesn't
+         * pass through. Reuses the same pseudo-header helper already
+         * built for UDP/TCP-over-IPv6 checksum verification. */
+        bool icmpv6_checksum_valid = false;
+        if (ip6_result.payload_len >= 4 && ip6_result.payload_len <= 1500) {
+            uint8_t scratch[1500];
+            memcpy(scratch, ip6_result.payload, ip6_result.payload_len);
+            uint16_t orig_checksum = (scratch[2] << 8) | scratch[3];
+            scratch[2] = 0; scratch[3] = 0;
+            uint32_t partial = ipv6_pseudo_header_partial(
+                ip6_result.src_addr, ip6_result.dst_addr, ip6_result.payload_len, 58);
+            uint16_t computed = checksum16(scratch, ip6_result.payload_len, partial);
+            icmpv6_checksum_valid = (computed == orig_checksum);
+        }
+        dissect_result_add(&dissect_out, "icmpv6_checksum_valid",
+                            icmpv6_checksum_valid ? "true" : "false");
+
+        struct flow_log_record rec = {0};
+        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
+        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        strncpy(rec.category, "ICMPv6", sizeof(rec.category) - 1);
+        const char *icmpv6_type = dissect_result_get(&dissect_out, "icmpv6_type");
+        if (icmpv6_type) strncpy(rec.app_name, icmpv6_type, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, icmpv6_checksum_valid ? "high" : "low", sizeof(rec.confidence) - 1);
+
+        log_ring_try_push(queue_id, &rec);
+        return;
+    }
 
     if (ip6_result.next_header == 17 /* UDP */) {
         struct udp_result udp_result;
@@ -483,6 +621,45 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
         rec.dot_score = classification.dot_score;
         rec.doh_score = classification.doh_score;
+
+        /* Same TCP-based dissector dispatch as the IPv4 TCP path above
+         * (HTTP/1.1, HTTP/2 with persistent HPACK state, SSH) — see
+         * that copy's comment for the full rationale on why HTTP/2 is
+         * special-cased and why this matters at all (a real gap where
+         * these dissectors were registered but never invoked). */
+        if (strcmp(classification.category, "unknown") == 0) {
+            double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
+                                                    tcp_result.dst_port, "TCP");
+            if (http2_confidence > 0.3) {
+                struct hpack_dynamic_table *persistent_dyn =
+                    hpack_get_connection_table(queue_id, &key);
+                struct dissect_result h2_out;
+                memset(&h2_out, 0, sizeof(h2_out));
+                http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                               persistent_dyn, &h2_out);
+
+                strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+                const char *authority = dissect_result_get(&h2_out, "http2_authority");
+                if (authority) {
+                    strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
+                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                } else {
+                    strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                }
+            } else {
+                struct dissect_result tcp_out;
+                bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
+                                                        tcp_result.dst_port, "TCP", &tcp_out);
+                if (tcp_matched) {
+                    strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
+                    const char *identity = dissect_result_get(&tcp_out, "http_host");
+                    if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                    if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
+                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                }
+            }
+        }
+
         rec.out_of_order_segments = stats.out_of_order_segments;
         rec.retransmit_count = stats.retransmit_count;
         rec.overlap_conflict_count = stats.overlap_conflict_count;

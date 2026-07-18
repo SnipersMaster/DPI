@@ -386,17 +386,26 @@ static bool hpack_resolve_index(uint64_t index, const struct hpack_dynamic_table
  *
  * Calls `on_header(name, value, user_ctx)` for each decoded header
  * field, in order. Returns false if the block couldn't be fully
- * decoded (malformed input, or a dynamic-table-miss on a reference
- * this per-call table can't resolve — see this file's header comment).
+ * decoded (malformed input, or a dynamic-table-miss the given table
+ * can't resolve — see this file's header comment).
+ *
+ * `dyn` is now an EXTERNALLY-OWNED table, not created internally —
+ * this is what makes connection-level HPACK persistence possible:
+ * the caller (dpi_hpack_connection_state.c, for callers that have a
+ * real flow identity) can pass the SAME table across multiple calls
+ * for the same connection, so literal-with-incremental-indexing
+ * entries from an earlier HEADERS frame remain resolvable in a later
+ * one. Callers without flow context (the registry-facing
+ * http2_dissect(), and this file's own fuzz harness) use
+ * hpack_decode_header_block_fresh() below, which creates a table that
+ * only lives for one call — the original, more limited behavior.
  * ================================================================== */
 typedef void (*hpack_header_callback)(const char *name, const char *value, void *user_ctx);
 
 static bool hpack_decode_header_block(const uint8_t *data, size_t len,
-                                       size_t dynamic_table_max_size,
+                                       struct hpack_dynamic_table *dyn,
                                        hpack_header_callback on_header, void *user_ctx,
                                        bool *saw_dynamic_table_miss) {
-    struct hpack_dynamic_table dyn;
-    hpack_dynamic_table_init(&dyn, dynamic_table_max_size);
     *saw_dynamic_table_miss = false;
 
     size_t pos = 0;
@@ -414,7 +423,7 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
 
             const char *name, *value;
             bool miss;
-            if (!hpack_resolve_index(index, &dyn, &name, &value, &miss)) {
+            if (!hpack_resolve_index(index, dyn, &name, &value, &miss)) {
                 if (miss) *saw_dynamic_table_miss = true;
                 return false;
             }
@@ -431,7 +440,7 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
                 name = name_buf;
             } else {
                 const char *dummy_val; bool miss;
-                if (!hpack_resolve_index(index, &dyn, &name, &dummy_val, &miss)) {
+                if (!hpack_resolve_index(index, dyn, &name, &dummy_val, &miss)) {
                     if (miss) *saw_dynamic_table_miss = true;
                     return false;
                 }
@@ -439,18 +448,18 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
 
             if (!hpack_decode_string(data, len, &pos, value_buf, sizeof(value_buf))) return false;
             on_header(name, value_buf, user_ctx);
-            hpack_dynamic_table_insert(&dyn, name, value_buf);
+            hpack_dynamic_table_insert(dyn, name, value_buf);
 
         } else if ((first_byte & 0xE0) == 0x20) {
             /* Dynamic Table Size Update, RFC 7541 S6.3 */
             uint64_t new_size;
             if (!hpack_decode_integer(data, len, &pos, 5, &new_size)) return false;
-            if (new_size > dyn.max_size) return false;   /* MUST NOT exceed protocol limit */
-            dyn.max_size = new_size;
-            while (dyn.count > 0 && dyn.total_size > dyn.max_size) {
-                struct hpack_dynamic_entry *last = &dyn.entries[dyn.count - 1];
-                dyn.total_size -= strlen(last->name) + strlen(last->value) + 32;
-                dyn.count--;
+            if (new_size > dyn->max_size) return false;   /* MUST NOT exceed protocol limit */
+            dyn->max_size = new_size;
+            while (dyn->count > 0 && dyn->total_size > dyn->max_size) {
+                struct hpack_dynamic_entry *last = &dyn->entries[dyn->count - 1];
+                dyn->total_size -= strlen(last->name) + strlen(last->value) + 32;
+                dyn->count--;
             }
             continue;   /* no header field produced by this instruction */
 
@@ -468,7 +477,7 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
                 name = name_buf;
             } else {
                 const char *dummy_val; bool miss;
-                if (!hpack_resolve_index(index, &dyn, &name, &dummy_val, &miss)) {
+                if (!hpack_resolve_index(index, dyn, &name, &dummy_val, &miss)) {
                     if (miss) *saw_dynamic_table_miss = true;
                     return false;
                 }
@@ -484,4 +493,23 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
     }
 
     return true;
+}
+
+/*
+ * Convenience wrapper for callers with NO persistent flow context —
+ * creates a fresh, empty dynamic table for this call only and
+ * discards it afterward. This is the ORIGINAL behavior this file had
+ * before HPACK connection persistence was added (dpi_hpack_connection_
+ * state.c): static-table references and same-block literals decode
+ * correctly, cross-frame dynamic-table references don't. Used by
+ * http2_dissect() (the registry-facing entry point, which has no flow
+ * identity to key persistent state on) and by fuzz_hpack_decoder.c.
+ */
+static bool hpack_decode_header_block_fresh(const uint8_t *data, size_t len,
+                                             size_t dynamic_table_max_size,
+                                             hpack_header_callback on_header, void *user_ctx,
+                                             bool *saw_dynamic_table_miss) {
+    struct hpack_dynamic_table dyn;
+    hpack_dynamic_table_init(&dyn, dynamic_table_max_size);
+    return hpack_decode_header_block(data, len, &dyn, on_header, user_ctx, saw_dynamic_table_miss);
 }

@@ -38,10 +38,8 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Provides: hpack_decode_header_block(), hpack_header_callback typedef. */
-#include "dpi_hpack_decoder.c"
-
-/* Provides: hpack_decode_header_block(), hpack_header_callback typedef. */
+/* Provides: hpack_decode_header_block(), hpack_decode_header_block_fresh(),
+ * hpack_header_callback typedef, struct hpack_dynamic_table. */
 #include "dpi_hpack_decoder.c"
 
 #define HTTP2_PORT 443   /* h2 is almost always over TLS/443 in practice;
@@ -135,11 +133,59 @@ static double http2_detect(const uint8_t *payload, uint16_t len,
     return 0.0;
 }
 
-static void http2_dissect(const uint8_t *payload, uint16_t len,
-                           uint16_t dst_port, const char *l4_proto,
-                           struct dissect_result *out) {
-    (void)dst_port; (void)l4_proto;
+/*
+ * Decode one (possibly CONTINUATION-reassembled) header block and
+ * extract the captured pseudo-headers into `out`. Shared by both
+ * entry points below — the only difference between them is whether
+ * `dyn` is a fresh, call-scoped table or a persistent, connection-
+ * scoped one.
+ */
+static void http2_process_header_block(const uint8_t *header_block, size_t header_block_len,
+                                        struct hpack_dynamic_table *dyn,
+                                        struct dissect_result *out) {
+    struct http2_header_capture ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    bool dyn_miss = false;
 
+    bool decode_ok;
+    if (dyn) {
+        decode_ok = hpack_decode_header_block(header_block, header_block_len, dyn,
+                                               http2_header_callback, &ctx, &dyn_miss);
+    } else {
+        /* 4096 is HTTP/2's default SETTINGS_HEADER_TABLE_SIZE (RFC 9113
+         * S6.5.2) — used as the fresh table's max size since this path
+         * has no persisted SETTINGS negotiation to draw from either. */
+        decode_ok = hpack_decode_header_block_fresh(header_block, header_block_len, 4096,
+                                                     http2_header_callback, &ctx, &dyn_miss);
+    }
+
+    if (ctx.found_authority) dissect_result_add(out, "http2_authority", ctx.authority);
+    if (ctx.found_method) dissect_result_add(out, "http2_method", ctx.method);
+    if (ctx.found_path) dissect_result_add(out, "http2_path", ctx.path);
+    if (ctx.found_status) dissect_result_add(out, "http2_status", ctx.status);
+
+    if (dyn_miss) {
+        dissect_result_add(out, "http2_hpack_dynamic_table_miss", "true");
+    } else if (!decode_ok) {
+        dissect_result_add(out, "http2_hpack_decode_error", "true");
+    }
+}
+
+/*
+ * Shared core, parameterized by an OPTIONAL persistent dynamic table:
+ *   - persistent_dyn == NULL: fresh per-HEADERS-frame table (the
+ *     original, more limited behavior) — used by the registry-facing
+ *     http2_dissect() below, which has no flow identity to key state
+ *     on.
+ *   - persistent_dyn != NULL: the SAME table is reused across calls
+ *     for the same connection — used by http2_dissect_with_flow_state(),
+ *     called directly from the TCP capture path where real flow
+ *     identity (and therefore persistent per-flow state, the same way
+ *     dpi_tcp_flow_reassembly.c persists TCP state) is available.
+ */
+static void http2_dissect_core(const uint8_t *payload, uint16_t len,
+                                struct hpack_dynamic_table *persistent_dyn,
+                                struct dissect_result *out) {
     size_t pos = 0;
     bool has_preface = (len >= HTTP2_PREFACE_LEN &&
                          memcmp(payload, HTTP2_PREFACE, HTTP2_PREFACE_LEN) == 0);
@@ -152,9 +198,8 @@ static void http2_dissect(const uint8_t *payload, uint16_t len,
 
     /* Walk as many complete frame headers as are available. Frame
      * PAYLOADS are skipped over (using the frame's own length field)
-     * rather than parsed — HEADERS frame contents specifically are
-     * HPACK-compressed and out of scope, see this file's header
-     * comment. */
+     * rather than parsed — except HEADERS/CONTINUATION field blocks,
+     * which are now HPACK-decoded (see the shared helper below). */
     int frames_parsed = 0;
     int headers_frame_count = 0;
     int rst_stream_count = 0;
@@ -205,36 +250,96 @@ static void http2_dissect(const uint8_t *payload, uint16_t len,
             if (!header_frame_malformed && fp + pad_length <= frame_len) {
                 size_t header_block_len = frame_len - fp - pad_length;
                 const uint8_t *header_block = frame_payload + fp;
+                size_t consumed_through = pos + HTTP2_FRAME_HDR_LEN + frame_len;
 
-                if (!end_headers) {
-                    /* Header block continues in a CONTINUATION frame —
-                     * not reassembled here, see this file's header
-                     * comment. */
-                    dissect_result_add(out, "http2_headers_continued_not_reassembled", "true");
+                /* Accumulation buffer for HEADERS + CONTINUATION field
+                 * blocks. Stack-allocated, NOT static — a static buffer
+                 * here would be the exact same concurrency bug caught
+                 * and fixed for dpi_quic_parser.c's decryption buffer
+                 * earlier in this project: this function is called
+                 * concurrently from multiple lcores in the DPDK worker.
+                 * 16KB comfortably covers real-world header blocks
+                 * without needing dynamic allocation. */
+                uint8_t combined_block[16384];
+                size_t combined_len = 0;
+
+                if (header_block_len > sizeof(combined_block)) {
+                    dissect_result_add(out, "parse_warning", "headers_frame_too_large_for_reassembly_buffer");
                 } else {
-                    struct http2_header_capture ctx;
-                    memset(&ctx, 0, sizeof(ctx));
-                    bool dyn_miss = false;
-                    /* 4096 is HTTP/2's default SETTINGS_HEADER_TABLE_SIZE
-                     * (RFC 9113 S6.5.2) — used here as the dynamic table's
-                     * max size since this reference decoder doesn't track
-                     * actual SETTINGS frame negotiation across the
-                     * connection. */
-                    bool decode_ok = hpack_decode_header_block(
-                        header_block, header_block_len, 4096,
-                        http2_header_callback, &ctx, &dyn_miss);
+                    memcpy(combined_block, header_block, header_block_len);
+                    combined_len = header_block_len;
 
-                    if (ctx.found_authority) dissect_result_add(out, "http2_authority", ctx.authority);
-                    if (ctx.found_method) dissect_result_add(out, "http2_method", ctx.method);
-                    if (ctx.found_path) dissect_result_add(out, "http2_path", ctx.path);
-                    if (ctx.found_status) dissect_result_add(out, "http2_status", ctx.status);
+                    /* Reassemble CONTINUATION frames (RFC 9113 S6.10) that
+                     * follow IMMEDIATELY in this same buffer, sharing the
+                     * same stream_id, until one has END_HEADERS set. This
+                     * covers the common case (HEADERS+CONTINUATION sent
+                     * back-to-back in one write) — a CONTINUATION frame
+                     * split across a TCP reassembly boundary into a
+                     * SEPARATE dissect() call is NOT covered, since this
+                     * dissector has no state persisting between calls
+                     * for that (same category of limitation as the
+                     * HPACK dynamic table needing connection state —
+                     * see this file's header comment). */
+                    size_t scan_pos = consumed_through;
+                    bool reassembly_failed = false;
 
-                    if (dyn_miss) {
-                        dissect_result_add(out, "http2_hpack_dynamic_table_miss", "true");
-                    } else if (!decode_ok) {
-                        dissect_result_add(out, "http2_hpack_decode_error", "true");
+                    while (!end_headers && !reassembly_failed) {
+                        if (scan_pos + HTTP2_FRAME_HDR_LEN > len) {
+                            dissect_result_add(out, "http2_continuation_incomplete_in_buffer", "true");
+                            reassembly_failed = true;
+                            break;
+                        }
+                        uint32_t cont_len = (payload[scan_pos]<<16)|(payload[scan_pos+1]<<8)|payload[scan_pos+2];
+                        uint8_t cont_type = payload[scan_pos+3];
+                        uint8_t cont_flags = payload[scan_pos+4];
+                        uint32_t cont_stream = ((payload[scan_pos+5]<<24)|(payload[scan_pos+6]<<16)|
+                                                 (payload[scan_pos+7]<<8)|payload[scan_pos+8]) & 0x7FFFFFFF;
+
+                        if (cont_type != 0x9 /* CONTINUATION */ || cont_stream != stream_id) {
+                            /* RFC 9113 S6.10: a CONTINUATION frame MUST be
+                             * preceded by a HEADERS/PUSH_PROMISE/CONTINUATION
+                             * frame without END_HEADERS on the SAME stream.
+                             * Anything else here is a protocol violation from
+                             * this dissector's perspective — stop, don't guess. */
+                            dissect_result_add(out, "parse_warning", "expected_continuation_frame_not_found");
+                            reassembly_failed = true;
+                            break;
+                        }
+                        if (scan_pos + HTTP2_FRAME_HDR_LEN + cont_len > len) {
+                            dissect_result_add(out, "http2_continuation_incomplete_in_buffer", "true");
+                            reassembly_failed = true;
+                            break;
+                        }
+                        if (combined_len + cont_len > sizeof(combined_block)) {
+                            dissect_result_add(out, "parse_warning", "continuation_reassembly_buffer_exceeded");
+                            reassembly_failed = true;
+                            break;
+                        }
+
+                        memcpy(combined_block + combined_len,
+                               payload + scan_pos + HTTP2_FRAME_HDR_LEN, cont_len);
+                        combined_len += cont_len;
+                        scan_pos += HTTP2_FRAME_HDR_LEN + cont_len;
+                        end_headers = (cont_flags & 0x04) != 0;
+                    }
+
+                    if (end_headers && !reassembly_failed) {
+                        if (scan_pos != consumed_through) {
+                            dissect_result_add(out, "http2_continuation_reassembled", "true");
+                        }
+                        http2_process_header_block(combined_block, combined_len,
+                                                    persistent_dyn, out);
+                        /* Advance the OUTER loop past every CONTINUATION
+                         * frame we just consumed, so it doesn't re-walk
+                         * them as if they were independent frames. */
+                        consumed_through = scan_pos;
                     }
                 }
+
+                pos = consumed_through;
+                frames_parsed++;
+                if ((int)stream_id > max_stream_id_seen) max_stream_id_seen = (int)stream_id;
+                continue;   /* pos already advanced past HEADERS+CONTINUATION(s) above */
             } else {
                 dissect_result_add(out, "parse_warning", "malformed_headers_frame_padding");
             }
@@ -269,6 +374,36 @@ static void http2_dissect(const uint8_t *payload, uint16_t len,
                                      * fuller implementation; referenced here
                                      * to avoid an unused-function warning
                                      * in this reference version */
+}
+
+/*
+ * Registry-facing entry point — matches the dissector_dissect_fn
+ * signature exactly, so this is what register_http2_dissector() below
+ * wires in. Has no flow identity available (the registry interface
+ * doesn't pass one), so it uses a fresh HPACK dynamic table per call —
+ * the original, more limited behavior. Fine for the UDP dispatch path
+ * and for standalone/fuzzing use; the TCP capture path should prefer
+ * http2_dissect_with_flow_state() below when it has real flow context.
+ */
+static void http2_dissect(const uint8_t *payload, uint16_t len,
+                           uint16_t dst_port, const char *l4_proto,
+                           struct dissect_result *out) {
+    (void)dst_port; (void)l4_proto;
+    http2_dissect_core(payload, len, NULL, out);
+}
+
+/*
+ * Capture-path-facing entry point — called DIRECTLY (not through
+ * dispatch_dissection()/the registry) from the TCP path once it has a
+ * real per-flow HPACK dynamic table to persist across calls for the
+ * same connection. See dpi_hpack_connection_state.c for how that table
+ * is looked up/created/evicted, keyed by the same tcp_flow_key
+ * dpi_tcp_flow_reassembly.c uses.
+ */
+static void http2_dissect_with_flow_state(const uint8_t *payload, uint16_t len,
+                                           struct hpack_dynamic_table *persistent_dyn,
+                                           struct dissect_result *out) {
+    http2_dissect_core(payload, len, persistent_dyn, out);
 }
 
 static const uint16_t http2_hint_ports[] = { HTTP2_PORT };
