@@ -47,7 +47,51 @@ See the per-file status table below before trusting any specific piece.
                                                       dpi_quic_parser.c)
 ```
 
-## File map
+## Supported protocols
+
+Three tiers, and the distinction matters: "parsed" means structured
+fields are extracted and validated; "detected" means the engine can
+recognize/score the traffic but doesn't extract protocol fields;
+everything else is not touched by this engine at all yet.
+
+### Fully parsed (structured fields extracted)
+
+| Protocol | RFC | File | What's extracted |
+|---|---|---|---|
+| Ethernet | IEEE 802.3 | `dpi_secure_bootstrap.c` / `dpi_dpdk_worker.c` | Ethertype, basic frame bounds. No VLAN (802.1Q) tag handling yet. |
+| IPv4 | RFC 791 | `dpi_rfc_parser.c` | Header checksum validation, options (TLV), fragmentation reassembly (see gaps below) |
+| TCP | RFC 9293 | `dpi_rfc_parser.c` | Checksum validation, options (MSS, window scale, SACK-permitted, timestamps). Per-flow overlap-resolution policy not yet implemented (see gaps below). |
+| TLS (ClientHello / SNI) | RFC 8446, RFC 6066 | `dpi_app_classifier.c` | SNI hostname from the ClientHello `server_name` extension. Does not parse the rest of the handshake (cipher suites, other extensions, certificates). |
+| RADIUS | RFC 2865, RFC 2866 | `dpi_radius_parser.c` | Packet code, identifier, User-Name, NAS-IP-Address, Calling-Station-ID, Acct-Status-Type. `User-Password` is detected as present but its value is deliberately never extracted (credential handling). |
+
+### Detected / scored, not fully dissected
+
+| Protocol | File | What it does |
+|---|---|---|
+| QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame. **Does not yet extract SNI from it** — needs a small refactor to hand the decrypted ClientHello (which lacks a TLS record-layer wrapper) to the existing SNI parser. See the file's TODO. |
+| WireGuard | `dpi_vpn_detector.c` | Fingerprints handshake message types/sizes to produce a VPN-likelihood score. Does not parse WireGuard's actual handshake cryptographic fields or transport data. |
+| OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. |
+| IKE / IPsec (IKEv1/IKEv2) | `dpi_vpn_detector.c` | Validates the ISAKMP header shape and version for a VPN-likelihood score. No payload/SA parsing. |
+| Encrypted Client Hello (ECH) | `dpi_app_classifier.c` | Recognized only as "SNI absent, TLS 1.3 handshake" — not decoded (ECH decoding would require the ECH config's private key, which a network observer doesn't have by design). |
+
+### Not supported yet
+
+Everything else. Notably absent, roughly in order of likely value if
+you extend this: **IPv6** (the entire engine is IPv4-only right now —
+this is a significant gap, not a minor one, given IPv6 traffic share),
+**DNS** (high value — cheap to add, plaintext unless DoH/DoT, and
+useful both standalone and as a correlation signal for the DGA/VPN
+detectors), **HTTP/1.1 and HTTP/2** (Host header / `:authority`
+extraction, useful where TLS isn't in play or as a fallback), **SSH**,
+**FTP**, **SMTP/IMAP/POP3**, **SMB**, **SIP/RTP**, **MQTT**, **NTP**,
+**DHCP**, **SNMP**, and industrial/ICS protocols (Modbus, DNP3) if
+that's relevant to your deployment. All of these would plug into
+`dpi_dissector_registry.c` following the same `detect()`/`dissect()`
+pattern already used for RADIUS and QUIC — that registry is what makes
+adding each of these an isolated, independently-fuzzable module rather
+than a growing special case inside one function.
+
+
 
 | File | Role | Depends on |
 |---|---|---|
