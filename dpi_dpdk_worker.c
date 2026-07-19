@@ -114,6 +114,7 @@
 #include "dpi_snmp_parser.c"
 #include "dpi_stun_parser.c"
 #include "dpi_modbus_parser.c"
+#include "dpi_dnp3_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -130,10 +131,27 @@
 
 static volatile int force_quit = 0;
 
+/* Set by SIGUSR1, checked periodically by exactly one lcore (queue 0 —
+ * see lcore_worker() below) to trigger reload_protocol_config(). SIGHUP
+ * is deliberately NOT reused for this even though it's the more
+ * traditional "reload config" signal in some daemons — dpi_output_sink.c's
+ * file sink already claims SIGHUP for log-rotation reopen via its own
+ * sigaction() call, and a second independent sigaction(SIGHUP, ...) call
+ * here would silently replace that handler rather than compose with it.
+ * SIGUSR1 avoids that conflict entirely rather than requiring the two
+ * to be manually coordinated into one combined handler. */
+static volatile int reload_config_requested = 0;
+
 static void signal_handler(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
         printf("\nsignal %d received, shutting down\n", signum);
         force_quit = 1;
+    } else if (signum == SIGUSR1) {
+        reload_config_requested = 1;   /* actual reload happens in
+                                          * lcore_worker(), not here —
+                                          * reload_protocol_config() does
+                                          * a file read + fprintf(), and
+                                          * neither is async-signal-safe */
     }
 }
 
@@ -827,10 +845,26 @@ static int lcore_worker(void *arg) {
     uint16_t queue_id = *(uint16_t *)arg;
     uint16_t port_id = 0;
     struct rte_mbuf *bufs[BURST_SIZE];
+    uint32_t poll_count = 0;
 
     printf("lcore %u polling queue %u\n", rte_lcore_id(), queue_id);
 
     while (!force_quit) {
+        /* Reload check: gated to queue 0 only (not every lcore), so a
+         * SIGUSR1 triggers exactly one reload_protocol_config() call —
+         * not N redundant file reads and N redundant log lines across
+         * N cores. Checked every 4096 poll iterations rather than
+         * every single one; reload_config_requested is a plain
+         * volatile int (not atomic), which is fine here since it's
+         * only ever WRITTEN by the signal handler (on whichever thread
+         * receives the signal) and only ever READ/CLEARED by this one
+         * designated lcore — not the N-writer/N-reader pattern that
+         * g_registry's `enabled` field needed atomics for above. */
+        if (queue_id == 0 && (poll_count++ & 0xFFF) == 0 && reload_config_requested) {
+            reload_config_requested = 0;
+            reload_protocol_config();
+        }
+
         uint16_t nb_rx = rte_eth_rx_burst(port_id, queue_id, bufs, BURST_SIZE);
         for (uint16_t i = 0; i < nb_rx; i++) {
             dissect_packet(bufs[i], queue_id);
@@ -842,6 +876,10 @@ static int lcore_worker(void *arg) {
 int main(int argc, char **argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGUSR1, signal_handler);   /* reload protocols.ini without a restart —
+                                          see reload_protocol_config() in
+                                          dpi_dissector_registry.c. Usage:
+                                          kill -USR1 <pid> after editing protocols.ini */
 
     int ret = rte_eal_init(argc, argv);
     if (ret < 0) {

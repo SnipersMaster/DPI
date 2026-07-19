@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <pwd.h>
 #include <grp.h>
 #include <net/if.h>
@@ -75,6 +76,7 @@
 #include "dpi_snmp_parser.c"
 #include "dpi_stun_parser.c"
 #include "dpi_modbus_parser.c"
+#include "dpi_dnp3_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -673,6 +675,21 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
            stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
 }
 
+/* SIGUSR1 reloads protocols.ini without a restart — see
+ * reload_protocol_config() in dpi_dissector_registry.c. Usage:
+ * kill -USR1 <pid> after editing protocols.ini. Single-threaded here,
+ * so a plain sig_atomic_t (rather than the _Atomic bool the DPDK
+ * worker's multi-lcore version needs for g_registry's `enabled` field)
+ * is sufficient — only this one thread ever reads or writes it. Must
+ * be file-scope (not local to main()) so the signal handler function
+ * below can reach it — a signal handler has no way to access a
+ * caller's local variables. */
+static volatile sig_atomic_t reload_config_requested = 0;
+
+static void bootstrap_signal_handler(int signum) {
+    if (signum == SIGUSR1) reload_config_requested = 1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <interface>\n", argv[0]);
@@ -696,10 +713,17 @@ int main(int argc, char **argv) {
      * starts. Single-threaded here, so there's no ordering hazard the
      * way there is in the DPDK worker — just needs to happen before
      * the first packet could possibly need it. */
+    signal(SIGUSR1, bootstrap_signal_handler);
+
     register_all_dissectors();
 
     unsigned char buf[SNAPLEN];
     for (;;) {
+        if (reload_config_requested) {
+            reload_config_requested = 0;
+            reload_protocol_config();
+        }
+
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n < 0) {
             if (errno == EINTR) continue;
