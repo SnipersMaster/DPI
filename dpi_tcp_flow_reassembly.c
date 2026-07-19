@@ -159,6 +159,31 @@ static struct tcp_flow_key tcp_flow_key_make_v6(const uint8_t src_addr16[16],
     return k;
 }
 
+/*
+ * Swap src/dst to get the OPPOSITE direction's key for the same TCP
+ * connection. Needed because this project's flow keys (and therefore
+ * everything keyed by them, including dpi_hpack_connection_state.c's
+ * per-connection HPACK state) are directional — each direction of a
+ * connection gets its own independent entry. That's correct for TCP
+ * reassembly (sequence numbers are direction-specific) but means any
+ * protocol semantic that spans BOTH directions — like HTTP/2's
+ * SETTINGS_HEADER_TABLE_SIZE, which a SETTINGS frame sent by endpoint A
+ * uses to constrain endpoint B's encoder for the OPPOSITE direction,
+ * not A's own — needs an explicit way to reach the other direction's
+ * state. See dpi_http2_parser.c's SETTINGS handling for where this
+ * matters: a real correctness bug (not just a documented
+ * simplification) was found and fixed using this helper.
+ */
+static struct tcp_flow_key tcp_flow_key_reverse(const struct tcp_flow_key *key) {
+    struct tcp_flow_key reversed;
+    reversed.ip_version = key->ip_version;
+    memcpy(reversed.src_addr, key->dst_addr, 16);
+    memcpy(reversed.dst_addr, key->src_addr, 16);
+    reversed.src_port = key->dst_port;
+    reversed.dst_port = key->src_port;
+    return reversed;
+}
+
 static bool tcp_flow_key_equal(const struct tcp_flow_key *a, const struct tcp_flow_key *b) {
     return a->ip_version == b->ip_version &&
            memcmp(a->src_addr, b->src_addr, 16) == 0 &&

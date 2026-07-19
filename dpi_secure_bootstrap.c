@@ -74,6 +74,7 @@
 #include "dpi_ntp_parser.c"
 #include "dpi_snmp_parser.c"
 #include "dpi_stun_parser.c"
+#include "dpi_modbus_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -370,7 +371,34 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
             0, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
             TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
 
-        if (!have_new_data || !stats.is_first_delivery) return;
+        if (!have_new_data) return;
+
+        struct hpack_connection_entry *conn = hpack_get_connection_entry(0, &key);
+        bool has_pending_http2_continuation = conn && conn->has_pending_headers;
+        struct tcp_flow_key reverse_key = tcp_flow_key_reverse(&key);
+        struct hpack_connection_entry *reverse_conn = hpack_get_connection_entry(0, &reverse_key);
+
+        if (!stats.is_first_delivery && !has_pending_http2_continuation) return;
+
+        if (!stats.is_first_delivery && has_pending_http2_continuation) {
+            struct dissect_result h2_out;
+            memset(&h2_out, 0, sizeof(h2_out));
+            http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                           conn, reverse_conn, &h2_out);
+
+            if (!conn->has_pending_headers) {
+                const char *authority = dissect_result_get(&h2_out, "http2_authority");
+                printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+                       "\"category\":\"HTTP/2\",\"app_name\":\"%s\",\"confidence\":\"%s\","
+                       "\"reassembly\":{\"out_of_order\":%u,\"retransmits\":%u,"
+                       "\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
+                       src_str, dst_str, tcp_result.src_port, tcp_result.dst_port,
+                       authority ? authority : "", authority ? "high" : "low",
+                       stats.out_of_order_segments, stats.retransmit_count,
+                       stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
+            }
+            return;
+        }
 
         struct app_classification classification;
         classify_flow(contiguous_data, contiguous_len,
@@ -401,11 +429,10 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
             double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
                                                     tcp_result.dst_port, "TCP");
             if (http2_confidence > 0.3) {
-                struct hpack_dynamic_table *persistent_dyn = hpack_get_connection_table(0, &key);
                 struct dissect_result h2_out;
                 memset(&h2_out, 0, sizeof(h2_out));
                 http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
-                                               persistent_dyn, &h2_out);
+                                               conn, reverse_conn, &h2_out);
 
                 strncpy(effective_category, "HTTP/2", sizeof(effective_category) - 1);
                 const char *authority = dissect_result_get(&h2_out, "http2_authority");
@@ -535,22 +562,21 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         0, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
         TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
 
-    if (!have_new_data || !stats.is_first_delivery) return;
-    /* Gating on is_first_delivery here is about avoiding redundant work
-     * per flow, same reasoning as dpi_dpdk_worker.c — not a hot-path
-     * necessity at single-core lab-testing scale the way it is at 100G,
-     * but keeping the two capture paths behaviorally consistent matters
-     * more than a small unneeded optimization here. */
+    if (!have_new_data) return;
 
-    struct app_classification classification;
-    classify_flow(contiguous_data, contiguous_len,
-                  tcp_result.dst_port, "TCP", &classification);
+    /* Same pending-CONTINUATION check as dpi_dpdk_worker.c's matching
+     * code, and the same fix for a real inconsistency found while
+     * writing this: this v4 path never had the HTTP/1.1/HTTP/2/SSH/
+     * SMTP dispatch fallback that the IPv6 path just below already
+     * has — classify_flow() alone (TLS/SNI-only) was all that ran
+     * here. Both gaps fixed together since they touch the same block. */
+    struct hpack_connection_entry *conn = hpack_get_connection_entry(0, &key);
+    bool has_pending_http2_continuation = conn && conn->has_pending_headers;
+    struct tcp_flow_key reverse_key = tcp_flow_key_reverse(&key);
+    struct hpack_connection_entry *reverse_conn = hpack_get_connection_entry(0, &reverse_key);
 
-    /* Unlike dpi_dpdk_worker.c, printf here is fine — this is a
-     * single-threaded, non-100G reference path meant for lab testing,
-     * not a multi-core poll-mode hot loop. Still worth eventually
-     * replacing with structured logging for anything beyond ad hoc
-     * testing. */
+    if (!stats.is_first_delivery && !has_pending_http2_continuation) return;
+
     char src_ip_str[16], dst_ip_str[16];
     snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
              (ip_result.src_addr >> 24) & 0xFF, (ip_result.src_addr >> 16) & 0xFF,
@@ -559,6 +585,79 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
              (ip_result.dst_addr >> 24) & 0xFF, (ip_result.dst_addr >> 16) & 0xFF,
              (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
 
+    if (!stats.is_first_delivery && has_pending_http2_continuation) {
+        struct dissect_result h2_out;
+        memset(&h2_out, 0, sizeof(h2_out));
+        http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                       conn, reverse_conn, &h2_out);
+
+        if (!conn->has_pending_headers) {
+            const char *authority = dissect_result_get(&h2_out, "http2_authority");
+            printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
+                   "\"category\":\"HTTP/2\",\"app_name\":\"%s\",\"confidence\":\"%s\","
+                   "\"reassembly\":{\"out_of_order\":%u,\"retransmits\":%u,"
+                   "\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
+                   src_ip_str, dst_ip_str, tcp_result.src_port, tcp_result.dst_port,
+                   authority ? authority : "", authority ? "high" : "low",
+                   stats.out_of_order_segments, stats.retransmit_count,
+                   stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
+        }
+        return;
+    }
+
+    struct app_classification classification;
+    classify_flow(contiguous_data, contiguous_len,
+                  tcp_result.dst_port, "TCP", &classification);
+
+    /* Effective category/app_name/confidence, possibly overridden below
+     * by a TCP-based dissector match (HTTP/1.1, HTTP/2, SSH, SMTP) when
+     * classify_flow() found no TLS ClientHello — same pattern as the
+     * IPv6 path just below and the DPDK worker's matching code. */
+    char effective_category[MAX_PROTOCOL_NAME];
+    char effective_app_name[MAX_FIELD_VAL_LEN];
+    char effective_confidence[16];
+    strncpy(effective_category, classification.category, sizeof(effective_category) - 1);
+    strncpy(effective_app_name, classification.app_name, sizeof(effective_app_name) - 1);
+    strncpy(effective_confidence, classification.confidence, sizeof(effective_confidence) - 1);
+
+    if (strcmp(classification.category, "unknown") == 0) {
+        double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
+                                                tcp_result.dst_port, "TCP");
+        if (http2_confidence > 0.3) {
+            struct dissect_result h2_out;
+            memset(&h2_out, 0, sizeof(h2_out));
+            http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                           conn, reverse_conn, &h2_out);
+
+            strncpy(effective_category, "HTTP/2", sizeof(effective_category) - 1);
+            const char *authority = dissect_result_get(&h2_out, "http2_authority");
+            if (authority) {
+                strncpy(effective_app_name, authority, sizeof(effective_app_name) - 1);
+                strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+            } else {
+                strncpy(effective_confidence, "low", sizeof(effective_confidence) - 1);
+            }
+        } else {
+            struct dissect_result tcp_out;
+            bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
+                                                    tcp_result.dst_port, "TCP", &tcp_out);
+            if (tcp_matched) {
+                strncpy(effective_category, tcp_out.protocol_name, sizeof(effective_category) - 1);
+                const char *identity = dissect_result_get(&tcp_out, "http_host");
+                if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
+                if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
+                if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
+                if (identity) strncpy(effective_app_name, identity, sizeof(effective_app_name) - 1);
+                strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+            }
+        }
+    }
+
+    /* Unlike dpi_dpdk_worker.c, printf here is fine — this is a
+     * single-threaded, non-100G reference path meant for lab testing,
+     * not a multi-core poll-mode hot loop. Still worth eventually
+     * replacing with structured logging for anything beyond ad hoc
+     * testing. */
     printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
            "\"sni\":\"%s\",\"category\":\"%s\","
            "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
@@ -566,8 +665,8 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
            "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
            "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
            src_ip_str, dst_ip_str, tcp_result.src_port, tcp_result.dst_port,
-           classification.sni, classification.category, classification.app_name,
-           classification.confidence, classification.dga_score,
+           classification.sni, effective_category, effective_app_name,
+           effective_confidence, classification.dga_score,
            classification.vpn_score, classification.vpn_protocol,
            classification.dot_score, classification.doh_score,
            stats.out_of_order_segments, stats.retransmit_count,

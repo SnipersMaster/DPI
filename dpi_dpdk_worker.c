@@ -113,6 +113,7 @@
 #include "dpi_ntp_parser.c"
 #include "dpi_snmp_parser.c"
 #include "dpi_stun_parser.c"
+#include "dpi_modbus_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -296,6 +297,76 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 
     if (!have_new_data) return;
 
+    /* Look up (or create) this flow's HPACK connection entry BEFORE
+     * the is_first_delivery gate below — cheap (O(32) linear scan
+     * within one partition), and needed to check whether this flow
+     * has a PENDING cross-TCP-boundary CONTINUATION sequence waiting,
+     * which must be allowed through even on a NON-first delivery
+     * (the whole point of this feature is handling data that arrives
+     * in a later delivery than the one that started the HEADERS
+     * frame). A flow with no pending state (the overwhelming common
+     * case) still gets gated exactly as before. */
+    struct hpack_connection_entry *conn = hpack_get_connection_entry(queue_id, &key);
+    bool has_pending_http2_continuation = conn && conn->has_pending_headers;
+
+    /* Opposite-direction connection entry, needed so HPACK
+     * SETTINGS_HEADER_TABLE_SIZE (which constrains the PEER's encoder,
+     * not this direction's own) resizes the correct table — see
+     * dpi_http2_parser.c's http2_dissect_core() header comment for the
+     * full correctness rationale. Looked up unconditionally alongside
+     * `conn` since it's the same cheap O(32) scan. */
+    struct tcp_flow_key reverse_key = tcp_flow_key_reverse(&key);
+    struct hpack_connection_entry *reverse_conn = hpack_get_connection_entry(queue_id, &reverse_key);
+
+    if (!stats.is_first_delivery && !has_pending_http2_continuation) return;
+
+    if (!stats.is_first_delivery && has_pending_http2_continuation) {
+        /* RESUME PATH: this chunk is a later delivery for a flow
+         * that's mid-way through an HTTP/2 CONTINUATION sequence
+         * split across a TCP reassembly boundary. Skip classify_flow()
+         * entirely — there's no new TLS ClientHello/flow-start
+         * information in a continuation chunk — and go straight to
+         * completing (or further deferring) the pending header block. */
+        struct dissect_result h2_out;
+        memset(&h2_out, 0, sizeof(h2_out));
+        http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                       conn, reverse_conn, &h2_out);
+
+        /* Only emit a flow record if this call actually completed the
+         * pending sequence (i.e. conn no longer has pending headers) —
+         * if it's STILL pending (needs yet another delivery), there's
+         * nothing new to report yet. */
+        if (!conn->has_pending_headers) {
+            char src_ip_str[46], dst_ip_str[46];
+            snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+                     (ip_result.src_addr >> 24) & 0xFF, (ip_result.src_addr >> 16) & 0xFF,
+                     (ip_result.src_addr >> 8) & 0xFF, ip_result.src_addr & 0xFF);
+            snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+                     (ip_result.dst_addr >> 24) & 0xFF, (ip_result.dst_addr >> 16) & 0xFF,
+                     (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
+
+            struct flow_log_record rec = {0};
+            strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
+            strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
+            rec.src_port = tcp_result.src_port;
+            rec.dst_port = tcp_result.dst_port;
+            strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+            const char *authority = dissect_result_get(&h2_out, "http2_authority");
+            if (authority) {
+                strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else {
+                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            }
+            rec.out_of_order_segments = stats.out_of_order_segments;
+            rec.retransmit_count = stats.retransmit_count;
+            rec.overlap_conflict_count = stats.overlap_conflict_count;
+            rec.evasion_flag = stats.evasion_flag;
+            log_ring_try_push(queue_id, &rec);
+        }
+        return;
+    }
+
     /* Gate the classification pipeline (SNI parse, domain lookup, DGA
      * scoring, VPN scoring, DoH/DoT scoring) to run once per flow, on
      * its first contiguous delivery — not on every later chunk of a
@@ -305,8 +376,10 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
      * re-run for every additional in-order byte a multi-second
      * connection delivers. The ClientHello (and therefore the SNI)
      * essentially always arrives in a flow's first contiguous chunk,
-     * so this doesn't cost real detection coverage. */
-    if (!stats.is_first_delivery) return;
+     * so this doesn't cost real detection coverage. Reaching this
+     * point means stats.is_first_delivery is true — the only other
+     * way past the two checks above (non-first-delivery, no pending
+     * HTTP/2 state) already returned. */
 
     struct app_classification classification;
     classify_flow(contiguous_data, contiguous_len,
@@ -338,28 +411,20 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 
     /* If no TLS ClientHello was found (category still "unknown"), this
      * might be plaintext HTTP/1.1, HTTP/2 (h2c), or SSH — try those
-     * TCP-based dissectors now. THIS FIXES A REAL GAP found while
-     * wiring HPACK connection persistence: dpi_http1_parser.c,
-     * dpi_http2_parser.c, and dpi_ssh_parser.c were all registered
-     * into the dissector registry, but nothing on this TCP path ever
-     * actually called dispatch_dissection() against reassembled TCP
-     * data — only classify_flow()'s TLS/SNI-specific path was called.
-     * They were registered dead code. HTTP/2 gets special-cased (not
-     * routed through the generic registry dispatch) specifically so it
-     * can use the per-flow PERSISTENT HPACK table instead of a fresh
-     * one — the same "handle outside the generic interface when the
-     * generic interface doesn't fit" pattern used for TLS/SNI and for
-     * ICMPv6's checksum. */
+     * TCP-based dissectors now. HTTP/2 gets special-cased (not routed
+     * through the generic registry dispatch) specifically so it can
+     * use the per-flow PERSISTENT connection entry (dynamic table +
+     * pending-CONTINUATION state) instead of a fresh one — the same
+     * "handle outside the generic interface when the generic interface
+     * doesn't fit" pattern used for TLS/SNI and for ICMPv6's checksum. */
     if (strcmp(classification.category, "unknown") == 0) {
         double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
                                                 tcp_result.dst_port, "TCP");
         if (http2_confidence > 0.3) {
-            struct hpack_dynamic_table *persistent_dyn =
-                hpack_get_connection_table(queue_id, &key);
             struct dissect_result h2_out;
             memset(&h2_out, 0, sizeof(h2_out));
             http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
-                                           persistent_dyn, &h2_out);
+                                           conn, reverse_conn, &h2_out);
 
             strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
             const char *authority = dissect_result_get(&h2_out, "http2_authority");
@@ -641,7 +706,54 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
             queue_id, &key, tcp_result.seq, tcp_result.payload, tcp_result.payload_len,
             TCP_OVERLAP_FIRST_WINS, &contiguous_data, &contiguous_len, &stats);
 
-        if (!have_new_data || !stats.is_first_delivery) return;
+        if (!have_new_data) return;
+
+        /* This whole block was missed in an earlier pass that added
+         * cross-TCP-boundary CONTINUATION resumption to the v4 TCP
+         * path and both of dpi_secure_bootstrap.c's paths — this IPv6
+         * path still had the OLD is_first_delivery-only gate and the
+         * OLD hpack_get_connection_table() (dynamic-table-only, no
+         * pending-state access). Fixed now to match exactly. */
+        struct hpack_connection_entry *conn = hpack_get_connection_entry(queue_id, &key);
+        bool has_pending_http2_continuation = conn && conn->has_pending_headers;
+        struct tcp_flow_key reverse_key = tcp_flow_key_reverse(&key);
+        struct hpack_connection_entry *reverse_conn =
+            hpack_get_connection_entry(queue_id, &reverse_key);
+
+        if (!stats.is_first_delivery && !has_pending_http2_continuation) return;
+
+        if (!stats.is_first_delivery && has_pending_http2_continuation) {
+            struct dissect_result h2_out;
+            memset(&h2_out, 0, sizeof(h2_out));
+            http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
+                                           conn, reverse_conn, &h2_out);
+
+            if (!conn->has_pending_headers) {
+                char src_str6[46], dst_str6[46];
+                ipv6_addr_to_string(ip6_result.src_addr, src_str6, sizeof(src_str6));
+                ipv6_addr_to_string(ip6_result.dst_addr, dst_str6, sizeof(dst_str6));
+
+                struct flow_log_record rec = {0};
+                strncpy(rec.src_ip, src_str6, sizeof(rec.src_ip) - 1);
+                strncpy(rec.dst_ip, dst_str6, sizeof(rec.dst_ip) - 1);
+                rec.src_port = tcp_result.src_port;
+                rec.dst_port = tcp_result.dst_port;
+                strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+                const char *authority = dissect_result_get(&h2_out, "http2_authority");
+                if (authority) {
+                    strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
+                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                } else {
+                    strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                }
+                rec.out_of_order_segments = stats.out_of_order_segments;
+                rec.retransmit_count = stats.retransmit_count;
+                rec.overlap_conflict_count = stats.overlap_conflict_count;
+                rec.evasion_flag = stats.evasion_flag;
+                log_ring_try_push(queue_id, &rec);
+            }
+            return;
+        }
 
         struct app_classification classification;
         classify_flow(contiguous_data, contiguous_len,
@@ -671,12 +783,10 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
             double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
                                                     tcp_result.dst_port, "TCP");
             if (http2_confidence > 0.3) {
-                struct hpack_dynamic_table *persistent_dyn =
-                    hpack_get_connection_table(queue_id, &key);
                 struct dissect_result h2_out;
                 memset(&h2_out, 0, sizeof(h2_out));
                 http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
-                                               persistent_dyn, &h2_out);
+                                               conn, reverse_conn, &h2_out);
 
                 strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
                 const char *authority = dissect_result_get(&h2_out, "http2_authority");

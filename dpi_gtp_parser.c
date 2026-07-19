@@ -35,6 +35,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 
 #define GTP_U_PORT   2152
 #define GTPV2_C_PORT 2123
@@ -88,9 +89,25 @@ static double gtp1_detect(const uint8_t *payload, uint16_t len,
     return confidence;
 }
 
+/*
+ * GTP-in-GTP nesting depth bound — explicit and configurable, not just
+ * an implicit "never recurse" as an earlier version of this file had.
+ * Default stays conservative (1 extra level beyond the outer G-PDU,
+ * i.e. GTP_MAX_TUNNEL_DEPTH=1 permits exactly one nested tunnel to be
+ * dissected) for the security reason stated repeatedly in this
+ * project: unbounded recursion driven by attacker-controlled tunnel
+ * depth is a resource-exhaustion vector. Raise this only if you have a
+ * genuine multi-layer tunneling deployment and understand the
+ * per-level parsing cost you're accepting — this is a real safety
+ * bound, not an arbitrary one, so don't raise it casually.
+ */
+#define GTP_MAX_TUNNEL_DEPTH 1
+
 /* Forward declaration: gtp1_dissect() calls this before its definition appears. */
 static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
-                                       struct dissect_result *out);
+                                       int depth, struct dissect_result *out);
+static void gtp1_dissect_inner_packet_v6(const uint8_t *inner, uint16_t inner_len,
+                                          int depth, struct dissect_result *out);
 
 static void gtp1_dissect(const uint8_t *payload, uint16_t len,
                           uint16_t dst_port, const char *l4_proto,
@@ -152,7 +169,7 @@ static void gtp1_dissect(const uint8_t *payload, uint16_t len,
                                                                     remaining buffer
                                                                     if declared_len
                                                                     looks inconsistent */
-        gtp1_dissect_inner_packet(payload + inner_start, inner_len, out);
+        gtp1_dissect_inner_packet(payload + inner_start, inner_len, 0, out);
     }
 }
 
@@ -169,16 +186,18 @@ static void gtp1_dissect(const uint8_t *payload, uint16_t len,
  * bug gets a flag, not a crash or a hang.
  */
 static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
-                                       struct dissect_result *out) {
+                                       int depth, struct dissect_result *out) {
     if (inner_len < 1) return;
 
     uint8_t version = inner[0] >> 4;
+
+    if (version == 6) {
+        gtp1_dissect_inner_packet_v6(inner, inner_len, depth, out);
+        return;
+    }
+
     if (version != 4) {
-        /* Only IPv4 inner packets are recursed into in this pass — an
-         * IPv6 inner packet would need dpi_ipv6_parser.c wired here
-         * too, not done yet, flagged rather than silently skipped. */
-        dissect_result_add(out, "gtp_inner_packet_ipv6_not_dissected",
-                            version == 6 ? "true" : "false");
+        dissect_result_add(out, "gtp_inner_packet_unknown_ip_version", "true");
         return;
     }
 
@@ -189,23 +208,29 @@ static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
     }
 
     char ipbuf[32];
+    const char *src_key = (depth == 0) ? "gtp_inner_src_ip" : "gtp_nested_inner_src_ip";
+    const char *dst_key = (depth == 0) ? "gtp_inner_dst_ip" : "gtp_nested_inner_dst_ip";
+    const char *proto_key = (depth == 0) ? "gtp_inner_protocol" : "gtp_nested_inner_protocol";
+    const char *port_key = (depth == 0) ? "gtp_inner_dst_port" : "gtp_nested_inner_dst_port";
+    const char *sni_key = (depth == 0) ? "gtp_inner_sni" : "gtp_nested_inner_sni";
+
     snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
              (inner_ip.src_addr >> 24) & 0xFF, (inner_ip.src_addr >> 16) & 0xFF,
              (inner_ip.src_addr >> 8) & 0xFF, inner_ip.src_addr & 0xFF);
-    dissect_result_add(out, "gtp_inner_src_ip", ipbuf);
+    dissect_result_add(out, src_key, ipbuf);
     snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
              (inner_ip.dst_addr >> 24) & 0xFF, (inner_ip.dst_addr >> 16) & 0xFF,
              (inner_ip.dst_addr >> 8) & 0xFF, inner_ip.dst_addr & 0xFF);
-    dissect_result_add(out, "gtp_inner_dst_ip", ipbuf);
+    dissect_result_add(out, dst_key, ipbuf);
 
     if (inner_ip.protocol == 6 /* TCP */) {
-        dissect_result_add(out, "gtp_inner_protocol", "TCP");
+        dissect_result_add(out, proto_key, "TCP");
         struct tcp_result inner_tcp;
         if (parse_tcp(inner_ip.src_addr, inner_ip.dst_addr,
                        inner_ip.payload, inner_ip.payload_len, &inner_tcp)) {
             char portbuf[16];
             snprintf(portbuf, sizeof(portbuf), "%u", inner_tcp.dst_port);
-            dissect_result_add(out, "gtp_inner_dst_port", portbuf);
+            dissect_result_add(out, port_key, portbuf);
 
             /* Attempt SNI extraction directly on this single G-PDU
              * packet's inner payload — NOT going through TCP flow
@@ -230,27 +255,167 @@ static void gtp1_dissect_inner_packet(const uint8_t *inner, uint16_t inner_len,
             if (inner_tcp.payload_len > 0 &&
                 extract_sni_from_record(inner_tcp.payload, inner_tcp.payload_len, &sni)
                 && sni.found) {
-                dissect_result_add(out, "gtp_inner_sni", sni.hostname);
+                dissect_result_add(out, sni_key, sni.hostname);
             }
         }
     } else if (inner_ip.protocol == 17 /* UDP */) {
-        dissect_result_add(out, "gtp_inner_protocol", "UDP");
+        dissect_result_add(out, proto_key, "UDP");
         struct udp_result inner_udp;
         if (parse_udp(inner_ip.src_addr, inner_ip.dst_addr,
                        inner_ip.payload, inner_ip.payload_len, &inner_udp)) {
             char portbuf[16];
             snprintf(portbuf, sizeof(portbuf), "%u", inner_udp.dst_port);
-            dissect_result_add(out, "gtp_inner_dst_port", portbuf);
+            dissect_result_add(out, port_key, portbuf);
 
             if (inner_udp.dst_port == GTP_U_PORT || inner_udp.dst_port == GTPV2_C_PORT) {
-                /* Nested GTP tunnel detected — deliberately NOT
-                 * recursing further, see this function's header
-                 * comment. Flagged for visibility, not dissected. */
+                /* Nested GTP tunnel found. Recurse into it — but ONLY
+                 * if the depth bound allows, per GTP_MAX_TUNNEL_DEPTH
+                 * above. This is now a REAL bounded recursion (an
+                 * earlier version of this file only ever flagged this
+                 * case and stopped, with no actual recursion mechanism
+                 * at all) — the safety property is the explicit depth
+                 * check below, not "recursion doesn't exist". */
                 dissect_result_add(out, "gtp_nested_tunnel_detected", "true");
+
+                if (depth + 1 <= GTP_MAX_TUNNEL_DEPTH &&
+                    inner_udp.payload_len >= GTP1_HDR_LEN_MANDATORY) {
+                    const uint8_t *nested_gtp = inner_udp.payload;
+                    uint16_t nested_gtp_len = inner_udp.payload_len;
+
+                    uint8_t nested_flags = nested_gtp[0];
+                    uint8_t nested_version = (nested_flags >> 5) & 0x07;
+                    uint8_t nested_pt = (nested_flags >> 4) & 0x01;
+
+                    if (nested_version == 1 && nested_pt == 1) {
+                        uint8_t nested_msg_type = nested_gtp[1];
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%s", gtp1_msg_type_name(nested_msg_type));
+                        dissect_result_add(out, "gtp_nested_message_type", buf);
+
+                        bool nested_has_optional = (nested_flags & 0x07) != 0;
+                        size_t nested_hdr_len = GTP1_HDR_LEN_MANDATORY +
+                                                 (nested_has_optional ? GTP1_HDR_LEN_OPTIONAL : 0);
+
+                        if (nested_msg_type == GTP1_MSG_TYPE_GPDU &&
+                            nested_hdr_len <= nested_gtp_len) {
+                            /* Recurse into the DOUBLY-nested inner packet,
+                             * at depth+1 — the depth check above is what
+                             * keeps this from ever going further than
+                             * GTP_MAX_TUNNEL_DEPTH regardless of how many
+                             * more GTP layers an attacker tries to stack. */
+                            gtp1_dissect_inner_packet(nested_gtp + nested_hdr_len,
+                                                       (uint16_t)(nested_gtp_len - nested_hdr_len),
+                                                       depth + 1, out);
+                        }
+                    } else {
+                        dissect_result_add(out, "gtp_nested_not_gtpv1u", "true");
+                    }
+                } else if (depth + 1 > GTP_MAX_TUNNEL_DEPTH) {
+                    dissect_result_add(out, "gtp_nested_tunnel_depth_limit_reached", "true");
+                }
             }
         }
     } else {
-        dissect_result_add(out, "gtp_inner_protocol", "other");
+        dissect_result_add(out, proto_key, "other");
+    }
+}
+
+/*
+ * IPv6 counterpart to gtp1_dissect_inner_packet() above — same
+ * discipline (bounded to one level, TCP gets single-packet SNI
+ * extraction only, UDP-to-a-GTP-port is flagged as nested-not-
+ * recursed) applied via dpi_ipv6_parser.c's parse_ipv6()/parse_tcp_v6()/
+ * parse_udp_v6() instead of the IPv4 equivalents. Closes the gap
+ * where an IPv6 inner packet was previously detected but not
+ * dissected at all.
+ */
+static void gtp1_dissect_inner_packet_v6(const uint8_t *inner, uint16_t inner_len,
+                                          int depth, struct dissect_result *out) {
+    struct ipv6_result inner_ip6;
+    if (!parse_ipv6(inner, inner_len, &inner_ip6)) {
+        dissect_result_add(out, "gtp_inner_packet_parse_failed", "true");
+        return;
+    }
+
+    const char *src_key = (depth == 0) ? "gtp_inner_src_ip" : "gtp_nested_inner_src_ip";
+    const char *dst_key = (depth == 0) ? "gtp_inner_dst_ip" : "gtp_nested_inner_dst_ip";
+    const char *proto_key = (depth == 0) ? "gtp_inner_protocol" : "gtp_nested_inner_protocol";
+    const char *port_key = (depth == 0) ? "gtp_inner_dst_port" : "gtp_nested_inner_dst_port";
+    const char *sni_key = (depth == 0) ? "gtp_inner_sni" : "gtp_nested_inner_sni";
+
+    char ipbuf[46];
+    ipv6_addr_to_string(inner_ip6.src_addr, ipbuf, sizeof(ipbuf));
+    dissect_result_add(out, src_key, ipbuf);
+    ipv6_addr_to_string(inner_ip6.dst_addr, ipbuf, sizeof(ipbuf));
+    dissect_result_add(out, dst_key, ipbuf);
+
+    if (inner_ip6.next_header == 6 /* TCP */) {
+        dissect_result_add(out, proto_key, "TCP");
+        struct tcp_result inner_tcp;
+        if (parse_tcp_v6(inner_ip6.src_addr, inner_ip6.dst_addr,
+                          inner_ip6.payload, inner_ip6.payload_len, &inner_tcp)) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%u", inner_tcp.dst_port);
+            dissect_result_add(out, port_key, portbuf);
+
+            /* Same single-packet-only SNI extraction limitation as the
+             * IPv4 path — see that function's comment for why. */
+            struct sni_result sni;
+            if (inner_tcp.payload_len > 0 &&
+                extract_sni_from_record(inner_tcp.payload, inner_tcp.payload_len, &sni)
+                && sni.found) {
+                dissect_result_add(out, sni_key, sni.hostname);
+            }
+        }
+    } else if (inner_ip6.next_header == 17 /* UDP */) {
+        dissect_result_add(out, proto_key, "UDP");
+        struct udp_result inner_udp;
+        if (parse_udp_v6(inner_ip6.src_addr, inner_ip6.dst_addr,
+                          inner_ip6.payload, inner_ip6.payload_len, &inner_udp)) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%u", inner_udp.dst_port);
+            dissect_result_add(out, port_key, portbuf);
+
+            if (inner_udp.dst_port == GTP_U_PORT || inner_udp.dst_port == GTPV2_C_PORT) {
+                dissect_result_add(out, "gtp_nested_tunnel_detected", "true");
+
+                /* Same bounded-recursion mechanism as the IPv4 path —
+                 * see that function's comment for the safety rationale. */
+                if (depth + 1 <= GTP_MAX_TUNNEL_DEPTH &&
+                    inner_udp.payload_len >= GTP1_HDR_LEN_MANDATORY) {
+                    const uint8_t *nested_gtp = inner_udp.payload;
+                    uint16_t nested_gtp_len = inner_udp.payload_len;
+
+                    uint8_t nested_flags = nested_gtp[0];
+                    uint8_t nested_version = (nested_flags >> 5) & 0x07;
+                    uint8_t nested_pt = (nested_flags >> 4) & 0x01;
+
+                    if (nested_version == 1 && nested_pt == 1) {
+                        uint8_t nested_msg_type = nested_gtp[1];
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%s", gtp1_msg_type_name(nested_msg_type));
+                        dissect_result_add(out, "gtp_nested_message_type", buf);
+
+                        bool nested_has_optional = (nested_flags & 0x07) != 0;
+                        size_t nested_hdr_len = GTP1_HDR_LEN_MANDATORY +
+                                                 (nested_has_optional ? GTP1_HDR_LEN_OPTIONAL : 0);
+
+                        if (nested_msg_type == GTP1_MSG_TYPE_GPDU &&
+                            nested_hdr_len <= nested_gtp_len) {
+                            gtp1_dissect_inner_packet(nested_gtp + nested_hdr_len,
+                                                       (uint16_t)(nested_gtp_len - nested_hdr_len),
+                                                       depth + 1, out);
+                        }
+                    } else {
+                        dissect_result_add(out, "gtp_nested_not_gtpv1u", "true");
+                    }
+                } else if (depth + 1 > GTP_MAX_TUNNEL_DEPTH) {
+                    dissect_result_add(out, "gtp_nested_tunnel_depth_limit_reached", "true");
+                }
+            }
+        }
+    } else {
+        dissect_result_add(out, proto_key, "other");
     }
 }
 
@@ -444,11 +609,128 @@ static void gtpv2_dissect(const uint8_t *payload, uint16_t len,
                     dissect_result_add(out, key, val);
                 }
                 break;
+            case 3: {  /* Recovery / Restart Counter, TS 29.274 S8.5 */
+                if (ie_len >= 1) {
+                    snprintf(val, sizeof(val), "%u", ie_val[0]);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_recovery", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            }
+            case 82: {  /* RAT Type, TS 29.274 S8.17 */
+                if (ie_len >= 1) {
+                    static const char *rat_names[] = {
+                        "Reserved", "UTRAN", "GERAN", "WLAN", "GAN",
+                        "HSPA Evolution", "EUTRAN", "Virtual",
+                        "EUTRAN-NB-IoT", "LTE-M", "NR"
+                    };
+                    uint8_t rat = ie_val[0];
+                    const char *name = (rat < sizeof(rat_names) / sizeof(rat_names[0]))
+                                        ? rat_names[rat] : "Unknown";
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_rat_type", ie_count);
+                    dissect_result_add(out, key, name);
+                }
+                break;
+            }
+            case 87: {  /* F-TEID (Fully Qualified TEID), TS 29.274 S8.22 */
+                if (ie_len >= 5) {
+                    bool v4_flag = (ie_val[0] >> 7) & 1;
+                    bool v6_flag = (ie_val[0] >> 6) & 1;
+                    uint8_t iface_type = ie_val[0] & 0x3F;
+                    uint32_t teid = (ie_val[1]<<24)|(ie_val[2]<<16)|(ie_val[3]<<8)|ie_val[4];
+
+                    snprintf(val, sizeof(val), "iface_type=%u teid=0x%08x", iface_type, teid);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_fteid", ie_count);
+                    dissect_result_add(out, key, val);
+
+                    size_t addr_pos = 5;
+                    if (v4_flag && addr_pos + 4 <= ie_len) {
+                        snprintf(val, sizeof(val), "%u.%u.%u.%u",
+                                 ie_val[addr_pos], ie_val[addr_pos+1],
+                                 ie_val[addr_pos+2], ie_val[addr_pos+3]);
+                        snprintf(key, sizeof(key), "gtpv2_ie_%d_fteid_ipv4", ie_count);
+                        dissect_result_add(out, key, val);
+                        addr_pos += 4;
+                    }
+                    if (v6_flag && addr_pos + 16 <= ie_len) {
+                        char v6buf[46];
+                        struct in6_addr a;
+                        memcpy(&a, ie_val + addr_pos, 16);
+                        if (inet_ntop(AF_INET6, &a, v6buf, sizeof(v6buf))) {
+                            snprintf(key, sizeof(key), "gtpv2_ie_%d_fteid_ipv6", ie_count);
+                            dissect_result_add(out, key, v6buf);
+                        }
+                    }
+                }
+                break;
+            }
+            case 79: {  /* PDN Address Allocation (PAA), TS 29.274 S8.14 */
+                if (ie_len >= 1) {
+                    uint8_t pdn_type = ie_val[0] & 0x07;
+                    const char *pdn_name = (pdn_type == 1) ? "IPv4" :
+                                            (pdn_type == 2) ? "IPv6" :
+                                            (pdn_type == 3) ? "IPv4v6" : "Unknown";
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_paa_type", ie_count);
+                    dissect_result_add(out, key, pdn_name);
+
+                    size_t pos2 = 1;
+                    if ((pdn_type == 2 || pdn_type == 3) && pos2 + 17 <= ie_len) {
+                        pos2 += 1;   /* skip IPv6 Prefix Length octet */
+                        char v6buf[46];
+                        struct in6_addr a;
+                        memcpy(&a, ie_val + pos2, 16);
+                        if (inet_ntop(AF_INET6, &a, v6buf, sizeof(v6buf))) {
+                            snprintf(key, sizeof(key), "gtpv2_ie_%d_paa_ipv6", ie_count);
+                            dissect_result_add(out, key, v6buf);
+                        }
+                        pos2 += 16;
+                    }
+                    if ((pdn_type == 1 || pdn_type == 3) && pos2 + 4 <= ie_len) {
+                        snprintf(val, sizeof(val), "%u.%u.%u.%u",
+                                 ie_val[pos2], ie_val[pos2+1], ie_val[pos2+2], ie_val[pos2+3]);
+                        snprintf(key, sizeof(key), "gtpv2_ie_%d_paa_ipv4", ie_count);
+                        dissect_result_add(out, key, val);
+                    }
+                }
+                break;
+            }
+            case 94: {  /* Charging ID, TS 29.274 S8.28 — a plain 4-byte
+                         * unsigned integer, no bit-field ambiguity */
+                if (ie_len >= 4) {
+                    uint32_t charging_id = (ie_val[0]<<24)|(ie_val[1]<<16)|(ie_val[2]<<8)|ie_val[3];
+                    snprintf(val, sizeof(val), "%u", charging_id);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_charging_id", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            }
+            case 80: {  /* Bearer QoS, TS 29.274 S8.15 — DELIBERATELY
+                         * PARTIAL. Octet 5 packs PCI/PL/PVI as bit
+                         * fields whose EXACT bit positions this project
+                         * doesn't have the source spec text in front of
+                         * it to verify with the same confidence as
+                         * everything else here (unlike F-TEID/PAA,
+                         * which were verified against constructed test
+                         * vectors) — rather than assert a bit-field
+                         * layout that might be subtly wrong, only QCI
+                         * (octet 6, an unambiguous single byte
+                         * immediately following the flags octet) is
+                         * extracted. The four 5-byte bit-rate fields
+                         * that follow (Uplink/Downlink Maximum and
+                         * Guaranteed Bit Rate) are present but not
+                         * decoded in this pass for the same reason. */
+                if (ie_len >= 2) {
+                    snprintf(val, sizeof(val), "%u", ie_val[1]);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_qci", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            }
             default:
                 break;   /* unrecognized IE type: already bounds-validated
                           * above, just skip over it via ie_len below —
-                          * F-TEID, PDN Address Allocation, Bearer QoS,
-                          * and others would follow the identical pattern */
+                          * Bearer QoS's bit-rate fields, and others would
+                          * follow the identical pattern */
         }
 
         ie_pos += 4 + ie_len;

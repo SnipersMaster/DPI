@@ -2,31 +2,39 @@
  * dpi_http2_parser.c
  *
  * HTTP/2 (RFC 9113) dissector — connection preface detection,
- * frame-level parsing (type, flags, stream ID, length), and now HPACK
- * decoding (RFC 7541, via dpi_hpack_decoder.c) for HEADERS frames,
- * including :authority extraction.
+ * frame-level parsing (type, flags, stream ID, length), HPACK decoding
+ * (RFC 7541, via dpi_hpack_decoder.c) for HEADERS frames including
+ * :authority extraction, real SETTINGS_HEADER_TABLE_SIZE tracking, and
+ * — when called with a real flow identity via
+ * http2_dissect_with_flow_state() — both a PERSISTENT per-connection
+ * HPACK dynamic table and CONTINUATION frame reassembly ACROSS TCP
+ * delivery boundaries, not just within one buffer.
  *
  * NOT COMPILED/TESTED in this environment.
  *
  * -------------------------------------------------------------------
- * SCOPE LIMIT — narrower than "no HPACK at all" (an earlier version of
- * this file didn't have HPACK decoding; see dpi_hpack_decoder.c's own
- * header comment for the verification methodology behind it), but
- * still real:
+ * WHAT'S GENUINELY STILL LIMITED — read before assuming this is fully
+ * general (an earlier version of this file's scope comment described
+ * a narrower implementation; both major gaps it described — per-call-
+ * only dynamic table, no cross-boundary CONTINUATION — are now closed
+ * when a connection entry is available):
  * -------------------------------------------------------------------
- *   - The HPACK dynamic table used per HEADERS frame is FRESH PER
- *     CALL, not persisted across a connection's multiple HEADERS
- *     frames. Static-table references and same-frame
- *     literal-with-indexing entries decode correctly; a reference to
- *     an entry created by an EARLIER frame on the same connection
- *     can't be resolved here and is flagged
- *     (http2_hpack_dynamic_table_miss) rather than guessed at. Real
- *     HTTP/2 traffic relies heavily on cross-frame dynamic table
- *     references, so this decodes a meaningful fraction of traffic
- *     correctly, not all of it.
- *   - CONTINUATION frames (a header block split across multiple
- *     HTTP/2 frames) are detected but not reassembled — flagged via
- *     http2_headers_continued_not_reassembled.
+ *   - The registry-facing http2_dissect() entry point (used by the
+ *     UDP dispatch path and by fuzzing) has no flow identity to key
+ *     persistent state on, so it still uses a fresh dynamic table and
+ *     no cross-boundary CONTINUATION resumption — this is inherent to
+ *     that entry point, not a remaining bug.
+ *   - SETTINGS_HEADER_TABLE_SIZE tracking uses ONE table per
+ *     connection, not the two independent per-direction encoding
+ *     contexts real HTTP/2 has — see the SETTINGS-handling code's own
+ *     comment for why this is a stated simplification, not an oversight.
+ *   - CONTINUATION reassembly across a TCP boundary only covers a
+ *     split that lands CLEANLY at a frame boundary (not enough buffer
+ *     for the next frame's header at all). A split in the MIDDLE of a
+ *     CONTINUATION frame's own header or payload is a different,
+ *     still-unhandled case — flagged via
+ *     http2_continuation_split_mid_frame_not_reassembled rather than
+ *     silently mishandled.
  *
  * Frame-level metadata (frame type distribution, stream count, frame
  * sizes, RST_STREAM ratio for Rapid-Reset-style abuse detection)
@@ -172,27 +180,182 @@ static void http2_process_header_block(const uint8_t *header_block, size_t heade
 }
 
 /*
- * Shared core, parameterized by an OPTIONAL persistent dynamic table:
- *   - persistent_dyn == NULL: fresh per-HEADERS-frame table (the
- *     original, more limited behavior) — used by the registry-facing
- *     http2_dissect() below, which has no flow identity to key state
- *     on.
- *   - persistent_dyn != NULL: the SAME table is reused across calls
- *     for the same connection — used by http2_dissect_with_flow_state(),
- *     called directly from the TCP capture path where real flow
- *     identity (and therefore persistent per-flow state, the same way
- *     dpi_tcp_flow_reassembly.c persists TCP state) is available.
+ * Scans forward from *scan_pos_ptr in `payload` for CONTINUATION
+ * frames matching `stream_id`, appending their content into
+ * combined_block (bounded by combined_cap) until one is found with
+ * END_HEADERS set. Shared by both the normal in-buffer HEADERS-frame
+ * path and the cross-TCP-boundary resume path below — same scanning
+ * logic, different starting state.
+ *
+ * Three distinguishable outcomes matter here, not just success/fail:
+ *   - COMPLETE: END_HEADERS reached, combined_block/combined_len hold
+ *     the full header block, ready to HPACK-decode.
+ *   - NEED_MORE: ran out of buffer cleanly AT A FRAME BOUNDARY (not
+ *     enough bytes for even the next frame's header) — this is the
+ *     resumable case. The caller can save combined_block/combined_len
+ *     and try again once more TCP data arrives for this connection.
+ *   - FAILED: a genuine protocol violation (wrong frame type/stream),
+ *     the reassembly buffer was exceeded, OR the split happened in
+ *     the MIDDLE of a CONTINUATION frame's own header/payload rather
+ *     than cleanly between frames — this last case specifically is
+ *     NOT resumable with the state tracked here (would need partial-
+ *     frame state this file doesn't keep) and is flagged via
+ *     http2_continuation_split_mid_frame_not_reassembled to be
+ *     honest about that distinct, still-unhandled scope limit.
+ */
+enum http2_continuation_scan_result {
+    HTTP2_CONT_COMPLETE,
+    HTTP2_CONT_NEED_MORE,
+    HTTP2_CONT_FAILED
+};
+
+static enum http2_continuation_scan_result http2_scan_continuations(
+        const uint8_t *payload, uint16_t len, size_t *scan_pos_ptr, uint32_t stream_id,
+        uint8_t *combined_block, size_t combined_cap, size_t *combined_len_ptr,
+        struct dissect_result *out) {
+    size_t scan_pos = *scan_pos_ptr;
+    size_t combined_len = *combined_len_ptr;
+
+    while (true) {
+        if (scan_pos + HTTP2_FRAME_HDR_LEN > len) {
+            *scan_pos_ptr = scan_pos;
+            *combined_len_ptr = combined_len;
+            return HTTP2_CONT_NEED_MORE;   /* clean split at a frame boundary: resumable */
+        }
+
+        uint32_t cont_len = (payload[scan_pos]<<16)|(payload[scan_pos+1]<<8)|payload[scan_pos+2];
+        uint8_t cont_type = payload[scan_pos+3];
+        uint8_t cont_flags = payload[scan_pos+4];
+        uint32_t cont_stream = ((payload[scan_pos+5]<<24)|(payload[scan_pos+6]<<16)|
+                                 (payload[scan_pos+7]<<8)|payload[scan_pos+8]) & 0x7FFFFFFF;
+
+        if (cont_type != 0x9 /* CONTINUATION */ || cont_stream != stream_id) {
+            /* RFC 9113 S6.10: a CONTINUATION frame MUST be preceded by
+             * a HEADERS/PUSH_PROMISE/CONTINUATION frame without
+             * END_HEADERS on the SAME stream. Anything else here is a
+             * protocol violation from this dissector's perspective —
+             * stop, don't guess. */
+            dissect_result_add(out, "parse_warning", "expected_continuation_frame_not_found");
+            *scan_pos_ptr = scan_pos;
+            *combined_len_ptr = combined_len;
+            return HTTP2_CONT_FAILED;
+        }
+
+        if (scan_pos + HTTP2_FRAME_HDR_LEN + cont_len > len) {
+            /* Split in the MIDDLE of this CONTINUATION frame's own
+             * header/payload, not cleanly between frames — the scope
+             * limit this file still has, see the enum comment above. */
+            dissect_result_add(out, "http2_continuation_split_mid_frame_not_reassembled", "true");
+            *scan_pos_ptr = scan_pos;
+            *combined_len_ptr = combined_len;
+            return HTTP2_CONT_FAILED;
+        }
+
+        if (combined_len + cont_len > combined_cap) {
+            dissect_result_add(out, "parse_warning", "continuation_reassembly_buffer_exceeded");
+            *scan_pos_ptr = scan_pos;
+            *combined_len_ptr = combined_len;
+            return HTTP2_CONT_FAILED;
+        }
+
+        memcpy(combined_block + combined_len,
+               payload + scan_pos + HTTP2_FRAME_HDR_LEN, cont_len);
+        combined_len += cont_len;
+        scan_pos += HTTP2_FRAME_HDR_LEN + cont_len;
+
+        if (cont_flags & 0x04 /* END_HEADERS */) {
+            *scan_pos_ptr = scan_pos;
+            *combined_len_ptr = combined_len;
+            return HTTP2_CONT_COMPLETE;
+        }
+    }
+}
+
+/*
+ * Shared core, parameterized by an OPTIONAL connection entry:
+ *   - conn == NULL: fresh per-HEADERS-frame table, no cross-TCP-
+ *     boundary CONTINUATION resumption — the original, more limited
+ *     behavior — used by the registry-facing http2_dissect() below,
+ *     which has no flow identity to key state on.
+ *   - conn != NULL: the SAME dynamic table is reused across calls for
+ *     the same connection, AND a HEADERS/CONTINUATION sequence that
+ *     runs off the end of one TCP delivery is saved and resumed on the
+ *     next one for this same flow — used by
+ *     http2_dissect_with_flow_state(), called directly from the TCP
+ *     capture path where real flow identity is available.
+ *
+ * `reverse_conn` (also optional, NULL when conn is NULL) is the
+ * connection entry for the OPPOSITE direction of the same TCP
+ * connection — needed because a SETTINGS_HEADER_TABLE_SIZE value seen
+ * in a SETTINGS frame constrains the PEER's encoder (RFC 9113 S6.5.1:
+ * "the sender... informs the remote endpoint of the maximum size...
+ * that the sender will use"), i.e. it applies to the dynamic table
+ * used for the OPPOSITE direction's HEADERS frames, not this
+ * direction's own table. This was found as a genuine correctness bug
+ * (not just a documented simplification) while reasoning through what
+ * "one table per connection, applied regardless of direction" would
+ * actually mean in practice — a SETTINGS frame consistently resized
+ * the WRONG direction's table.
  */
 static void http2_dissect_core(const uint8_t *payload, uint16_t len,
-                                struct hpack_dynamic_table *persistent_dyn,
+                                struct hpack_connection_entry *conn,
+                                struct hpack_connection_entry *reverse_conn,
                                 struct dissect_result *out) {
+    struct hpack_dynamic_table *persistent_dyn = conn ? &conn->dyn_table : NULL;
     size_t pos = 0;
-    bool has_preface = (len >= HTTP2_PREFACE_LEN &&
+
+    /* Resume a pending cross-TCP-boundary CONTINUATION sequence from
+     * an EARLIER call, if one exists for this connection. This is
+     * checked before anything else — including the preface check,
+     * since a resumed buffer chunk mid-connection would never
+     * rationally start with the connection preface. */
+    if (conn && conn->has_pending_headers) {
+        uint8_t combined_block[16384];
+        size_t combined_len = conn->pending_block_len;
+        if (combined_len > sizeof(combined_block)) combined_len = sizeof(combined_block);
+        memcpy(combined_block, conn->pending_block, combined_len);
+
+        size_t scan_pos = 0;   /* this NEW payload should pick up exactly
+                                 * where the previous delivery's buffer
+                                 * ran out — see the NEED_MORE case below
+                                 * for why that's a safe assumption here */
+        enum http2_continuation_scan_result res = http2_scan_continuations(
+            payload, len, &scan_pos, conn->pending_stream_id,
+            combined_block, sizeof(combined_block), &combined_len, out);
+
+        if (res == HTTP2_CONT_COMPLETE) {
+            dissect_result_add(out, "http2_continuation_resumed_across_tcp_boundary", "true");
+            http2_process_header_block(combined_block, combined_len, persistent_dyn, out);
+            conn->has_pending_headers = false;
+            pos = scan_pos;   /* continue the normal frame loop below for
+                                * anything remaining in this buffer */
+        } else if (res == HTTP2_CONT_NEED_MORE) {
+            /* Still not enough — update the pending state again and
+             * stop; nothing else in this delivery can be safely
+             * processed until the rest arrives. */
+            if (combined_len <= sizeof(conn->pending_block)) {
+                memcpy(conn->pending_block, combined_block, combined_len);
+                conn->pending_block_len = combined_len;
+                dissect_result_add(out, "http2_continuation_still_pending", "true");
+            }
+            return;
+        } else {
+            /* FAILED — give up on this pending sequence rather than
+             * risk resuming from a now-desynchronized position. Fall
+             * through to process the rest of this buffer as if
+             * nothing were pending (pos stays 0), same degraded-but-
+             * reasonable behavior as a fresh protocol violation. */
+            conn->has_pending_headers = false;
+            dissect_result_add(out, "http2_continuation_resume_failed", "true");
+        }
+    }
+
+    bool has_preface = (pos == 0 && len >= HTTP2_PREFACE_LEN &&
                          memcmp(payload, HTTP2_PREFACE, HTTP2_PREFACE_LEN) == 0);
     if (has_preface) {
         dissect_result_add(out, "http2_preface_present", "true");
         pos = HTTP2_PREFACE_LEN;
-    } else {
+    } else if (pos == 0) {
         dissect_result_add(out, "http2_preface_present", "false");
     }
 
@@ -218,6 +381,55 @@ static void http2_dissect_core(const uint8_t *payload, uint16_t len,
              * rather than guess at partial content. */
             dissect_result_add(out, "http2_truncated_frame", "true");
             break;
+        }
+
+        if (frame_type == 0x4 /* SETTINGS */) {
+            /* RFC 9113 S6.5.1: SETTINGS frame payload is a sequence of
+             * (Identifier(2) + Value(4)) 6-byte pairs. Look for
+             * SETTINGS_HEADER_TABLE_SIZE (identifier 0x1).
+             *
+             * CORRECTNESS NOTE — this used to be a bug, not just a
+             * simplification: a SETTINGS_HEADER_TABLE_SIZE value tells
+             * the PEER what dynamic table size THEY may use when
+             * encoding headers back to the sender — i.e. it constrains
+             * the OPPOSITE direction's table, not the sender's own. An
+             * earlier version of this code resized `persistent_dyn`
+             * (this SAME direction's table) directly, which is exactly
+             * backwards. Fixed: now resizes `reverse_conn`'s table
+             * instead — the connection entry for the other direction of
+             * this same TCP connection, looked up by the capture path
+             * via `tcp_flow_key_reverse()` and passed in alongside
+             * `conn`. When `reverse_conn` isn't available (the registry-
+             * facing fresh-per-call path, or a capture path that hasn't
+             * been updated to pass it), the value is still surfaced as
+             * a field but no resize happens — correct behavior is
+             * "don't guess," not "resize the wrong table anyway."
+             *
+             * Remaining simplification, stated honestly: this still
+             * doesn't distinguish MULTIPLE SETTINGS frames arriving
+             * over a connection's lifetime with different values in
+             * each direction pair — it applies whichever value was most
+             * recently seen. Real HTTP/2 endpoints rarely change
+             * SETTINGS_HEADER_TABLE_SIZE mid-connection, so this is a
+             * minor residual gap compared to the directional fix above.
+             */
+            const uint8_t *settings_payload = payload + pos + HTTP2_FRAME_HDR_LEN;
+            size_t sp = 0;
+            while (sp + 6 <= frame_len) {
+                uint16_t setting_id = (settings_payload[sp] << 8) | settings_payload[sp+1];
+                uint32_t setting_value = (settings_payload[sp+2]<<24)|(settings_payload[sp+3]<<16)|
+                                          (settings_payload[sp+4]<<8)|settings_payload[sp+5];
+                if (setting_id == 0x1 /* SETTINGS_HEADER_TABLE_SIZE */) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%u", setting_value);
+                    dissect_result_add(out, "http2_settings_header_table_size", buf);
+
+                    if (reverse_conn) {
+                        hpack_dynamic_table_resize(&reverse_conn->dyn_table, setting_value);
+                    }
+                }
+                sp += 6;
+            }
         }
 
         if (frame_type == 0x1 /* HEADERS */) {
@@ -269,71 +481,50 @@ static void http2_dissect_core(const uint8_t *payload, uint16_t len,
                     memcpy(combined_block, header_block, header_block_len);
                     combined_len = header_block_len;
 
-                    /* Reassemble CONTINUATION frames (RFC 9113 S6.10) that
-                     * follow IMMEDIATELY in this same buffer, sharing the
-                     * same stream_id, until one has END_HEADERS set. This
-                     * covers the common case (HEADERS+CONTINUATION sent
-                     * back-to-back in one write) — a CONTINUATION frame
-                     * split across a TCP reassembly boundary into a
-                     * SEPARATE dissect() call is NOT covered, since this
-                     * dissector has no state persisting between calls
-                     * for that (same category of limitation as the
-                     * HPACK dynamic table needing connection state —
-                     * see this file's header comment). */
                     size_t scan_pos = consumed_through;
-                    bool reassembly_failed = false;
+                    enum http2_continuation_scan_result res = end_headers
+                        ? HTTP2_CONT_COMPLETE   /* END_HEADERS already set on the
+                                                  * HEADERS frame itself — no
+                                                  * CONTINUATION frames to scan for */
+                        : http2_scan_continuations(payload, len, &scan_pos, stream_id,
+                                                    combined_block, sizeof(combined_block),
+                                                    &combined_len, out);
 
-                    while (!end_headers && !reassembly_failed) {
-                        if (scan_pos + HTTP2_FRAME_HDR_LEN > len) {
-                            dissect_result_add(out, "http2_continuation_incomplete_in_buffer", "true");
-                            reassembly_failed = true;
-                            break;
-                        }
-                        uint32_t cont_len = (payload[scan_pos]<<16)|(payload[scan_pos+1]<<8)|payload[scan_pos+2];
-                        uint8_t cont_type = payload[scan_pos+3];
-                        uint8_t cont_flags = payload[scan_pos+4];
-                        uint32_t cont_stream = ((payload[scan_pos+5]<<24)|(payload[scan_pos+6]<<16)|
-                                                 (payload[scan_pos+7]<<8)|payload[scan_pos+8]) & 0x7FFFFFFF;
-
-                        if (cont_type != 0x9 /* CONTINUATION */ || cont_stream != stream_id) {
-                            /* RFC 9113 S6.10: a CONTINUATION frame MUST be
-                             * preceded by a HEADERS/PUSH_PROMISE/CONTINUATION
-                             * frame without END_HEADERS on the SAME stream.
-                             * Anything else here is a protocol violation from
-                             * this dissector's perspective — stop, don't guess. */
-                            dissect_result_add(out, "parse_warning", "expected_continuation_frame_not_found");
-                            reassembly_failed = true;
-                            break;
-                        }
-                        if (scan_pos + HTTP2_FRAME_HDR_LEN + cont_len > len) {
-                            dissect_result_add(out, "http2_continuation_incomplete_in_buffer", "true");
-                            reassembly_failed = true;
-                            break;
-                        }
-                        if (combined_len + cont_len > sizeof(combined_block)) {
-                            dissect_result_add(out, "parse_warning", "continuation_reassembly_buffer_exceeded");
-                            reassembly_failed = true;
-                            break;
-                        }
-
-                        memcpy(combined_block + combined_len,
-                               payload + scan_pos + HTTP2_FRAME_HDR_LEN, cont_len);
-                        combined_len += cont_len;
-                        scan_pos += HTTP2_FRAME_HDR_LEN + cont_len;
-                        end_headers = (cont_flags & 0x04) != 0;
-                    }
-
-                    if (end_headers && !reassembly_failed) {
+                    if (res == HTTP2_CONT_COMPLETE) {
                         if (scan_pos != consumed_through) {
                             dissect_result_add(out, "http2_continuation_reassembled", "true");
                         }
                         http2_process_header_block(combined_block, combined_len,
                                                     persistent_dyn, out);
-                        /* Advance the OUTER loop past every CONTINUATION
-                         * frame we just consumed, so it doesn't re-walk
-                         * them as if they were independent frames. */
                         consumed_through = scan_pos;
+                    } else if (res == HTTP2_CONT_NEED_MORE) {
+                        /* Clean split at a frame boundary — resumable
+                         * IF we have a connection entry to save state
+                         * in. Without one (the fresh-per-call registry
+                         * path), there's nowhere to persist this to,
+                         * so it's flagged as incomplete the same way
+                         * it always was. */
+                        if (conn && combined_len <= sizeof(conn->pending_block)) {
+                            conn->has_pending_headers = true;
+                            conn->pending_stream_id = stream_id;
+                            memcpy(conn->pending_block, combined_block, combined_len);
+                            conn->pending_block_len = combined_len;
+                            dissect_result_add(out, "http2_continuation_pending_cross_boundary", "true");
+                        } else {
+                            dissect_result_add(out, "http2_continuation_incomplete_in_buffer", "true");
+                        }
+                        /* Nothing more can be safely parsed from this
+                         * buffer past this point — the rest of it (if
+                         * any) belongs to the CONTINUATION frame(s) we
+                         * were expecting, not independent frames. */
+                        consumed_through = len;
                     }
+                    /* HTTP2_CONT_FAILED: consumed_through stays at its
+                     * original value (just past the HEADERS frame
+                     * itself) — the outer loop naturally falls through
+                     * to reprocess whatever follows as independent
+                     * frames, same degraded-but-reasonable behavior as
+                     * before this refactor. */
                 }
 
                 pos = consumed_through;
@@ -380,30 +571,43 @@ static void http2_dissect_core(const uint8_t *payload, uint16_t len,
  * Registry-facing entry point — matches the dissector_dissect_fn
  * signature exactly, so this is what register_http2_dissector() below
  * wires in. Has no flow identity available (the registry interface
- * doesn't pass one), so it uses a fresh HPACK dynamic table per call —
- * the original, more limited behavior. Fine for the UDP dispatch path
- * and for standalone/fuzzing use; the TCP capture path should prefer
+ * doesn't pass one), so it uses a fresh HPACK dynamic table per call
+ * and no cross-TCP-boundary CONTINUATION resumption — the original,
+ * more limited behavior. Fine for the UDP dispatch path and for
+ * standalone/fuzzing use; the TCP capture path should prefer
  * http2_dissect_with_flow_state() below when it has real flow context.
  */
 static void http2_dissect(const uint8_t *payload, uint16_t len,
                            uint16_t dst_port, const char *l4_proto,
                            struct dissect_result *out) {
     (void)dst_port; (void)l4_proto;
-    http2_dissect_core(payload, len, NULL, out);
+    http2_dissect_core(payload, len, NULL, NULL, out);
 }
 
 /*
  * Capture-path-facing entry point — called DIRECTLY (not through
  * dispatch_dissection()/the registry) from the TCP path once it has a
- * real per-flow HPACK dynamic table to persist across calls for the
- * same connection. See dpi_hpack_connection_state.c for how that table
- * is looked up/created/evicted, keyed by the same tcp_flow_key
+ * real per-flow connection entry: persistent HPACK dynamic table AND
+ * cross-TCP-boundary CONTINUATION resumption state. See
+ * dpi_hpack_connection_state.c for how that entry is looked up/
+ * created/evicted, keyed by the same tcp_flow_key
  * dpi_tcp_flow_reassembly.c uses.
+ *
+ * `reverse_conn` is the connection entry for the OPPOSITE direction of
+ * the same TCP connection (looked up via `tcp_flow_key_reverse()` by
+ * the capture path) — required for SETTINGS_HEADER_TABLE_SIZE to
+ * resize the correct direction's table. See http2_dissect_core()'s
+ * header comment for the full correctness rationale. Passing NULL here
+ * (e.g. if the capture path hasn't been updated, or the reverse flow
+ * hasn't been seen yet) means SETTINGS values are still surfaced as
+ * fields but no resize happens — safe degradation, not silent
+ * misbehavior.
  */
 static void http2_dissect_with_flow_state(const uint8_t *payload, uint16_t len,
-                                           struct hpack_dynamic_table *persistent_dyn,
+                                           struct hpack_connection_entry *conn,
+                                           struct hpack_connection_entry *reverse_conn,
                                            struct dissect_result *out) {
-    http2_dissect_core(payload, len, persistent_dyn, out);
+    http2_dissect_core(payload, len, conn, reverse_conn, out);
 }
 
 static const uint16_t http2_hint_ports[] = { HTTP2_PORT };
