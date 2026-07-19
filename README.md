@@ -280,7 +280,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (24 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (25 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -297,6 +297,7 @@ fully-parsed table above. What remains:
 | `dpi_quic_parser.c` | QUIC (RFC 9000/9001) Initial packet dissector: HKDF key derivation (RFC 9001 §5.2, salt verified against the RFC), header protection removal, AES-128-GCM decryption, and SNI extraction from the decrypted CRYPTO frame (wired end-to-end — an earlier README revision of this row was stale, this has been fixed since). Logic cross-checked against RFC 9001 pseudocode; not yet run against byte-exact test vectors. | OpenSSL (libssl/libcrypto) |
 | `dpi_protocol_config.c`, `protocols.ini` | The protocol "arsenal" — central enable/disable config for dissectors, read once at startup. See the dedicated section above. | none (self-contained) |
 | `dpi_ipv6_parser.c` | IPv6 (RFC 8200) header + extension header chain parsing, plus IPv6-specific TCP/UDP checksum pseudo-header functions (`parse_tcp_v6`/`parse_udp_v6`). Extension chain walking verified against a 20-header adversarial chain (correctly rejected via a hard cap). | `dpi_rfc_parser.c` (shares `checksum16()`, `struct tcp_result`/`struct udp_result`, option parsing) |
+| `dpi_vlan_parser.c` | 802.1Q / 802.1ad (QinQ) VLAN tag stripping — a framing-layer helper, not a protocol dissector (no `detect()`/`dissect()`, not gated by `protocols.ini`). Closes a real gap: neither capture path previously recognized ethertype `0x8100`/`0x88A8` at all, so any VLAN-tagged frame — common on real trunk ports — silently fell through every existing dispatch branch and got dropped. Bounded to 2 stacked tags (covers every real QinQ deployment; more than that is rejected, same "bound nesting" reasoning as GTP-in-GTP's depth cap). Verified against single-tag, QinQ double-tag, adversarial 5-tag over-nesting, truncated-tag, and untagged cases in Python before wiring in. | none (self-contained) |
 | `dpi_http1_parser.c` | HTTP/1.1 request/status line + Host/User-Agent header extraction. | `dpi_dissector_registry.c` |
 | `dpi_http2_parser.c` | HTTP/2 connection preface + frame-level metadata, HPACK-decoded headers (via `dpi_hpack_decoder.c`), real SETTINGS_HEADER_TABLE_SIZE tracking, and — when called with real flow context — CONTINUATION reassembly across TCP delivery boundaries plus a persistent per-connection dynamic table (via `dpi_hpack_connection_state.c`). See the fully-parsed table above for the full detail and remaining scope limits. | `dpi_dissector_registry.c`, `dpi_hpack_decoder.c`, `dpi_hpack_connection_state.c` |
 | `dpi_ssh_parser.c` | SSH identification string + KEXINIT algorithm name-list extraction (plaintext, sent before encryption begins — same pattern as TLS's ClientHello). | `dpi_dissector_registry.c` |
@@ -330,6 +331,7 @@ fully-parsed table above. What remains:
 | `dpi_quic_parser.c` | No | No | SNI extraction wired end-to-end. The key-derivation-through-decryption **algorithm** is now verified against RFC 9001 Appendix A.2's real published test vector (via an independent Python + `cryptography`-library reimplementation — successful decryption recovering the RFC's own "example.com" example is strong confirmation the algorithm is right). This is a meaningfully higher confidence level than "cross-checked against pseudocode" alone, but it is **not** the same as compiling and running this actual C file against that vector — that step still hasn't happened (no compiler available in any sandbox this project has been built in) and remains the honest next step. Packet-number reconstruction simplified (correct for a connection's first Initial packet only — the case the verified vector covers); no CRYPTO frame reassembly across multiple packets. |
 | `dpi_protocol_config.c` | No | No | Simple, low-risk file — startup-only config load, no ongoing state to get wrong |
 | `dpi_ipv6_parser.c` | No | No | Extension chain walking verified by hand against a 20-header adversarial case (correctly rejected); a real fuzzing pass (`fuzz_ipv6_parser.c`) would give much broader coverage than the handful of hand-checked cases here |
+| `dpi_vlan_parser.c` | No | No | Stripping logic verified in Python against 5 cases (single tag, QinQ, over-nesting, truncation, untagged); the VLAN ID(s) themselves are extracted (`vlan_id_outer`/`vlan_id_inner`) but NOT yet threaded into `flow_log_record`/the JSON output — same category of gap as when IPv6 addresses first needed new output fields. A tagged frame is now correctly dispatched to the right protocol, but its VLAN membership isn't visible in the resulting flow record yet. |
 | `dpi_http1_parser.c` | No | No | No chunked transfer-encoding or body parsing; only Host/User-Agent headers extracted, not a general header map |
 | `dpi_http2_parser.c` | No | No | CONTINUATION reassembly across a TCP boundary only covers a split landing cleanly at a frame boundary, not mid-frame (see gap table above); SETTINGS_HEADER_TABLE_SIZE now correctly resizes the OPPOSITE direction's table (a real directional bug was found and fixed, not just documented — see gap table above) — the residual simplification is not distinguishing multiple SETTINGS frames with different values over a connection's lifetime, which is minor since real endpoints rarely change this value mid-connection |
 | `dpi_ssh_parser.c` | No | No | Only 8 of RFC 4253's 10 KEXINIT name-lists extracted (languages lists omitted, almost always empty in practice); nothing past KEXINIT is parsed (correctly — it's encrypted from there) |
@@ -537,6 +539,76 @@ system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
 
+## Real-world validation against a real capture
+
+Everything above this point had been verified against constructed test
+vectors and RFC/spec examples — never actual captured network traffic.
+That gap was closed for a meaningful subset of this project using
+Johannes Weber's "Ultimate PCAP" (a 15.6 MB, 51,328-packet pcapng file
+covering 80+ protocols), provided directly by the user. No pip/network
+access exists in this sandbox, so a pcapng parser was written from
+scratch in Python (same "verify independently, don't assume a library
+does it right" discipline as everything else here) rather than relying
+on scapy/dpkt.
+
+**Results, checked against the real, byte-exact source files (not
+just descriptions of the logic):**
+
+- **VLAN stripping**: all **16,371** real VLAN-tagged frames in the
+  capture parsed successfully — zero malformed, zero over-nested
+  rejections. Real traffic included VLAN+PPPoE (6,795 frames — not
+  decapsulated further, correctly, since PPPoE isn't supported),
+  VLAN+IPv6 (4,366, including a real RIPng packet traced end-to-end
+  through `parse_ipv6()`'s logic), VLAN+IPv4 (2,843), VLAN+EAPOL,
+  VLAN+MACsec, and a genuine **802.3/LLC-SNAP frame** (ethertype-field
+  value `0x32`, which is below 1500 and therefore a length field per
+  IEEE 802.3, not a real EtherType) — a real-world framing case this
+  project doesn't parse, confirmed to fail gracefully (unrecognized,
+  not misparsed) rather than crash. Also found a real VLAN-tagged
+  gratuitous ARP reply, traced through `dpi_arp_parser.c`'s exact field
+  offsets successfully.
+- **Modbus/TCP**: all **38** real Modbus payloads in the capture
+  accepted by `modbus_detect()`'s logic, exercising **8 different
+  function codes** in real traffic (Read Coils, Read Discrete Inputs,
+  Read/Write Holding Registers, Read Input Registers, Write Single
+  Coil, Write Multiple Coils/Registers) — genuinely rare, valuable
+  SCADA/ICS ground truth to validate against.
+- **DNS name decompression**: all **2,229** real DNS packets decoded
+  successfully, including a deliberately-crafted maximum-length-name
+  query (six labels totaling 253 presentation-format characters,
+  ending in `weberdns.de` — clearly a hand-built edge-case test by the
+  pcap's author, not organic traffic).
+
+**A mistake caught during this process, worth being honest about**: an
+early pass of the DNS verification script flagged 6 of those 2,229
+packets as "too long" and rejected. Before reporting that as a bug,
+the actual constant in `dpi_dns_parser.c` was checked directly — the
+verification script had used a guessed value (253) instead of the
+code's real threshold (`MAX_LABEL_OUTPUT` = 300, checked against RFC
+1035 §3.1's actual 255-byte wire-format limit). Correcting the
+verification script's own error brought the result to 2,229/2,229 —
+the dissector was right, the first draft of the *test* was wrong. This
+is the same failure mode any external test suite can have, and it's
+worth remembering when reading "zero failures" results generally: they
+are only as trustworthy as the test's own fidelity to the real code,
+which is why the actual source constants were checked directly here
+rather than assumed.
+
+**What this does and doesn't prove, stated with the same care as every
+other verification in this project**: this confirms the dissector
+*logic* (faithfully mirrored in Python, checked line-by-line against
+the real C source's constants and structure) produces correct results
+against real, diverse, unmodified network traffic — a meaningfully
+higher bar than synthetic test vectors alone. It does **not** confirm
+the actual C code compiles or runs correctly, since no compiler exists
+in this sandbox — that remains the one gap true of every file in this
+project, restated here rather than glossed over. Seven of the most
+valuable real packets (a real VLAN+IPv6 RIPng frame, a real
+VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
+requests, and the real maximum-length DNS query) were added to the
+fuzz seed corpora as genuinely superior ground truth compared to
+synthetic seeds — **89 seed files total now**.
+
 ## Suggested next steps, roughly in priority order
 
 **Done in this pass — headline item first**: **the RFC 9001 Appendix
@@ -674,7 +746,7 @@ random. This is real, if secondhand, verification — stronger than
 than the primary-source verification this project did for HPACK and
 QUIC. **24 fuzz harnesses total now.**
 
-1. **Actually run the fuzzers.** Now 24 harnesses, still zero executed
+1. **Actually run the fuzzers.** Now 25 harnesses, still zero executed
    — no clang/libFuzzer in this sandbox, unchanged from every previous
    version of this list. This remains the single most important gap
    between "carefully reviewed" (which, at this point, this project
