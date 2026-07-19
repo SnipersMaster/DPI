@@ -50,6 +50,16 @@
  * step, not a small gap.
  */
 
+#ifndef DPI_HPACK_DECODER_INCLUDED
+#define DPI_HPACK_DECODER_INCLUDED
+/* Guard added so this file can be safely #included from more than one
+ * place in the same translation unit — dpi_http2_parser.c includes it
+ * directly, and dpi_hpack_connection_state.c now also needs
+ * struct hpack_dynamic_table available regardless of include order
+ * relative to dpi_http2_parser.c. Making double-inclusion safe here is
+ * simpler and lower-risk than depending on a specific include order
+ * across three files staying correct forever. */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -325,6 +335,28 @@ static void hpack_dynamic_table_init(struct hpack_dynamic_table *t, size_t max_s
     t->max_size = max_size;
 }
 
+/*
+ * Resize the table's max_size and evict from the end until it fits,
+ * per RFC 7541 S4.3 (protocol-level dynamic table size update) and
+ * S6.5.2 (SETTINGS_HEADER_TABLE_SIZE). Shared by two callers:
+ *   - The in-band "Dynamic Table Size Update" HPACK instruction
+ *     (RFC 7541 S6.3), already handled inline in
+ *     hpack_decode_header_block() — refactored to call this instead
+ *     of duplicating the eviction loop.
+ *   - Real SETTINGS_HEADER_TABLE_SIZE tracking from HTTP/2 SETTINGS
+ *     frames (dpi_http2_parser.c), added so the previously-hardcoded
+ *     4096 default now reflects actual negotiated connection state
+ *     when available.
+ */
+static void hpack_dynamic_table_resize(struct hpack_dynamic_table *t, size_t new_max_size) {
+    t->max_size = new_max_size;
+    while (t->count > 0 && t->total_size > t->max_size) {
+        struct hpack_dynamic_entry *last = &t->entries[t->count - 1];
+        t->total_size -= strlen(last->name) + strlen(last->value) + 32;
+        t->count--;
+    }
+}
+
 static void hpack_dynamic_table_insert(struct hpack_dynamic_table *t,
                                         const char *name, const char *value) {
     size_t entry_size = strlen(name) + strlen(value) + 32;   /* RFC 7541 S4.1 */
@@ -455,12 +487,7 @@ static bool hpack_decode_header_block(const uint8_t *data, size_t len,
             uint64_t new_size;
             if (!hpack_decode_integer(data, len, &pos, 5, &new_size)) return false;
             if (new_size > dyn->max_size) return false;   /* MUST NOT exceed protocol limit */
-            dyn->max_size = new_size;
-            while (dyn->count > 0 && dyn->total_size > dyn->max_size) {
-                struct hpack_dynamic_entry *last = &dyn->entries[dyn->count - 1];
-                dyn->total_size -= strlen(last->name) + strlen(last->value) + 32;
-                dyn->count--;
-            }
+            hpack_dynamic_table_resize(dyn, new_size);
             continue;   /* no header field produced by this instruction */
 
         } else {
@@ -513,3 +540,5 @@ static bool hpack_decode_header_block_fresh(const uint8_t *data, size_t len,
     hpack_dynamic_table_init(&dyn, dynamic_table_max_size);
     return hpack_decode_header_block(data, len, &dyn, on_header, user_ctx, saw_dynamic_table_miss);
 }
+
+#endif /* DPI_HPACK_DECODER_INCLUDED */

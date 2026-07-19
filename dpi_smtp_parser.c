@@ -5,17 +5,23 @@
  * same general shape as dpi_sip_rtp_parser.c's SIP half and
  * dpi_http1_parser.c. Extracts the commands/responses most useful for
  * mail relay abuse/spam detection: HELO/EHLO domain, MAIL FROM,
- * RCPT TO, and response codes (particularly the initial greeting and
- * any error codes).
+ * RCPT TO, response codes, and — when the DATA command's message
+ * content lands in the same reassembled buffer — the RFC 5322 message
+ * headers (Subject/From/To/Date) that precede the actual mail body.
  *
  * NOT COMPILED/TESTED in this environment.
  *
- * SCOPE: line-oriented command/response extraction only — does not
- * parse the DATA section (the actual mail body/headers that follow a
- * DATA command), which would need its own MIME-aware parsing and is a
- * substantially different problem (matching this project's pattern of
- * scoping message bodies out of text-protocol dissectors — SIP's
- * dissector doesn't parse SDP bodies either).
+ * SCOPE, stated precisely: line-oriented command/response extraction,
+ * PLUS plaintext RFC 5322 header parsing up to the blank line that
+ * ends the header section. Does NOT parse the message BODY or any
+ * MIME structure within it (multipart boundaries, base64/quoted-
+ * printable encoded parts, attachments) — that's a substantially
+ * different, MIME-aware parsing problem, matching this project's
+ * pattern of scoping message bodies out of text-protocol dissectors
+ * (SIP's dissector doesn't parse SDP bodies either). The distinction
+ * that matters: RFC 5322 headers are structurally identical in
+ * complexity to the SMTP command lines already parsed here (line-
+ * oriented, colon-delimited); MIME body interpretation is not.
  */
 
 #include <stdint.h>
@@ -99,10 +105,76 @@ static void smtp_dissect(const uint8_t *payload, uint16_t len,
             dissect_result_add(out, "smtp_rcpt_to", line + 8);
         } else if (n >= 4 && strncasecmp(line, "DATA", 4) == 0) {
             dissect_result_add(out, "smtp_data_command_seen", "true");
-            break;   /* everything after this is message body, not
-                      * command/response traffic — stop here rather
-                      * than trying to interpret mail content as SMTP
-                      * commands */
+
+            /* Extending scope slightly here: RFC 5322 message headers
+             * (Subject/From/To/Date) that precede the actual mail
+             * body are plaintext, line-oriented, and structurally
+             * indistinguishable in complexity from the SMTP command
+             * lines already parsed above — genuinely different from
+             * MIME body/multipart decoding, which is the piece that
+             * stays deliberately out of scope (see this file's header
+             * comment). If the buffer we already have extends past
+             * this DATA line (common when the client's message follows
+             * closely enough to land in the same reassembled chunk),
+             * walk RFC 5322 header lines until the blank line that
+             * ends the header section, then stop — the body itself,
+             * and any MIME structure within it, is NOT parsed. */
+            pos += line_end + 2;
+            int header_lines_parsed = 0;
+
+            while (pos < len && header_lines_parsed < 16) {
+                size_t hdr_line_end = smtp_find_line_end(payload, len - pos);
+                if (hdr_line_end >= len - pos) break;   /* incomplete: stop, don't guess */
+
+                char hdr_line[SMTP_MAX_LINE];
+                size_t hn = hdr_line_end < sizeof(hdr_line) - 1
+                            ? hdr_line_end : sizeof(hdr_line) - 1;
+                memcpy(hdr_line, payload + pos, hn);
+                hdr_line[hn] = '\0';
+
+                if (hn == 0) {
+                    /* Blank line: end of RFC 5322 headers, body begins
+                     * right after — deliberately not parsed further. */
+                    dissect_result_add(out, "smtp_message_body_begins", "true");
+                    break;
+                }
+
+                char *colon = strchr(hdr_line, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *val = colon + 1;
+                    while (*val == ' ') val++;
+
+                    if (strcasecmp(hdr_line, "Subject") == 0) {
+                        dissect_result_add(out, "smtp_message_subject", val);
+                    } else if (strcasecmp(hdr_line, "From") == 0) {
+                        dissect_result_add(out, "smtp_message_from", val);
+                    } else if (strcasecmp(hdr_line, "To") == 0) {
+                        dissect_result_add(out, "smtp_message_to", val);
+                    } else if (strcasecmp(hdr_line, "Date") == 0) {
+                        dissect_result_add(out, "smtp_message_date", val);
+                    }
+                    /* Unrecognized headers (Content-Type, MIME-Version,
+                     * etc.) are walked past but not extracted — this is
+                     * genuinely still just RFC 5322 header parsing, not
+                     * MIME interpretation, even when a Content-Type
+                     * header is present; understanding what that
+                     * Content-Type MEANS (multipart boundaries, nested
+                     * body parts) is the part that stays out of scope. */
+                } else {
+                    /* A continuation/folded header line (starts with
+                     * whitespace) or malformed line — not specifically
+                     * handled, matching this addition's bounded scope. */
+                }
+
+                pos += hdr_line_end + 2;
+                header_lines_parsed++;
+            }
+
+            break;   /* whether or not message headers were found, stop
+                      * here — everything from this point on is message
+                      * body/MIME content, not command/response or
+                      * RFC 5322 header traffic */
         } else if (n >= 8 && strncasecmp(line, "STARTTLS", 8) == 0) {
             dissect_result_add(out, "smtp_starttls_seen", "true");
         }

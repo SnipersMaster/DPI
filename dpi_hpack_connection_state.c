@@ -32,6 +32,13 @@
 #include <string.h>
 #include <time.h>
 
+/* Provides: struct hpack_dynamic_table, hpack_dynamic_table_init().
+ * Safe to include here regardless of what else has already included
+ * it elsewhere in the same translation unit — dpi_hpack_decoder.c now
+ * has an include guard specifically so this doesn't depend on a
+ * fragile cross-file include ordering. */
+#include "dpi_hpack_decoder.c"
+
 #define HPACK_CONN_PER_PARTITION   32   /* fewer than TCP flows per partition —
                                            * HTTP/2 connections are typically
                                            * much longer-lived and more
@@ -43,12 +50,51 @@
                                            * long-lived (multiplexed,
                                            * kept alive) — much longer
                                            * than TCP_FLOW_TIMEOUT_SECONDS */
+#define HPACK_PENDING_BLOCK_MAX    16384  /* matches dpi_http2_parser.c's
+                                             * combined_block size — a
+                                             * partial header block waiting
+                                             * for its completing
+                                             * CONTINUATION frame across a
+                                             * TCP delivery boundary can't
+                                             * exceed what a single
+                                             * reassembly pass could ever
+                                             * have accumulated anyway */
+
+/* MEMORY FOOTPRINT of the pending-CONTINUATION addition specifically:
+ * HPACK_PENDING_BLOCK_MAX (16384) + stream_id (4) + length (8) + flag (1)
+ * ≈ 16.4 KB added per connection entry. At HPACK_CONN_PER_PARTITION=32
+ * across TCP_REASSEMBLY_NUM_PARTITIONS=16 partitions, that's ~8 MB
+ * additional static memory for this feature alone, on top of whatever
+ * the dynamic table itself already costs. Worth knowing before treating
+ * this as a "small" addition — it isn't free, even though it's bounded
+ * and predictable. */
 
 struct hpack_connection_entry {
     bool     in_use;
     struct   tcp_flow_key key;
     struct   hpack_dynamic_table dyn_table;
     time_t   last_activity;
+
+    /* Cross-TCP-boundary CONTINUATION reassembly state. When a HEADERS
+     * (or CONTINUATION) frame's field block runs off the end of the
+     * CURRENT TCP delivery without reaching one with END_HEADERS set,
+     * the bytes accumulated so far are saved here instead of being
+     * discarded — the NEXT delivery for this same flow resumes the
+     * search rather than starting over or giving up. See
+     * dpi_http2_parser.c's http2_dissect_core() for where this is
+     * populated and consumed.
+     *
+     * SCOPE: this only covers the case where the split happens
+     * cleanly AT a frame boundary (not enough buffer for the next
+     * frame's header at all) — not a split in the middle of a
+     * CONTINUATION frame's own header or payload, which would need
+     * additional partial-frame state this doesn't track. Flagged via
+     * http2_continuation_split_mid_frame_not_reassembled when that
+     * happens, same as before this change. */
+    bool     has_pending_headers;
+    uint32_t pending_stream_id;
+    uint8_t  pending_block[HPACK_PENDING_BLOCK_MAX];
+    size_t   pending_block_len;
 };
 
 /* Reuses TCP_REASSEMBLY_NUM_PARTITIONS from dpi_tcp_flow_reassembly.c —
@@ -63,8 +109,15 @@ static bool tcp_flow_key_equal(const struct tcp_flow_key *a, const struct tcp_fl
  * file — declared here only to make the dependency explicit at a
  * glance; the actual definition is used (same translation unit). */
 
-static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition_id,
-                                                                const struct tcp_flow_key *key) {
+/*
+ * Full-entry accessor — used by http2_dissect_with_flow_state(), which
+ * needs both the dynamic table AND the pending-CONTINUATION state, not
+ * just the table alone. hpack_get_connection_table() below is now a
+ * thin wrapper over this for callers that only need the table (kept
+ * so existing call sites don't need to change).
+ */
+static struct hpack_connection_entry *hpack_get_connection_entry(uint16_t partition_id,
+                                                                   const struct tcp_flow_key *key) {
     if (partition_id >= TCP_REASSEMBLY_NUM_PARTITIONS) return NULL;
 
     time_t now = time(NULL);
@@ -80,7 +133,7 @@ static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition
 
         if (e->in_use && tcp_flow_key_equal(&e->key, key)) {
             e->last_activity = now;
-            return &e->dyn_table;
+            return e;
         }
         if (!e->in_use && !free_slot) free_slot = e;
     }
@@ -94,13 +147,18 @@ static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition
     free_slot->key = *key;
     free_slot->last_activity = now;
     /* 4096 = HTTP/2's default SETTINGS_HEADER_TABLE_SIZE (RFC 9113
-     * S6.5.2) — same default used by the fresh-per-call path in
-     * dpi_http2_parser.c, since this reference implementation doesn't
-     * track actual SETTINGS frame negotiation either way. A real
-     * implementation would update this from the peer's actual
-     * SETTINGS_HEADER_TABLE_SIZE value when negotiated. */
+     * S6.5.2) — now updated to the REAL negotiated value when a
+     * SETTINGS frame carrying SETTINGS_HEADER_TABLE_SIZE is seen (see
+     * dpi_http2_parser.c's SETTINGS handling), this is just the
+     * starting default before any such frame has been observed. */
     hpack_dynamic_table_init(&free_slot->dyn_table, 4096);
-    return &free_slot->dyn_table;
+    return free_slot;
+}
+
+static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition_id,
+                                                                const struct tcp_flow_key *key) {
+    struct hpack_connection_entry *e = hpack_get_connection_entry(partition_id, key);
+    return e ? &e->dyn_table : NULL;
 }
 
 /*
