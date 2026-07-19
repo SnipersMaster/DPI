@@ -90,19 +90,29 @@
 #include "dpi_gtp_parser.c"
 #include "dpi_dns_parser.c"
 #include "dpi_http1_parser.c"
+
+/* Provides: struct hpack_connection_entry, hpack_get_connection_entry(),
+ * hpack_get_connection_table() — per-flow persistent HPACK state,
+ * keyed by the same tcp_flow_key TCP reassembly uses. Now included
+ * BEFORE dpi_http2_parser.c (an earlier version had this the other way
+ * around) because http2_dissect_with_flow_state() needs
+ * struct hpack_connection_entry declared before its own signature uses
+ * it — this file's own internal #include "dpi_hpack_decoder.c" (now
+ * guarded against double-inclusion) satisfies its struct hpack_dynamic_
+ * table dependency regardless of this reordering. */
+#include "dpi_hpack_connection_state.c"
 #include "dpi_http2_parser.c"
 
-/* Provides: hpack_get_connection_table() — per-flow persistent HPACK
- * dynamic table, keyed by the same tcp_flow_key TCP reassembly uses.
- * Must come after both dpi_tcp_flow_reassembly.c (struct tcp_flow_key)
- * and dpi_http2_parser.c (struct hpack_dynamic_table, via
- * dpi_hpack_decoder.c). */
-#include "dpi_hpack_connection_state.c"
 #include "dpi_ssh_parser.c"
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
 #include "dpi_smtp_parser.c"
+#include "dpi_arp_parser.c"
+#include "dpi_mqtt_parser.c"
+#include "dpi_ntp_parser.c"
+#include "dpi_snmp_parser.c"
+#include "dpi_stun_parser.c"
 #include "dpi_quic_parser.c"   /* needs OpenSSL — see this file's own header for
                                  * the -lssl -lcrypto build requirement */
 
@@ -193,8 +203,35 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+#ifndef RTE_ETHER_TYPE_ARP
+#define RTE_ETHER_TYPE_ARP 0x0806
+#endif
+    if (ethertype == RTE_ETHER_TYPE_ARP) {
+        /* ARP has no L4 payload to dispatch on — the whole thing after
+         * the Ethernet header IS the ARP message. Calls
+         * dispatch_dissection() directly here, parallel to how ICMP is
+         * called directly rather than through a TCP/UDP branch — see
+         * dpi_arp_parser.c's header comment for why. */
+        struct dissect_result arp_out;
+        bool matched = dispatch_dissection(ip_start, ip_len, 0, "ARP", &arp_out);
+        if (matched) {
+            struct flow_log_record rec = {0};
+            const char *sender_ip = dissect_result_get(&arp_out, "arp_sender_ip");
+            const char *target_ip = dissect_result_get(&arp_out, "arp_target_ip");
+            if (sender_ip) strncpy(rec.src_ip, sender_ip, sizeof(rec.src_ip) - 1);
+            if (target_ip) strncpy(rec.dst_ip, target_ip, sizeof(rec.dst_ip) - 1);
+            strncpy(rec.category, "ARP", sizeof(rec.category) - 1);
+            const char *opcode = dissect_result_get(&arp_out, "arp_opcode");
+            if (opcode) strncpy(rec.app_name, opcode, sizeof(rec.app_name) - 1);
+            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            log_ring_try_push(queue_id, &rec);
+        }
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ethertype != RTE_ETHER_TYPE_IPV4) {
-        rte_pktmbuf_free(m);   /* not IPv4 or IPv6: not handled */
+        rte_pktmbuf_free(m);   /* not IPv4, IPv6, or ARP: not handled */
         return;
     }
 

@@ -62,13 +62,18 @@
 #include "dpi_gtp_parser.c"
 #include "dpi_dns_parser.c"
 #include "dpi_http1_parser.c"
-#include "dpi_http2_parser.c"
 #include "dpi_hpack_connection_state.c"
+#include "dpi_http2_parser.c"
 #include "dpi_ssh_parser.c"
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
 #include "dpi_smtp_parser.c"
+#include "dpi_arp_parser.c"
+#include "dpi_mqtt_parser.c"
+#include "dpi_ntp_parser.c"
+#include "dpi_snmp_parser.c"
+#include "dpi_stun_parser.c"
 #include "dpi_quic_parser.c"
 
 /* ---------------------------------------------------------------------
@@ -462,8 +467,28 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+#ifndef ETH_P_ARP
+#define ETH_P_ARP 0x0806
+#endif
+    if (ethertype == ETH_P_ARP) {
+        struct dissect_result arp_out;
+        bool matched = dispatch_dissection((const uint8_t *)payload, (uint16_t)payload_len,
+                                            0, "ARP", &arp_out);
+        if (matched) {
+            const char *opcode = dissect_result_get(&arp_out, "arp_opcode");
+            const char *sender_ip = dissect_result_get(&arp_out, "arp_sender_ip");
+            const char *target_ip = dissect_result_get(&arp_out, "arp_target_ip");
+            const char *sender_mac = dissect_result_get(&arp_out, "arp_sender_mac");
+            printf("{\"protocol\":\"ARP\",\"arp_opcode\":\"%s\",\"arp_sender_ip\":\"%s\","
+                   "\"arp_sender_mac\":\"%s\",\"arp_target_ip\":\"%s\"}\n",
+                   opcode ? opcode : "", sender_ip ? sender_ip : "",
+                   sender_mac ? sender_mac : "", target_ip ? target_ip : "");
+        }
+        return;
+    }
+
     if (ethertype != ETH_P_IP) {
-        return;   /* not IPv4 or IPv6: not handled */
+        return;   /* not IPv4, IPv6, or ARP: not handled */
     }
 
     struct ipv4_result ip_result;

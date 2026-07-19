@@ -138,12 +138,17 @@ everything else is not touched by this engine at all yet.
 | GTP-U v1 | 3GPP TS 29.281 | `dpi_gtp_parser.c` | Message type, TEID, sequence number. **G-PDU inner IP packets are now recursively dissected** (IPv4 only, bounded to exactly one level of nesting — a nested GTP-in-GTP tunnel is detected and flagged, deliberately NOT recursed into further, since unbounded recursion driven by attacker-controlled tunnel depth is exactly the resource-exhaustion vector this project's first security checklist warned about). Inner TCP flows get single-packet SNI extraction (not full flow reassembly — a ClientHello split across multiple G-PDU packets won't be caught). |
 | GTPv2-C | 3GPP TS 29.274 | `dpi_gtp_parser.c` | Message type, TEID (if present), sequence number, **and now Information Elements**: IMSI and MSISDN (BCD-decoded per TS 29.274 §8.3/§8.11, verified round-trip against constructed test vectors), APN (label-decoded per TS 23.003 §9.1), and Cause. IMSI/MSISDN are subscriber PII — flagged with a privacy note in the code, same discipline as RADIUS's `User-Password` handling. Other IE types (F-TEID, Bearer QoS, etc.) not yet walked. |
 | DNS | RFC 1035 | `dpi_dns_parser.c` | Query name (bounds-checked, cycle-safe compression pointer decoding — verified against a cyclic-pointer adversarial test case). **Answer, authority, and additional records all now walked** (A/AAAA/CNAME/NS types), sharing one bounds-checked section-walking function across all three. |
+| MQTT | MQTT v3.1.1/v5 | `dpi_mqtt_parser.c` | CONNECT/CONNACK/PUBLISH/SUBSCRIBE message types, client ID, topic names. TCP-based (or TLS-over-TCP); reachable via the TCP capture path's generic dispatch fallback. |
+| NTP | RFC 5905 | `dpi_ntp_parser.c` | Fixed 48-byte header: LI/VN/Mode, stratum, poll, precision. Straightforward, no variable-length fields to bounds-check beyond the fixed size itself. |
+| SNMP | RFC 1157 (v1), RFC 3416 (v2c/v3 common PDU) | `dpi_snmp_parser.c` | BER/ASN.1 decoding — a genuinely different parsing paradigm from the fixed-field/TLV approach used everywhere else in this project. Community string, PDU type, basic varbind walking. |
+| ARP | RFC 826 | `dpi_arp_parser.c` | Opcode, sender/target MAC+IP for the common Ethernet+IPv4 case. Runs directly over its own EtherType (0x0806) — never has an IP header at all, so it needs its own capture-path branch parallel to IPv4/IPv6, not routed through TCP/UDP dispatch. Gratuitous-ARP and zero-target-MAC-in-reply are flagged (useful ARP-spoofing signals) without being judged as malicious, since both patterns have legitimate uses too. |
+| STUN | RFC 5389 | `dpi_stun_parser.c` | Message type, magic cookie validation, transaction ID, basic attribute walking. Works over UDP or TCP. TURN relay semantics not implemented — this is STUN message parsing only. |
 
 ### Detected / scored, not fully dissected
 
 | Protocol | File | What it does |
 |---|---|---|
-| QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame, and now extracts SNI from the enclosed ClientHello (wired to `extract_sni_from_clienthello_body()`, which was split out of the TLS-over-TCP SNI parser specifically because QUIC's CRYPTO frame has no TLS record-layer wrapper — RFC 9001 S4.1.3). Logic cross-checked against RFC 9001's own pseudocode line-by-line; **not yet validated against RFC 9001 Appendix A.2's byte-exact test vectors** — those are two different levels of confidence, see the file header. |
+| QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame, and now extracts SNI from the enclosed ClientHello (wired to `extract_sni_from_clienthello_body()`, which was split out of the TLS-over-TCP SNI parser specifically because QUIC's CRYPTO frame has no TLS record-layer wrapper — RFC 9001 S4.1.3). Logic cross-checked against RFC 9001's own pseudocode line-by-line, **and the algorithm independently re-verified against RFC 9001 Appendix A.2's real published test vector** (keys derived from scratch via Python's `hashlib`/`hmac`, decrypted via the `cryptography` library — not a re-run of this C file — recovering a ClientHello containing "example.com", matching the RFC's own example exactly). This confirms the *algorithm* is correct against real bytes; it does not yet confirm this specific C file compiles and runs correctly, which awaits an actual compiler (see the status table below). |
 | DNS-over-HTTPS (DoH) | `dpi_doh_dot_detector.c` | No structural fingerprint exists — DoH is indistinguishable from ordinary HTTPS at the wire level. Detection is entirely SNI-based, matching against `domain_rules.ini`'s `[dns_over_https]` category. This is stated plainly rather than implying a cleverer detection method exists. |
 | WireGuard | `dpi_vpn_detector.c` | Fingerprints handshake message types/sizes to produce a VPN-likelihood score. Does not parse WireGuard's actual handshake cryptographic fields or transport data. |
 | OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. |
@@ -157,24 +162,34 @@ recommended in earlier versions of this README (IPv6, HTTP/1.1, DNS
 answer records, SSH, HTTP/2 at the frame level + HPACK + CONTINUATION
 reassembly + connection persistence, GTP inner-packet recursion, DHCP,
 SIP/RTP, GTPv2-C IEs, ICMP/ICMPv6 including embedded-packet recursion,
-SMTP) is now implemented. Here's a fresh prioritized list for what's
-genuinely still missing:
+SMTP, MQTT, NTP, SNMP, ARP, STUN) is now implemented. What's genuinely
+still missing:
 
 | Protocol | Value | Effort relative to what's built |
 |---|---|---|
 | **SMB/CIFS** | Medium — significant for internal/enterprise network visibility (file share access, lateral movement detection) | Higher — SMB2/3 has a more complex, binary, multi-command structure than the text protocols built so far |
-| **MQTT** | Medium, IoT-specific — connect/publish/subscribe visibility for IoT deployments | Low — compact binary protocol, simpler than most already built (RADIUS-level complexity) |
-| **NTP** | Low-medium, but cheap | Low — fixed 48-byte header, straightforward |
-| **SNMP** | Medium, network-management-specific | Medium — BER/ASN.1 encoding is a new parsing paradigm not used elsewhere in this project (everything so far is fixed-field or simple TLV) |
 | **Modbus/DNP3** (ICS/SCADA) | Situational — high value specifically for industrial/OT network monitoring, irrelevant otherwise | Low-medium — both are simpler, more fixed-structure protocols than most already built |
-| **ARP** | Low value alone, but cheap and sometimes useful for on-link visibility (ARP spoofing detection) | Very low — trivial fixed-format protocol |
-| **STUN/TURN** | Situational — relevant if WebRTC/VoIP traffic matters for your deployment (NAT traversal visibility) | Medium — STUN's TLV attribute structure is similar to what's already built; the ICE/TURN relay logic adds real complexity beyond basic message parsing |
+| **POP3/IMAP** | Low-medium — mail retrieval visibility, similar value profile to SMTP but for the receiving side | Low — text-based command/response, same shape as SMTP/SIP already built |
+| **TFTP** | Low, but very cheap | Very low — trivial fixed-format protocol, simpler than DHCP |
 
 All of these would plug into `dpi_dissector_registry.c` following the
 same `detect()`/`dissect()` pattern already used throughout — register
-the new dissector, add it to `protocols.ini`, done. ARP is probably the
-cheapest next addition if you want another quick win before tackling
-something larger like SMB or SNMP.
+the new dissector, add it to `protocols.ini`, done. SMB is probably the
+next highest-value addition given how common internal file-share
+traffic is in enterprise environments.
+
+**An architectural note surfaced while wiring ARP in** (see the gap
+table below for the fuller story): most protocols in this project run
+over TCP or UDP and reach their dissector via the generic
+`dispatch_dissection()` call already present in the UDP and TCP
+capture paths — a newly-registered UDP/TCP-based dissector becomes
+reachable automatically, no capture-path changes needed. **ARP and
+ICMP are the exception** — ARP has no IP header at all (its own
+EtherType), and ICMP's checksum needs IP addresses the generic
+interface doesn't pass through — both needed dedicated capture-path
+branches. Any future non-IP-based protocol (or one needing IP-context
+the generic interface doesn't carry) will need the same treatment,
+not just registration.
 
 ### Real gaps within what's now "supported" — don't over-read the table above
 
@@ -194,6 +209,8 @@ fully-parsed table above. What remains:
 | HTTP/2 CONTINUATION across a TCP reassembly boundary | `dpi_http2_parser.c` | Reassembly only works when CONTINUATION frames arrive in the SAME buffer as their HEADERS frame (the common case, since implementations typically send them back-to-back). A CONTINUATION split across a separate `dissect()` call isn't covered — flagged via `http2_continuation_incomplete_in_buffer` |
 | HPACK's default table size is hardcoded to 4096 | `dpi_hpack_connection_state.c`, `dpi_http2_parser.c` | Real HTTP/2 negotiates `SETTINGS_HEADER_TABLE_SIZE` per-connection via SETTINGS frames; this reference implementation doesn't track that negotiation, so a connection that negotiates a non-default size could be decoded against the wrong table size limit |
 | SMTP doesn't parse the DATA/message body | `dpi_smtp_parser.c` | Deliberately scoped out, same as SIP's SDP body — mail body content is a substantially different (MIME-aware) parsing problem |
+| ARP/MQTT/NTP/SNMP/STUN were built but not wired in | `dpi_dissector_registry.c`, `protocols.ini`, capture files | **Found and fixed in this pass**: all five dissector files existed and defined `register_*_dissector()`, but none were called in `register_all_dissectors()`, none had a `protocols.ini` entry, and ARP specifically had no capture-path branch at all (it's not IP-based, so the generic TCP/UDP dispatch never reaches it). All five are now registered and reachable; MQTT/NTP/SNMP/STUN needed no capture-path changes (already covered by the generic UDP/TCP dispatch), ARP needed a dedicated EtherType branch (now added to both capture files). |
+| ARP/MQTT/NTP/SNMP/STUN have fuzz harnesses but unverified seeds | `fuzz_arp_parser.c` and siblings | Harnesses exist and balance-check clean, but their seed corpora were generated quickly in this pass and were **not** individually verified byte-for-byte against each dissector's exact parsing logic the way the DNS/GTP/SSH seeds were earlier — treat these as starting points to mutate from, not confirmed-correct fixtures |
 
 
 
@@ -204,7 +221,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (17 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (22 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). The 5 newest (arp/mqtt/ntp/snmp/stun) close a gap where those dissectors existed and were registered but had never been fuzzed. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -248,7 +265,7 @@ fully-parsed table above. What remains:
 | `dpi_doh_dot_detector.c` | No | No | DoT structural detection unverified against real captures; DoH detection is inherently limited to SNI-list matching (no structural fallback exists) |
 | `dpi_dissector_registry.c` | No | No | Framework only — O(n) dispatch noted as a possible future bottleneck at very high dissector counts |
 | `dpi_radius_parser.c` | No | No | Otherwise structurally complete for the core RFC 2865 fields covered |
-| `dpi_quic_parser.c` | No | No | SNI extraction wired end-to-end. **Now validated byte-exact against RFC 9001 Appendix A.2's real published test vector** (all 9 derived secrets/keys/IVs, header protection, AEAD decryption all confirmed to match exactly, recovering the RFC's own example SNI "example.com") — this was previously only "cross-checked against pseudocode," a meaningfully lower confidence level; that gap is now closed. Packet-number reconstruction simplified (correct for a connection's first Initial packet only — the case the verified vector covers); no CRYPTO frame reassembly across multiple packets. |
+| `dpi_quic_parser.c` | No | No | SNI extraction wired end-to-end. The key-derivation-through-decryption **algorithm** is now verified against RFC 9001 Appendix A.2's real published test vector (via an independent Python + `cryptography`-library reimplementation — successful decryption recovering the RFC's own "example.com" example is strong confirmation the algorithm is right). This is a meaningfully higher confidence level than "cross-checked against pseudocode" alone, but it is **not** the same as compiling and running this actual C file against that vector — that step still hasn't happened (no compiler available in any sandbox this project has been built in) and remains the honest next step. Packet-number reconstruction simplified (correct for a connection's first Initial packet only — the case the verified vector covers); no CRYPTO frame reassembly across multiple packets. |
 | `dpi_protocol_config.c` | No | No | Simple, low-risk file — startup-only config load, no ongoing state to get wrong |
 | `dpi_ipv6_parser.c` | No | No | Extension chain walking verified by hand against a 20-header adversarial case (correctly rejected); a real fuzzing pass (`fuzz_ipv6_parser.c`) would give much broader coverage than the handful of hand-checked cases here |
 | `dpi_http1_parser.c` | No | No | No chunked transfer-encoding or body parsing; only Host/User-Agent headers extracted, not a general header map |
@@ -408,21 +425,36 @@ reference/prototype stage but not for a maintained codebase.
 
 ## Suggested next steps, roughly in priority order
 
-**Done in this pass — headline item first**: **RFC 9001 Appendix A.2's
-exact test vector was found and used.** After two earlier failed
-attempts (direct RFC fetches truncating before the appendix; searches
-surfacing only mismatched pre-final-draft fragments), a third-party
-Ruby implementation was found that itself asserts against the RFC's
-published values end-to-end. Re-verified independently in Python,
-mirroring `dpi_quic_parser.c`'s actual C logic step-by-step: all 9
-derived secrets/keys/IVs, the header-protection sample offset (`18`,
-matching this file's formula exactly), packet number recovery, AAD
-reconstruction, and full AES-128-GCM decryption all match the RFC's
-published values **byte-exact**, correctly recovering the RFC's own
-example SNI ("example.com"). This closes what had been an open
-validation gap across many turns of this project — QUIC is no longer
-the one component "cross-checked against pseudocode" instead of tested
-against real values.
+**Done in this pass — headline item first**: **the RFC 9001 Appendix
+A.2 test vector was independently verified.** The seed file
+`fuzz_seeds/quic_header/rfc9001_appendix_a2_client_initial_REAL.bin`
+was checked from scratch this session: its bytes match a packet
+fragment independently found via web search earlier in this project
+(`c000000001088394c8f03e5157080000449e...`), and — more importantly —
+running it through a from-scratch Python reimplementation of the same
+algorithm `dpi_quic_parser.c` uses (HKDF via `hashlib`/`hmac`, AES-ECB
+header protection removal and AES-128-GCM decryption via the real
+`cryptography` library, not a hand-rolled cipher) **successfully
+decrypted it**, recovering a CRYPTO frame containing a TLS ClientHello
+with the literal string "example.com" — exactly matching RFC 9001's
+published worked example. GCM authentication succeeding is not
+something that happens by chance, so this is strong confirmation that
+both the test vector is genuine and the algorithm is correct against
+real bytes.
+
+**Precisely what this does and doesn't prove**, stated carefully since
+overclaiming here would be worse than the original gap: this confirms
+the *algorithm* — already cross-checked against RFC 9001's pseudocode
+line-by-line — produces correct output on real data. It does **not**
+confirm that `dpi_quic_parser.c`'s actual C code is bug-free, since
+verification was done via an independent Python reimplementation, not
+by compiling and running that C file itself (still not possible in any
+sandbox this project has been built in). What's closed is the gap
+between "logic reviewed against pseudocode" and "algorithm verified
+against real bytes" — QUIC is no longer the only component at that
+lower confidence tier. What remains open — compiling and running the
+actual C code against this seed — is true of every file in this
+project, not something specific to QUIC anymore.
 
 Also done: SMTP (command/response parsing, flows through the same
 generic TCP dissector dispatch HTTP/1.1 and SSH already use — no
@@ -435,8 +467,20 @@ HTTP/2 CONTINUATION reassembly specifically
 (`fuzz_http2_continuation.c`), constructing real multi-frame sequences
 — including deliberate stream-ID-mismatch and frame-type-corruption
 adversarial cases — from fuzz input rather than relying on generic
-byte fuzzing to stumble into valid structure. 17 fuzz harnesses total
-now (up from 15).
+byte fuzzing to stumble into valid structure.
+
+**A real gap found and fixed by auditing rather than assuming**:
+`dpi_arp_parser.c`, `dpi_mqtt_parser.c`, `dpi_ntp_parser.c`,
+`dpi_snmp_parser.c`, and `dpi_stun_parser.c` all existed, compiled
+cleanly (by inspection), and defined `register_*_dissector()` — but
+none were actually called in `register_all_dissectors()`, none had a
+`protocols.ini` entry, and ARP specifically had no capture-path branch
+at all (it's not IP-based — its own EtherType — so the generic TCP/UDP
+dispatch could never reach it regardless of registration). All five
+are now registered, in `protocols.ini`, and — for ARP — reachable via
+a dedicated EtherType branch added to both capture files. Five new
+fuzz harnesses close the loop. **22 fuzz harnesses total now** (up from
+15 at the start of this pass).
 
 **A seed-generation bug caught before shipping, worth mentioning
 alongside the code bugs from previous passes**: an early Python script
@@ -447,9 +491,12 @@ byte offsets actually matched what the C parser expects, the same
 discipline applied to source code, applied here to test fixtures.
 Fixed and re-verified before adding to the corpus. Worth noting because
 test/seed generation code deserves the same scrutiny as the code it's
-testing — a wrong seed can silently validate nothing.
+testing — a wrong seed can silently validate nothing. (The 5 newest
+seeds — arp/mqtt/ntp/snmp/stun — were generated quickly in this same
+pass and do NOT have this same level of scrutiny yet; see the gap
+table above.)
 
-1. **Actually run the fuzzers.** Now 17 harnesses, still zero executed
+1. **Actually run the fuzzers.** Now 22 harnesses, still zero executed
    — no clang/libFuzzer in this sandbox, unchanged from every previous
    version of this list. This remains the single most important gap
    between "carefully reviewed" (which, at this point, this project
@@ -457,11 +504,14 @@ testing — a wrong seed can silently validate nothing.
    of additional logic review substitutes for this.
 2. **`fuzz_hpack_decoder.c` and `fuzz_quic_header.c` are the top two
    priorities**, in roughly that order. HPACK remains the most novel,
-   least-precedented logic in the project. QUIC now has a byte-exact-
-   verified real RFC packet as a seed
+   least-precedented logic in the project. QUIC now has an
+   independently-decryption-verified real RFC packet as a seed
    (`rfc9001_appendix_a2_client_initial_REAL.bin`) — mutating from a
-   confirmed-correct real packet is likely to surface genuine edge
-   cases faster than mutating from a synthetic one.
+   confirmed-genuine real packet is likely to surface genuine edge
+   cases faster than mutating from a synthetic one. Compiling
+   `dpi_quic_parser.c` itself and confirming it decrypts this exact
+   seed correctly is also now a well-defined, specific next step (see
+   above on what's proven vs. not).
 3. **Compile everything against real dev headers.** Still true for
    every file — an enormous amount of care has gone into logic
    verification specifically *because* nothing here can be compiled in
@@ -476,5 +526,10 @@ testing — a wrong seed can silently validate nothing.
    conditions — unchanged from before.
 7. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`**
    against real captures — unchanged from before.
-8. **Add ARP or SMB** as the next protocol additions — see the
-   recommendation table above for the fuller prioritized list.
+8. **Verify the 5 newest seed corpora (arp/mqtt/ntp/snmp/stun)**
+   byte-for-byte against their dissectors' actual parsing logic, the
+   way DNS/GTP/SSH/QUIC seeds were — they were generated quickly and
+   are best-effort starting points, not confirmed-correct fixtures yet.
+9. **Add SMB, Modbus/DNP3, or POP3/IMAP** as the next protocol
+   additions — see the recommendation table above for the fuller
+   prioritized list.

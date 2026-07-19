@@ -220,6 +220,11 @@ static void register_all_dissectors(void) {
     extern void register_icmp_dissector(void);
     extern void register_icmpv6_dissector(void);
     extern void register_smtp_dissector(void);
+    extern void register_arp_dissector(void);
+    extern void register_mqtt_dissector(void);
+    extern void register_ntp_dissector(void);
+    extern void register_snmp_dissector(void);
+    extern void register_stun_dissector(void);
 
     /* Each registration is now gated by the arsenal config — a
      * protocol disabled in protocols.ini is simply never registered,
@@ -241,6 +246,11 @@ static void register_all_dissectors(void) {
     if (protocol_enabled("icmp"))   register_icmp_dissector();
     if (protocol_enabled("icmpv6")) register_icmpv6_dissector();
     if (protocol_enabled("smtp"))   register_smtp_dissector();
+    if (protocol_enabled("arp"))    register_arp_dissector();
+    if (protocol_enabled("mqtt"))   register_mqtt_dissector();
+    if (protocol_enabled("ntp"))    register_ntp_dissector();
+    if (protocol_enabled("snmp"))   register_snmp_dissector();
+    if (protocol_enabled("stun"))   register_stun_dissector();
 
     fprintf(stderr, "dissector_registry: %d protocol dissector(s) registered "
             "(per protocols.ini)\n", g_n_dissectors);
