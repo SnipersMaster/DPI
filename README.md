@@ -173,6 +173,7 @@ everything else is not touched by this engine at all yet.
 | GTP-U v1 | 3GPP TS 29.281 | `dpi_gtp_parser.c` | Message type, TEID, sequence number. **G-PDU inner IP packets are now recursively dissected for both IPv4 and IPv6** inner packets. GTP-in-GTP nested tunnels are now **actually recursed into** (not just flagged) up to an explicit, configurable `GTP_MAX_TUNNEL_DEPTH` (default 1 extra level) — a real safety bound stated as such in the code, not an arbitrary one; raising it means accepting more per-level parsing cost against attacker-controlled nesting. Inner TCP flows get single-packet SNI extraction (not full flow reassembly — a ClientHello split across multiple G-PDU packets won't be caught). |
 | GTPv2-C | 3GPP TS 29.274 | `dpi_gtp_parser.c` | Message type, TEID (if present), sequence number, and **10 Information Element types**: IMSI, MSISDN (BCD-decoded, verified round-trip), APN (label-decoded), Cause, Recovery/Restart Counter, RAT Type, F-TEID (interface type + TEID + IPv4/IPv6 address), PDN Address Allocation (IPv4/IPv6/IPv4v6), Charging ID, and Bearer QoS (**QCI only, deliberately partial** — the PCI/PL/PVI bit-field layout and bit-rate fields weren't extracted since this project doesn't have the source spec text in front of it to verify the exact bit positions with the same confidence as everything else here; stated honestly in the code rather than guessed at). F-TEID, PAA, and Charging ID verified against constructed test vectors. IMSI/MSISDN are subscriber PII — flagged with a privacy note, same discipline as RADIUS's `User-Password` handling. |
 | Modbus/TCP | Modbus Application Protocol V1.1b3 | `dpi_modbus_parser.c` | MBAP header (transaction ID, unit ID) + function code, with address/quantity or address/value extraction for the most common function codes (Read Coils/Discrete Inputs/Holding Registers/Input Registers, Write Single Coil/Register). Exception responses flagged with their exception code. The first ICS/SCADA protocol in this project — genuinely distinct visibility from everything else built so far. |
+| GRE | RFC 2784, RFC 2890 | `dpi_gre_parser.c` | This project's first true **tunnel decapsulation** protocol beyond GTP — C/K/S flags, optional checksum/key/sequence fields, and recursive dissection of the inner IPv4 or IPv6 payload (addresses, protocol, single-packet TCP SNI), bounded to one level of GRE-in-GRE nesting for the same resource-exhaustion reason as GTP-in-GTP. ERSPAN (Cisco's mirrored-traffic encapsulation) and GRE keepalives are both detected and flagged by name. IP protocol 47, reachable over both IPv4 and IPv6 — needed dedicated capture-path branches (not TCP/UDP-based) in both, same pattern as ICMP/ARP. Verified against 744 real GRE packets from a genuine capture (459 over IPv4, 285 over IPv6) with zero parse failures — see the real-world validation section below for what that process actually caught. |
 | DNP3 | IEEE 1815 | `dpi_dnp3_parser.c` | Data Link Layer (direction, link function, destination/source addresses) plus Transport/Application Layer (FIR/FIN/sequence, application function code) for frames whose user data fits in a single 16-byte block — DNP3 requires a CRC after every 16 bytes, and reassembling data spanning multiple such blocks isn't attempted in this pass (flagged, not silently misparsed). **Verification methodology differs from most of this project**: IEEE 1815 is a paid standard not available to search here, so the field layout was instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other and with an official-looking function-code reference — a genuine discrepancy in a third (blog) source was found and discarded in favor of the two mutually-consistent captures. Header CRC (polynomial 0x3D65) is not verified. |
 | DNS | RFC 1035 | `dpi_dns_parser.c` | Query name (bounds-checked, cycle-safe compression pointer decoding — verified against a cyclic-pointer adversarial test case). **Answer, authority, and additional records all now walked** (A/AAAA/CNAME/NS types), sharing one bounds-checked section-walking function across all three. |
 | MQTT | MQTT v3.1.1/v5 | `dpi_mqtt_parser.c` | CONNECT/CONNACK/PUBLISH/SUBSCRIBE message types, client ID, topic names. TCP-based (or TLS-over-TCP); reachable via the TCP capture path's generic dispatch fallback. |
@@ -280,7 +281,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (25 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (26 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -578,6 +579,28 @@ just descriptions of the logic):**
   query (six labels totaling 253 presentation-format characters,
   ending in `weberdns.de` — clearly a hand-built edge-case test by the
   pcap's author, not organic traffic).
+- **GRE decapsulation**: all **744** real GRE packets (459 over IPv4,
+  285 over IPv6) parsed with zero failures — 186 with inner IPv4, 186
+  with inner IPv6, 346 real Cisco ERSPAN (mirrored-traffic
+  encapsulation) frames correctly detected and flagged rather than
+  misparsed, and 22 genuine GRE keepalives correctly identified.
+
+**A second mistake caught during this process** (same failure mode as
+the DNS one below, different root cause): an early GRE verification
+pass found **zero** keepalive packets, contradicting packets that had
+looked keepalive-shaped on manual inspection moments earlier. Before
+concluding the dissector mishandled them, the actual `parse_ipv4()`
+source was checked — confirmed it already correctly bounds a packet's
+payload to the IP header's own declared Total Length field, not the
+raw captured buffer. The verification script hadn't been doing that
+trim, so Ethernet's minimum-frame-length padding was being counted as
+if it were GRE payload. Once the test was fixed to match what
+`parse_ipv4()` already did correctly, all 22 real keepalives were
+identified exactly as expected. Worth stating plainly: this was a
+second, independent instance of "the test was wrong, not the code" —
+not a fluke from the DNS case below, but a real, recurring risk in
+any external verification effort, caught the same way both times: by
+checking the actual source before writing a bug report against it.
 
 **A mistake caught during this process, worth being honest about**: an
 early pass of the DNS verification script flagged 6 of those 2,229
@@ -607,7 +630,11 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **89 seed files total now**.
+synthetic seeds — **95 seed files total now** (7 from VLAN/Modbus/DNS
+validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
+keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
+all-flags-set header — since real traffic didn't happen to include
+those bounded/adversarial cases).
 
 ## Suggested next steps, roughly in priority order
 

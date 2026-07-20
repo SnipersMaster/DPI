@@ -51,6 +51,7 @@
  * the full rationale on each; not repeated here. This file doesn't
  * need dpi_async_output.c, since single-threaded printf() is fine at
  * this scale (see the note where it's used below). */
+#include "dpi_vlan_parser.c"
 #include "dpi_rfc_parser.c"
 
 /* Provides: parse_ipv6(), struct ipv6_result, parse_tcp_v6(), parse_udp_v6(). */
@@ -69,6 +70,7 @@
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
+#include "dpi_gre_parser.c"
 #include "dpi_smtp_parser.c"
 #include "dpi_arp_parser.c"
 #include "dpi_mqtt_parser.c"
@@ -193,6 +195,7 @@ static int install_seccomp_filter(void) {
 static void dissect_udp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len);
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result);
+static void dissect_gre_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -219,6 +222,39 @@ static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
            src_ip_str, dst_ip_str,
            icmp_type ? icmp_type : "", icmp_code ? icmp_code : "",
            checksum_valid ? checksum_valid : "");
+}
+
+static void dissect_gre_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "GRE", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    const char *protocol_type = dissect_result_get(&dissect_out, "gre_protocol_type");
+    const char *inner_src = dissect_result_get(&dissect_out, "gre_inner_src_ip");
+    const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
+    const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
+    const char *erspan = dissect_result_get(&dissect_out, "gre_erspan_detected");
+    const char *keepalive = dissect_result_get(&dissect_out, "gre_keepalive_likely");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"GRE\","
+           "\"gre_protocol_type\":\"%s\",\"gre_inner_src_ip\":\"%s\","
+           "\"gre_inner_dst_ip\":\"%s\",\"gre_inner_sni\":\"%s\","
+           "\"gre_erspan_detected\":\"%s\",\"gre_keepalive_likely\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           protocol_type ? protocol_type : "", inner_src ? inner_src : "",
+           inner_dst ? inner_dst : "", inner_sni ? inner_sni : "",
+           erspan ? erspan : "false", keepalive ? keepalive : "false");
 }
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
@@ -309,6 +345,32 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                "\"icmpv6_type\":\"%s\",\"icmpv6_code\":\"%s\",\"icmpv6_checksum_valid\":\"%s\"}\n",
                src_str, dst_str, icmpv6_type ? icmpv6_type : "", icmpv6_code ? icmpv6_code : "",
                icmpv6_checksum_valid ? "true" : "false");
+        return;
+    }
+
+    if (ip6_result.next_header == 47 /* GRE */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "GRE", &dissect_out);
+        if (!matched) return;
+
+        const char *protocol_type = dissect_result_get(&dissect_out, "gre_protocol_type");
+        const char *inner_src = dissect_result_get(&dissect_out, "gre_inner_src_ip");
+        const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
+        const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
+        const char *erspan = dissect_result_get(&dissect_out, "gre_erspan_detected");
+        const char *keepalive = dissect_result_get(&dissect_out, "gre_keepalive_likely");
+
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"GRE\","
+               "\"gre_protocol_type\":\"%s\",\"gre_inner_src_ip\":\"%s\","
+               "\"gre_inner_dst_ip\":\"%s\",\"gre_inner_sni\":\"%s\","
+               "\"gre_erspan_detected\":\"%s\",\"gre_keepalive_likely\":\"%s\"}\n",
+               src_str, dst_str,
+               protocol_type ? protocol_type : "", inner_src ? inner_src : "",
+               inner_dst ? inner_dst : "", inner_sni ? inner_sni : "",
+               erspan ? erspan : "false", keepalive ? keepalive : "false");
         return;
     }
 
@@ -488,6 +550,25 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     const unsigned char *payload = buf + ETH_HDR_LEN;
     ssize_t payload_len = len - ETH_HDR_LEN;
 
+    /* VLAN stripping (802.1Q / 802.1ad QinQ), bounded to 2 tags — same
+     * gap and same fix as dpi_dpdk_worker.c's matching code, see that
+     * comment (or dpi_vlan_parser.c's header) for the full rationale.
+     * After this, ethertype/payload/payload_len refer to whatever's
+     * INSIDE the VLAN tag(s), so the dispatch below needs no other
+     * changes to handle tagged traffic transparently. */
+    if (ethertype == ETHERTYPE_8021Q || ethertype == ETHERTYPE_8021AD) {
+        struct vlan_strip_result vlan;
+        if (!vlan_strip(ethertype, (const uint8_t *)payload, (uint16_t)payload_len, &vlan)) {
+            return;   /* malformed tag or over-nested: drop, don't guess */
+        }
+        ethertype = vlan.real_ethertype;
+        payload = (const unsigned char *)vlan.payload;
+        payload_len = vlan.payload_len;
+        (void)vlan.vlan_id_outer;   /* not yet threaded into the JSON output —
+                                      * see dpi_dpdk_worker.c's matching note */
+        (void)vlan.vlan_id_inner;
+    }
+
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86DD
 #endif
@@ -527,6 +608,11 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
 
     if (ip_result.protocol == 1 /* ICMP */) {
         dissect_icmp_datagram(&ip_result);
+        return;
+    }
+
+    if (ip_result.protocol == 47 /* GRE */) {
+        dissect_gre_datagram(&ip_result);
         return;
     }
 

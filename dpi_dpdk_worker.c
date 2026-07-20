@@ -61,6 +61,7 @@
  * of capture backend (DPDK here, or the AF_PACKET path in
  * dpi_secure_bootstrap.c) — that portability was deliberate when this
  * file was written. */
+#include "dpi_vlan_parser.c"
 #include "dpi_rfc_parser.c"
 
 /* Provides: parse_ipv6(), struct ipv6_result, parse_tcp_v6(),
@@ -107,6 +108,7 @@
 #include "dpi_dhcp_parser.c"
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
+#include "dpi_gre_parser.c"
 #include "dpi_smtp_parser.c"
 #include "dpi_arp_parser.c"
 #include "dpi_mqtt_parser.c"
@@ -202,6 +204,7 @@ static int port_init(uint16_t port_id, struct rte_mempool *mbuf_pool, uint16_t n
  * definition appears later in this file. */
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -215,6 +218,34 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     uint16_t ethertype = rte_be_to_cpu_16(eth->ether_type);
     const uint8_t *ip_start = (const uint8_t *)(eth + 1);
     uint16_t ip_len = len - sizeof(struct rte_ether_hdr);
+
+    /* VLAN stripping (802.1Q / 802.1ad QinQ), bounded to 2 tags — see
+     * dpi_vlan_parser.c's header comment for the full rationale. Real
+     * gap this closes: neither IPV6/ARP/IPV4 branch below ever
+     * recognized ethertype 0x8100/0x88A8 before this, so a VLAN-tagged
+     * frame — extremely common on real trunk ports — would silently
+     * fall through all of them and be dropped. After this, `ethertype`/
+     * `ip_start`/`ip_len` refer to whatever's INSIDE the VLAN tag(s),
+     * so the existing dispatch below needs no other changes to handle
+     * tagged traffic transparently. */
+    if (ethertype == ETHERTYPE_8021Q || ethertype == ETHERTYPE_8021AD) {
+        struct vlan_strip_result vlan;
+        if (!vlan_strip(ethertype, ip_start, ip_len, &vlan)) {
+            rte_pktmbuf_free(m);   /* malformed tag or over-nested: drop, don't guess */
+            return;
+        }
+        ethertype = vlan.real_ethertype;
+        ip_start = vlan.payload;
+        ip_len = vlan.payload_len;
+        /* VLAN IDs aren't currently threaded into flow_log_record —
+         * would need new fields the same way IPv6 addresses needed
+         * new fields when that support was added. Not done in this
+         * pass; the stripping/dispatch correctness is the priority
+         * here, field-level visibility into which VLAN a flow came
+         * from is a reasonable, contained follow-up. */
+        (void)vlan.vlan_id_outer;
+        (void)vlan.vlan_id_inner;
+    }
 
     if (ethertype == RTE_ETHER_TYPE_IPV6) {
         dissect_ipv6_packet(ip_start, ip_len, queue_id);
@@ -266,6 +297,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 47 /* GRE */) {
+        dissect_gre_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -273,7 +310,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, nor ICMP: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, nor GRE: not handled */
         return;
     }
 
@@ -519,6 +556,48 @@ static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, ui
     log_ring_try_push(queue_id, &rec);
 }
 
+static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "GRE", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    struct flow_log_record rec = {0};
+    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
+    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
+    strncpy(rec.category, "GRE", sizeof(rec.category) - 1);
+    /* Same fixed-field limitation as ICMP — app_name is repurposed to
+     * carry the single most useful summary field. For a decapsulated
+     * tunnel, that's the inner destination IP if one was found (the
+     * "what's actually being tunneled" answer), falling back to the
+     * decapsulated inner SNI if TLS was found inside, since either is
+     * more useful than the GRE header fields alone for a flow-level
+     * summary. */
+    const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
+    const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
+    if (inner_sni) {
+        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else if (inner_dst) {
+        strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else {
+        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
+
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -644,6 +723,34 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         const char *icmpv6_type = dissect_result_get(&dissect_out, "icmpv6_type");
         if (icmpv6_type) strncpy(rec.app_name, icmpv6_type, sizeof(rec.app_name) - 1);
         strncpy(rec.confidence, icmpv6_checksum_valid ? "high" : "low", sizeof(rec.confidence) - 1);
+
+        log_ring_try_push(queue_id, &rec);
+        return;
+    }
+
+    if (ip6_result.next_header == 47 /* GRE */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "GRE", &dissect_out);
+        if (!matched) return;
+
+        struct flow_log_record rec = {0};
+        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
+        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        strncpy(rec.category, "GRE", sizeof(rec.category) - 1);
+        const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
+        const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
+        if (inner_sni) {
+            strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
+            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        } else if (inner_dst) {
+            strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
+            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        } else {
+            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        }
 
         log_ring_try_push(queue_id, &rec);
         return;
