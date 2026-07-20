@@ -71,6 +71,7 @@
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
 #include "dpi_gre_parser.c"
+#include "dpi_mpls_parser.c"
 #include "dpi_smtp_parser.c"
 #include "dpi_arp_parser.c"
 #include "dpi_mqtt_parser.c"
@@ -597,8 +598,31 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+#ifndef ETH_P_MPLS_UC
+#define ETH_P_MPLS_UC 0x8847
+#endif
+    if (ethertype == ETH_P_MPLS_UC || ethertype == 0x8848 /* MPLS multicast */) {
+        struct dissect_result mpls_out;
+        bool matched = dispatch_dissection((const uint8_t *)payload, (uint16_t)payload_len,
+                                            0, "MPLS", &mpls_out);
+        if (matched) {
+            const char *depth = dissect_result_get(&mpls_out, "mpls_stack_depth");
+            const char *top_label = dissect_result_get(&mpls_out, "mpls_top_label");
+            const char *inner_src = dissect_result_get(&mpls_out, "mpls_inner_src_ip");
+            const char *inner_dst = dissect_result_get(&mpls_out, "mpls_inner_dst_ip");
+            const char *inner_sni = dissect_result_get(&mpls_out, "mpls_inner_sni");
+            printf("{\"protocol\":\"MPLS\",\"mpls_stack_depth\":\"%s\",\"mpls_top_label\":\"%s\","
+                   "\"mpls_inner_src_ip\":\"%s\",\"mpls_inner_dst_ip\":\"%s\","
+                   "\"mpls_inner_sni\":\"%s\"}\n",
+                   depth ? depth : "", top_label ? top_label : "",
+                   inner_src ? inner_src : "", inner_dst ? inner_dst : "",
+                   inner_sni ? inner_sni : "");
+        }
+        return;
+    }
+
     if (ethertype != ETH_P_IP) {
-        return;   /* not IPv4, IPv6, or ARP: not handled */
+        return;   /* not IPv4, IPv6, ARP, or MPLS: not handled */
     }
 
     struct ipv4_result ip_result;

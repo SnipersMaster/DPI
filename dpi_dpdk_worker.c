@@ -109,6 +109,7 @@
 #include "dpi_sip_rtp_parser.c"
 #include "dpi_icmp_parser.c"
 #include "dpi_gre_parser.c"
+#include "dpi_mpls_parser.c"
 #include "dpi_smtp_parser.c"
 #include "dpi_arp_parser.c"
 #include "dpi_mqtt_parser.c"
@@ -280,8 +281,43 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+#ifndef RTE_ETHER_TYPE_MPLS
+#define RTE_ETHER_TYPE_MPLS 0x8847   /* unicast; 0x8848 is multicast, checked separately below */
+#endif
+    if (ethertype == RTE_ETHER_TYPE_MPLS || ethertype == 0x8848 /* MPLS multicast */) {
+        /* MPLS decapsulation — like ARP, dispatched directly rather
+         * than through a TCP/UDP branch, since MPLS has no ports and
+         * is identified by EtherType, not an IP protocol number (that
+         * distinction is why it's wired here at the ethertype level
+         * rather than nested inside an IP-protocol branch the way GRE
+         * is — see dpi_mpls_parser.c's header comment). */
+        struct dissect_result mpls_out;
+        bool matched = dispatch_dissection(ip_start, ip_len, 0, "MPLS", &mpls_out);
+        if (matched) {
+            struct flow_log_record rec = {0};
+            const char *inner_src = dissect_result_get(&mpls_out, "mpls_inner_src_ip");
+            const char *inner_dst = dissect_result_get(&mpls_out, "mpls_inner_dst_ip");
+            const char *inner_sni = dissect_result_get(&mpls_out, "mpls_inner_sni");
+            if (inner_src) strncpy(rec.src_ip, inner_src, sizeof(rec.src_ip) - 1);
+            if (inner_dst) strncpy(rec.dst_ip, inner_dst, sizeof(rec.dst_ip) - 1);
+            strncpy(rec.category, "MPLS", sizeof(rec.category) - 1);
+            if (inner_sni) {
+                strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else if (inner_dst) {
+                strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else {
+                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            }
+            log_ring_try_push(queue_id, &rec);
+        }
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ethertype != RTE_ETHER_TYPE_IPV4) {
-        rte_pktmbuf_free(m);   /* not IPv4, IPv6, or ARP: not handled */
+        rte_pktmbuf_free(m);   /* not IPv4, IPv6, ARP, or MPLS: not handled */
         return;
     }
 
