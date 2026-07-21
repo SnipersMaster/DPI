@@ -72,6 +72,15 @@
 #include "dpi_icmp_parser.c"
 #include "dpi_gre_parser.c"
 #include "dpi_mpls_parser.c"
+#include "dpi_ospf_parser.c"
+#include "dpi_igmp_parser.c"
+#include "dpi_rip_parser.c"
+#include "dpi_ssdp_parser.c"
+#include "dpi_syslog_parser.c"
+#include "dpi_mdns_parser.c"
+#include "dpi_bgp_parser.c"
+#include "dpi_ldap_parser.c"
+#include "dpi_ftp_parser.c"
 #include "dpi_smtp_parser.c"
 #include "dpi_arp_parser.c"
 #include "dpi_mqtt_parser.c"
@@ -197,6 +206,8 @@ static void dissect_udp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len);
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result);
 static void dissect_gre_datagram(const struct ipv4_result *ip_result);
+static void dissect_ospf_datagram(const struct ipv4_result *ip_result);
+static void dissect_igmp_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -256,6 +267,60 @@ static void dissect_gre_datagram(const struct ipv4_result *ip_result) {
            protocol_type ? protocol_type : "", inner_src ? inner_src : "",
            inner_dst ? inner_dst : "", inner_sni ? inner_sni : "",
            erspan ? erspan : "false", keepalive ? keepalive : "false");
+}
+
+static void dissect_ospf_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "OSPF", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    const char *version = dissect_result_get(&dissect_out, "ospf_version");
+    const char *type = dissect_result_get(&dissect_out, "ospf_type");
+    const char *router_id = dissect_result_get(&dissect_out, "ospf_router_id");
+    const char *area_id = dissect_result_get(&dissect_out, "ospf_area_id");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"OSPF\","
+           "\"ospf_version\":\"%s\",\"ospf_type\":\"%s\","
+           "\"ospf_router_id\":\"%s\",\"ospf_area_id\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           version ? version : "", type ? type : "",
+           router_id ? router_id : "", area_id ? area_id : "");
+}
+
+static void dissect_igmp_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "IGMP", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    const char *igmp_type = dissect_result_get(&dissect_out, "igmp_type");
+    const char *group = dissect_result_get(&dissect_out, "igmp_group_address");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"IGMP\","
+           "\"igmp_type\":\"%s\",\"igmp_group_address\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           igmp_type ? igmp_type : "", group ? group : "");
 }
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
@@ -372,6 +437,28 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                protocol_type ? protocol_type : "", inner_src ? inner_src : "",
                inner_dst ? inner_dst : "", inner_sni ? inner_sni : "",
                erspan ? erspan : "false", keepalive ? keepalive : "false");
+        return;
+    }
+
+    if (ip6_result.next_header == 89 /* OSPF */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "OSPF", &dissect_out);
+        if (!matched) return;
+
+        const char *version = dissect_result_get(&dissect_out, "ospf_version");
+        const char *type = dissect_result_get(&dissect_out, "ospf_type");
+        const char *router_id = dissect_result_get(&dissect_out, "ospf_router_id");
+        const char *area_id = dissect_result_get(&dissect_out, "ospf_area_id");
+
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"OSPF\","
+               "\"ospf_version\":\"%s\",\"ospf_type\":\"%s\","
+               "\"ospf_router_id\":\"%s\",\"ospf_area_id\":\"%s\"}\n",
+               src_str, dst_str,
+               version ? version : "", type ? type : "",
+               router_id ? router_id : "", area_id ? area_id : "");
         return;
     }
 
@@ -640,13 +727,23 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ip_result.protocol == 89 /* OSPF */) {
+        dissect_ospf_datagram(&ip_result);
+        return;
+    }
+
+    if (ip_result.protocol == 2 /* IGMP */) {
+        dissect_igmp_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, nor ICMP: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, nor IGMP: not handled */
     }
 
     struct tcp_result tcp_result;

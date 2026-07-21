@@ -175,6 +175,15 @@ everything else is not touched by this engine at all yet.
 | Modbus/TCP | Modbus Application Protocol V1.1b3 | `dpi_modbus_parser.c` | MBAP header (transaction ID, unit ID) + function code, with address/quantity or address/value extraction for the most common function codes (Read Coils/Discrete Inputs/Holding Registers/Input Registers, Write Single Coil/Register). Exception responses flagged with their exception code. The first ICS/SCADA protocol in this project — genuinely distinct visibility from everything else built so far. |
 | GRE | RFC 2784, RFC 2890 | `dpi_gre_parser.c` | This project's first true **tunnel decapsulation** protocol beyond GTP — C/K/S flags, optional checksum/key/sequence fields, and recursive dissection of the inner IPv4 or IPv6 payload (addresses, protocol, single-packet TCP SNI), bounded to one level of GRE-in-GRE nesting for the same resource-exhaustion reason as GTP-in-GTP. ERSPAN (Cisco's mirrored-traffic encapsulation) and GRE keepalives are both detected and flagged by name. IP protocol 47, reachable over both IPv4 and IPv6 — needed dedicated capture-path branches (not TCP/UDP-based) in both, same pattern as ICMP/ARP. Verified against 744 real GRE packets from a genuine capture (459 over IPv4, 285 over IPv6) with zero parse failures — see the real-world validation section below for what that process actually caught. |
 | MPLS | RFC 3032 | `dpi_mpls_parser.c` | Bounded label-stack walk (label/TC/S/TTL per entry, up to 8 stacked labels) with decapsulation into the inner IPv4 or IPv6 payload, identified via the standard (but inherent-to-MPLS, not a gap in this dissector) version-nibble heuristic — MPLS itself has no explicit "next protocol" field, stated plainly in the code rather than glossed over. Identified by EtherType (0x8847/0x8848), not an IP protocol number, so it's wired at the ethertype-dispatch level alongside ARP rather than nested inside an IP-protocol branch like GRE. Verified against all 724 real MPLS packets in a genuine capture (100% single-label stacks carrying inner IPv4 in that specific traffic) — multi-label stacking and inner IPv6 are implemented and covered by synthetic seeds, since real production MPLS L3VPN commonly stacks a VPN label under the transport label even though this particular capture didn't exercise that. |
+| OSPF | RFC 2328 (v2), RFC 5340 (v3) | `dpi_ospf_parser.c` | Both OSPFv2 (over IPv4) and OSPFv3 (over IPv6) common headers, message type identification for all 5 types (Hello, DB Description, LS Request, LS Update, LS Ack), and full Hello-body extraction (network mask/interface ID, hello/dead intervals, DR/BDR, up to 4 neighbor router IDs) for both versions — their Hello body layouts genuinely differ (v2 has a network mask field, v3 has an Interface ID instead) and were verified separately against real packets of each. LSA contents within DB Description/LS Update/LS Request aren't decoded further — a substantially larger, separate problem given how many distinct LSA types exist, same "extract the highest-value piece, flag the rest by name" pattern as GTPv2-C's less common IEs. IP protocol 89, needs dedicated capture-path branches like GRE. Verified against all 586 real OSPF packets (278 v2, 308 v3) with zero failures — see the real-world validation section for a bounding bug this process caught (the third instance of the same class of bug in this project). |
+| BGP-4 | RFC 4271 | `dpi_bgp_parser.c` | TCP/port 179, reached through the existing generic TCP dispatch (no capture-path changes needed, unlike GRE/MPLS/OSPF). **Walks every BGP message in a TCP segment, not just the first** — confirmed necessary against real traffic, where 5 of 98 real segments carried more than one concatenated message, including one with 6 UPDATEs back to back. Full field extraction for OPEN (version/AS/hold-time/router ID) and NOTIFICATION (error code/subcode); for UPDATE, withdrawn-route count, the 5 most operationally common path attributes (ORIGIN, AS_PATH length, NEXT_HOP, MULTI_EXIT_DISC, LOCAL_PREF — verified against a real UPDATE including a real 0-length AS_PATH edge case), and up to 4 IPv4 NLRI prefixes. Less common path attributes (COMMUNITY, MP_REACH/UNREACH_NLRI for IPv6, EXTENDED_COMMUNITIES) are walked past correctly but not individually decoded. Verified against all 98 real BGP TCP payloads (119 total messages) with zero failures. |
+| LDAP / CLDAP | RFC 4511 (TCP), RFC 1798 (UDP/CLDAP) | `dpi_ldap_parser.c` | One dissector handling both transports (`detect()` accepts TCP or UDP, unlike most dissectors here) since LDAP and CLDAP share the identical BER-encoded `LDAPMessage` structure. Reuses the exact BER TLV-walking logic already verified for SNMP — confirmed to generalize correctly to a second protocol, including real LDAP traffic's use of the 4-byte extended-length form even for small values (a known Microsoft implementation trait, not malformation). Full field extraction for BindRequest (version + DN — **never the password**, same discipline as RADIUS/SNMP), SearchRequest (base DN + scope), SearchResultEntry (object DN), any `*Response`/`*Done` message (result code), and ExtendedRequest (the request OID, including StartTLS detection). Walks multiple messages per TCP segment like BGP's dissector. **Verified against 14 real CLDAP/UDP packets** (Active Directory DC-discovery "ping" traffic) with zero failures; the TCP path is implemented per RFC 4511 but not verified against real traffic, since this specific capture had none — see the real-world validation section for how that was discovered. |
+| FTP | RFC 959 | `dpi_ftp_parser.c` | Text-based command/response control channel, same shape as SMTP/SIP. Extracts command name and argument for USER/CWD/TYPE/RETR/STOR/PWD, response codes, and flags `AUTH TLS` as a security-relevant signal — matching this project's STARTTLS-for-SMTP/StartTLS-for-LDAP pattern. **`PASS`'s argument is never extracted**, only flagged present — a real plaintext FTP password was visible in this capture's own traffic, confirming this matters rather than being a theoretical concern. Real traffic also revealed a genuine FTPS session (`AUTH TLS` mid-connection, control channel upgraded to encrypted TLS) — the dissector correctly rejects the resulting encrypted bytes as non-FTP (0 false acceptances across all 144 real payloads tested) by validating that data is actually printable ASCII before trusting it, rather than trusting the port alone. One honest, stated coverage gap: multi-line responses (common for `FEAT`) whose continuation lines land at the start of a reassembled buffer aren't recognized in isolation, since this dissector — like SMTP/SIP's — keeps no per-connection state. |
+| IGMP | RFC 1112 (v1), RFC 2236 (v2), RFC 3376 (v3) | `dpi_igmp_parser.c` | Membership Query (including the IGMPv3 query extension — QRV, source count), v1/v2 Membership Reports, Leave Group, and v3 Membership Reports (group record count + first record's type and multicast address). IPv4-only by protocol design (IPv6 uses the separate MLD protocol instead — a real scope boundary, not an oversight). IP protocol 2, needs a dedicated capture-path branch like GRE/OSPF. Verified against all 25 real IGMP packets in a genuine capture — real v3 reports correctly targeted mDNS's own multicast address (224.0.0.251), consistent with mDNS traffic also present in the same capture. |
+| RIP / RIPng | RFC 1058, RFC 2453 (RIP v1/v2), RFC 2080 (RIPng) | `dpi_rip_parser.c` | One dissector for both — they share an identical 4-byte header shape, differing only in route-entry format (IPv4 address+mask for RIP, IPv6 prefix+length for RIPng); the destination port (520 vs 521) is what disambiguates them, since nothing in the header itself does. Extracts command, version, and up to 4 route entries (metric, prefix, next hop for RIP; prefix/length, metric for RIPng). Verified against all 68 real RIPv2 packets and all 124 real RIPng packets — real routes included a default route (`0.0.0.0/0.0.0.0`, `::/0`) and genuine `/64` IPv6 prefixes. |
+| SSDP | UPnP Simple Service Discovery Protocol | `dpi_ssdp_parser.c` | HTTP-like text headers over UDP (port 1900) — M-SEARCH requests, NOTIFY announcements, and search responses. Extracts ST, NT/NTS, LOCATION (the device description URL — often the most useful field), SERVER, and USN. **A real off-by-one string-length bug was caught during verification**: an early draft miscounted `"M-SEARCH * HTTP/1.1"` as 20 characters (it's 19), which silently rejected every one of the 87 real M-SEARCH messages in verification — only the 12 NOTIFY messages passed, and a bare "12/99 detected" result looked like partial success rather than an obvious failure until the method breakdown was checked against what real traffic actually showed. Fixed and re-verified to 99/99. |
+| Syslog | RFC 3164 (BSD, what essentially all real traffic uses), RFC 6587 (reliable TCP transport) | `dpi_syslog_parser.c` | Extracts facility/severity (decoded from the `<PRI>` value) and a bounded message-text preview, over both UDP/514 and TCP/601 — walking multiple LF-delimited messages per buffer per RFC 6587's non-transparent framing. Deliberately doesn't rigidly parse anything past PRI, matching syslog's own free-form design. Verified against 6 real UDP packets (a Cisco device's link-state and ACL logs, using Cisco's own message-tag convention) and 91 real TCP payloads (a Palo Alto firewall's structured TRAFFIC log stream) — two genuinely different real formats, both correctly handled by the same PRI-first, free-form-rest approach. RFC 5424 detection is implemented but wasn't exercised by any real traffic in this capture. |
+| mDNS | RFC 6762 | `dpi_mdns_parser.c` | Reuses `dpi_dns_parser.c`'s wire-format logic directly (mDNS is byte-for-byte the same message format as unicast DNS) rather than reimplementing name decompression a second time — required adding an include guard to the DNS parser file specifically to make that reuse safe. Correctly handles two real mDNS-specific quirks plain DNS never exercises: QDCOUNT can legitimately be 0 (178 of 339 real packets were pure announcements with no question section) and the class field's top bit is repurposed (the "QU bit" on questions, "cache-flush bit" on records) — confirmed real usage of both (18 real QU-bit questions, 41 real cache-flush answers) rather than assumed from the RFC text alone. Real service names extracted correctly, including Apple HomeKit and AirPlay/iTunes control services. |
 | DNP3 | IEEE 1815 | `dpi_dnp3_parser.c` | Data Link Layer (direction, link function, destination/source addresses) plus Transport/Application Layer (FIR/FIN/sequence, application function code) for frames whose user data fits in a single 16-byte block — DNP3 requires a CRC after every 16 bytes, and reassembling data spanning multiple such blocks isn't attempted in this pass (flagged, not silently misparsed). **Verification methodology differs from most of this project**: IEEE 1815 is a paid standard not available to search here, so the field layout was instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other and with an official-looking function-code reference — a genuine discrepancy in a third (blog) source was found and discarded in favor of the two mutually-consistent captures. Header CRC (polynomial 0x3D65) is not verified. |
 | DNS | RFC 1035 | `dpi_dns_parser.c` | Query name (bounds-checked, cycle-safe compression pointer decoding — verified against a cyclic-pointer adversarial test case). **Answer, authority, and additional records all now walked** (A/AAAA/CNAME/NS types), sharing one bounds-checked section-walking function across all three. |
 | MQTT | MQTT v3.1.1/v5 | `dpi_mqtt_parser.c` | CONNECT/CONNACK/PUBLISH/SUBSCRIBE message types, client ID, topic names. TCP-based (or TLS-over-TCP); reachable via the TCP capture path's generic dispatch fallback. |
@@ -282,7 +291,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (27 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (36 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -593,6 +602,111 @@ just descriptions of the logic):**
   specific capture — both are implemented and covered by synthetic
   seeds instead, noted honestly as such in both the code and here
   rather than implied to be real-traffic-verified when they weren't.
+- **OSPF**: all **586** real OSPF packets (278 OSPFv2, 308 OSPFv3)
+  parsed with zero failures across all 5 message types in both
+  versions. This is where a **third instance** of the same class of
+  bug this project keeps finding showed up: a real Hello packet's IP
+  layer said 60 bytes were available, but OSPF's own header said the
+  actual message was only 48 bytes — the remaining 12 were Ethernet/IP
+  padding. Parsing the neighbor list without bounding to OSPF's own
+  length field produced garbage "neighbor router IDs" that were
+  actually just padding bytes. Unlike the two earlier instances (GRE's
+  keepalive miscount, an earlier DNS threshold mismatch), this one was
+  caught and fixed BEFORE writing any C code at all — by that point in
+  this project's real-traffic-verification process, "does this
+  protocol carry its own length field, and am I bounding to it" had
+  become a standing question asked before trusting any result, not an
+  afterthought. `dpi_ospf_parser.c`'s header comment states this as a
+  general principle for exactly that reason.
+- **BGP**: all **98** real BGP TCP payloads (119 total messages,
+  including a real 6-message UPDATE burst in a single segment) parsed
+  with zero failures. This is the first TCP-based protocol in this
+  batch of real-world validation — unlike GRE/MPLS/OSPF it needed no
+  capture-path changes, only registration, since it's reached through
+  the same generic TCP dispatch every other TCP protocol in this
+  project already uses. Confirming that multiple BGP messages commonly
+  arrive concatenated in one TCP segment (5 of the 98 real payloads
+  had more than one) was itself a real finding from this process — a
+  dissector that only looked at the first message per buffer would
+  have silently dropped most of that traffic.
+- **LDAP/CLDAP**: reused the BER TLV-walking logic already verified
+  for SNMP, and confirmed it generalizes correctly against a second
+  real protocol — all **14** real CLDAP/UDP packets (Active Directory
+  DC-discovery "ping" traffic) parsed with zero failures. **A genuine
+  mistake in this project's own protocol survey was caught here**: an
+  earlier count had claimed "723 TCP + 106 UDP" port-389 packets, but
+  this capture actually has ZERO TCP port-389 traffic — the true split
+  is 0 TCP / 14 real CLDAP UDP packets (the 829 total count itself was
+  correct; the TCP/UDP split attributed to it was not). Caught by
+  computing the count two independent ways within a single script and
+  finding zero disagreement at zero TCP matches, rather than trusting
+  either number in isolation. The practical consequence, stated
+  honestly: `dpi_ldap_parser.c`'s TCP code path (the RFC 4511 primary
+  case, and what most real enterprise LDAP traffic actually is) is
+  implemented per spec but was never checked against a real captured
+  TCP LDAP message, since none existed in this capture to check it
+  against.
+- **FTP**: verified against 144 real FTP control-channel payloads,
+  including a complete real login sequence and a real `AUTH TLS`
+  upgrade partway through the connection. The property that actually
+  matters held perfectly: **0 false acceptances** — the dissector
+  never misinterpreted the resulting encrypted TLS bytes (confirmed
+  real TLS Handshake records, byte-for-byte) as FTP commands, across
+  every one of the 144 real payloads. This was designed in from the
+  start after spotting what looked like a garbled 6-character
+  "command" during manual inspection and tracing it to a raw TLS
+  ChangeCipherSpec byte sequence rather than dismissing it. A real
+  plaintext `PASS` command with an actual password value was also
+  present in this traffic — confirmed the dissector's password-hiding
+  behavior against it directly rather than just asserting the
+  discipline in a comment. 5 of 144 payloads exposed an honest,
+  separate coverage gap (multi-line response continuations landing at
+  a buffer's start aren't recognized in isolation) — a real limit,
+  not a safety issue, stated plainly in the code.
+- **IGMP, RIP/RIPng**: verified against all 25 real IGMP packets (4
+  Queries, 6 v1 Reports, 15 v3 Reports) and all 192 real RIP/RIPng
+  packets (68 RIPv2, 124 RIPng) with zero failures across the board.
+  Real IGMPv3 reports correctly targeted mDNS's own multicast address;
+  real RIP/RIPng routes included default routes and genuine prefixes.
+- **SSDP**: this is where a genuine, previously-undetected bug in this
+  project's *own code* was caught, not a bug in a verification script
+  this time. An early draft's `detect()` miscounted the literal string
+  `"M-SEARCH * HTTP/1.1"` as 20 characters — it's 19 — and had a
+  related, inconsistent length check on the NOTIFY branch too. Run
+  against the 99 real SSDP packets, this silently rejected all 87 real
+  M-SEARCH messages, passing only the 12 NOTIFY ones. The result,
+  "12/99 detected," is the kind of number that could easily be
+  mistaken for a capture containing exactly that number of legitimate
+  SSDP messages rather than a bug — it was only caught by checking the
+  *method breakdown* against the real traffic's actual distribution
+  (87 M-SEARCH / 12 NOTIFY) rather than accepting a nonzero detection
+  count as sufficient evidence of correctness. Fixed and re-verified
+  to 99/99 with the correct method split.
+- **Syslog**: verified against two genuinely different real formats in
+  the same capture — 6 real UDP packets from a Cisco device (link-state
+  and IPv6 ACL log messages, using Cisco's own `%FACILITY-SEVERITY-
+  MNEMONIC` message-tag convention) and 91 real TCP payloads from a
+  Palo Alto firewall (a structured CSV-like TRAFFIC log stream) — both
+  100% detected and correctly PRI-decoded. Confirmed the TCP framing
+  is RFC 6587's non-transparent framing (LF-delimited), not octet-
+  counting, by checking real bytes rather than assuming either
+  convention. RFC 5424's stricter format is implemented but wasn't
+  exercised by any real traffic in this capture — stated honestly
+  rather than implied to be equally verified.
+- **mDNS**: reused `dpi_dns_parser.c`'s existing, already-verified name
+  decompression directly rather than reimplementing it — required
+  adding an include guard to that file specifically to make the reuse
+  safe (same pattern as the HPACK decoder's guard from earlier in this
+  project). Verified against all 339 real mDNS packets (161 queries,
+  178 responses) with zero parse errors, and confirmed two genuinely
+  mDNS-specific behaviors against real traffic rather than assuming
+  them from RFC 6762's text alone: 178 of 339 real packets were
+  QDCOUNT=0 pure announcements (something ordinary DNS essentially
+  never does), and the class field's repurposed top bit was seen in
+  real use on both sides — 18 real questions with the "QU bit" set,
+  41 real answers with the "cache-flush bit" set. Real service names
+  decoded correctly, including Apple HomeKit and AirPlay/iTunes
+  control services.
 
 **A second mistake caught during this process** (same failure mode as
 the DNS one below, different root cause): an early GRE verification
@@ -639,7 +753,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **100 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **141 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include

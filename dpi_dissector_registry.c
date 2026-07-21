@@ -257,6 +257,15 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "dnp3",   "DNP3" },
     { "gre",    "GRE" },
     { "mpls",   "MPLS" },
+    { "ospf",   "OSPF" },
+    { "bgp",    "BGP" },
+    { "ldap",   "LDAP" },
+    { "ftp",    "FTP" },
+    { "igmp",   "IGMP" },
+    { "rip",    "RIP" },
+    { "ssdp",   "SSDP" },
+    { "syslog", "Syslog" },
+    { "mdns",   "mDNS" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -383,6 +392,15 @@ static void register_all_dissectors(void) {
     extern void register_dnp3_dissector(void);
     extern void register_gre_dissector(void);
     extern void register_mpls_dissector(void);
+    extern void register_ospf_dissector(void);
+    extern void register_bgp_dissector(void);
+    extern void register_ldap_dissector(void);
+    extern void register_ftp_dissector(void);
+    extern void register_igmp_dissector(void);
+    extern void register_rip_dissector(void);
+    extern void register_ssdp_dissector(void);
+    extern void register_syslog_dissector(void);
+    extern void register_mdns_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -415,6 +433,15 @@ static void register_all_dissectors(void) {
     register_dnp3_dissector();
     register_gre_dissector();
     register_mpls_dissector();
+    register_ospf_dissector();
+    register_bgp_dissector();
+    register_ldap_dissector();
+    register_ftp_dissector();
+    register_igmp_dissector();
+    register_rip_dissector();
+    register_ssdp_dissector();
+    register_syslog_dissector();
+    register_mdns_dissector();
 
     apply_protocol_config_to_registry();
 
