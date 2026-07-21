@@ -80,6 +80,8 @@
 #include "dpi_mdns_parser.c"
 #include "dpi_esp_parser.c"
 #include "dpi_hsrp_parser.c"
+#include "dpi_6in4_parser.c"
+#include "dpi_isakmp_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -211,6 +213,7 @@ static void dissect_gre_datagram(const struct ipv4_result *ip_result);
 static void dissect_ospf_datagram(const struct ipv4_result *ip_result);
 static void dissect_igmp_datagram(const struct ipv4_result *ip_result);
 static void dissect_esp_datagram(const struct ipv4_result *ip_result);
+static void dissect_sixin4_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -349,6 +352,25 @@ static void dissect_esp_datagram(const struct ipv4_result *ip_result) {
            "\"esp_spi\":\"%s\",\"esp_sequence\":\"%s\"}\n",
            src_ip_str, dst_ip_str,
            spi ? spi : "", seq ? seq : "");
+}
+
+static void dissect_sixin4_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "6in4", &dissect_out);
+    if (!matched) return;
+
+    const char *inner_src = dissect_result_get(&dissect_out, "sixin4_inner_src_ip");
+    const char *inner_dst = dissect_result_get(&dissect_out, "sixin4_inner_dst_ip");
+    const char *inner_proto = dissect_result_get(&dissect_out, "sixin4_inner_protocol");
+    const char *inner_sni = dissect_result_get(&dissect_out, "sixin4_inner_sni");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"6in4\","
+           "\"sixin4_inner_protocol\":\"%s\",\"sixin4_inner_sni\":\"%s\"}\n",
+           inner_src ? inner_src : "", inner_dst ? inner_dst : "",
+           inner_proto ? inner_proto : "", inner_sni ? inner_sni : "");
 }
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
@@ -787,13 +809,18 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ip_result.protocol == 41 /* 6in4 */) {
+        dissect_sixin4_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, nor ESP: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, nor 6in4: not handled */
     }
 
     struct tcp_result tcp_result;

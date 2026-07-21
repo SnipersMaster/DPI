@@ -118,6 +118,8 @@
 #include "dpi_mdns_parser.c"
 #include "dpi_esp_parser.c"
 #include "dpi_hsrp_parser.c"
+#include "dpi_6in4_parser.c"
+#include "dpi_isakmp_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -220,6 +222,7 @@ static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uin
 static inline void dissect_ospf_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_igmp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_sixin4_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -371,6 +374,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 41 /* 6in4 */) {
+        dissect_sixin4_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -378,7 +387,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, nor ESP: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, nor 6in4: not handled */
         return;
     }
 
@@ -751,6 +760,39 @@ static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uin
     const char *spi = dissect_result_get(&dissect_out, "esp_spi");
     if (spi) {
         strncpy(rec.app_name, spi, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else {
+        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
+
+static inline void dissect_sixin4_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "6in4", &dissect_out);
+    if (!matched) return;
+
+    struct flow_log_record rec = {0};
+    /* Unlike ESP/IGMP/OSPF (where the outer IPv4 addresses ARE the
+     * meaningful flow endpoints), 6in4's outer addresses are just the
+     * two tunnel routers — the INNER IPv6 addresses are what's
+     * actually communicating, so those are what go in the flow
+     * record, same reasoning as GRE's/MPLS's decapsulation helpers. */
+    const char *inner_src = dissect_result_get(&dissect_out, "sixin4_inner_src_ip");
+    const char *inner_dst = dissect_result_get(&dissect_out, "sixin4_inner_dst_ip");
+    const char *inner_sni = dissect_result_get(&dissect_out, "sixin4_inner_sni");
+    if (inner_src) strncpy(rec.src_ip, inner_src, sizeof(rec.src_ip) - 1);
+    if (inner_dst) strncpy(rec.dst_ip, inner_dst, sizeof(rec.dst_ip) - 1);
+    strncpy(rec.category, "6in4", sizeof(rec.category) - 1);
+    if (inner_sni) {
+        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else if (inner_dst) {
+        strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
         strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
     } else {
         strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
