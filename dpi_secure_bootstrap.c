@@ -84,6 +84,9 @@
 #include "dpi_isakmp_parser.c"
 #include "dpi_ldp_parser.c"
 #include "dpi_eigrp_parser.c"
+#include "dpi_s7comm_parser.c"
+#include "dpi_telnet_parser.c"
+#include "dpi_ah_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -217,6 +220,7 @@ static void dissect_igmp_datagram(const struct ipv4_result *ip_result);
 static void dissect_esp_datagram(const struct ipv4_result *ip_result);
 static void dissect_sixin4_datagram(const struct ipv4_result *ip_result);
 static void dissect_eigrp_datagram(const struct ipv4_result *ip_result);
+static void dissect_ah_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -400,6 +404,30 @@ static void dissect_eigrp_datagram(const struct ipv4_result *ip_result) {
            src_ip_str, dst_ip_str, opcode ? opcode : "", asn ? asn : "");
 }
 
+static void dissect_ah_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "AH", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    const char *spi = dissect_result_get(&dissect_out, "ah_spi");
+    const char *inner_proto = dissect_result_get(&dissect_out, "ah_inner_protocol");
+
+    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"AH\","
+           "\"ah_spi\":\"%s\",\"ah_inner_protocol\":\"%s\"}\n",
+           src_ip_str, dst_ip_str, spi ? spi : "", inner_proto ? inner_proto : "");
+}
+
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -570,6 +598,23 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
         printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"EIGRP\","
                "\"eigrp_opcode\":\"%s\",\"eigrp_asn\":\"%s\"}\n",
                src_str, dst_str, opcode ? opcode : "", asn ? asn : "");
+        return;
+    }
+
+    if (ip6_result.next_header == 51 /* AH */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "AH", &dissect_out);
+        if (!matched) return;
+
+        const char *spi = dissect_result_get(&dissect_out, "ah_spi");
+        const char *inner_proto = dissect_result_get(&dissect_out, "ah_inner_protocol");
+
+        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"AH\","
+               "\"ah_spi\":\"%s\",\"ah_inner_protocol\":\"%s\"}\n",
+               src_str, dst_str, spi ? spi : "", inner_proto ? inner_proto : "");
         return;
     }
 
@@ -863,13 +908,18 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ip_result.protocol == 51 /* AH */) {
+        dissect_ah_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, nor EIGRP: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, nor AH: not handled */
     }
 
     struct tcp_result tcp_result;

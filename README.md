@@ -190,6 +190,8 @@ everything else is not touched by this engine at all yet.
 | ISAKMP/IKE | RFC 2408 (IKEv1), RFC 7296 (IKEv2) | `dpi_isakmp_parser.c` | Full 28-byte fixed-header extraction — initiator/responder SPI, version (correctly distinguishing IKEv1 from IKEv2), exchange type (named), flags, message ID — complementing (not duplicating) `dpi_vpn_detector.c`'s existing IKE structural fingerprinting. Payload contents (SA proposals, key exchange, identification) aren't parsed, same "highest-value piece" scope as OSPF's LSAs. Verified against all 230 real packets with zero length-field mismatches — real traffic was dominated by Aggressive Mode (198 of 230), a real (if less secure) IKEv1 pattern common for PSK-based remote-access VPNs. |
 | LDP | RFC 5036 | `dpi_ldp_parser.c` | The MPLS control-plane protocol distributing the label bindings `dpi_mpls_parser.c`'s data-plane dissector sees on the wire. UDP port 646 for Hello discovery, TCP port 646 for the session (Initialization, KeepAlive, Address, Label Mapping/Request/Withdraw/Release, Notification) — walks multiple messages per buffer like BGP's dissector. Common header (router ID, label space) plus message type for every message; full FEC + label extraction for Label Mapping specifically (the highest-value message type), hand-decoded byte-for-byte against a real message before writing any C: FEC 10.0.0.0/24 → label 3. Verified against 290 real UDP Hello packets (290/290) and 76 real TCP session payloads. **Found a real capture artifact while checking TCP reassembly**: one flow's raw segments included exact duplicate packets and one case of two different payloads claiming the same TCP sequence number — likely an artifact of how this merged capture was assembled, and exactly the class of anomaly `dpi_tcp_flow_reassembly.c`'s overlap-conflict detection exists to handle, not something this dissector needs to account for itself. |
 | EIGRP | Cisco-proprietary (informational RFC 7868) | `dpi_eigrp_parser.c` | Full fixed-header extraction (version, opcode, INIT flag, sequence, ack, ASN) — RFC 7868 documents this shape clearly and it matched real traffic exactly. TLV VALUE contents are deliberately **not** decoded: EIGRP's exact TLV type numbering and internal field layout would need the RFC's precise text in hand to verify with the same confidence as everything else in this project, which wasn't available while writing this — same honest limitation as HSRPv2 and GTPv2-C's Bearer QoS bit-fields elsewhere here. TLVs are still walked correctly for accurate structure/count. IP protocol 88, wired into **both IPv4 and IPv6** — checking specifically (rather than assuming IPv4-only) turned up 62 real IPv6 packets, almost matching the 60 real IPv4 ones. Verified against all 60 real IPv4 packets: 60/60 detected, and critically, the TLV walk consumed exactly the whole buffer with zero trailing bytes across every single packet — strong structural confirmation of the framing logic even without decoding TLV semantics. |
+| S7comm | Siemens-proprietary (no RFC; reverse-engineered by the ICS security community) | `dpi_s7comm_parser.c` | A 3-layer stack — TPKT (RFC 1006) + COTP (ISO 8073 class 0) + S7COMM — over TCP port 102, from a genuine ICS/SCADA capture (`ics.pcapng`). Full header extraction (ROSCTR, PDU reference, parameter/data lengths, error class+code) plus the function code (Setup Communication, Read Var, Write Var — named). The full variable-specification structure within Read/Write Var (S7's own bit-oriented area/DB/address encoding) is deliberately not decoded, same honest scope limit as EIGRP's TLVs. **Caught a real structural detail during verification**: an early check assumed a fixed 10-byte header for every message type, which produced function-code garbage for every single one of 11,058 real Ack-Data messages — the tell was that the garbage count exactly matched that message type's total, not a random subset. The actual fix: Ack-Data carries both a Data Length field and an Error Class+Code pair, making its header 12 bytes, not 10. After the fix, all 22,116 real packets (100%) passed detect/dissect, with every function code pairing up exactly between request and paired response. |
+| Telnet | RFC 854/855 | `dpi_telnet_parser.c` | Walks IAC (0xFF) option-negotiation and subnegotiation sequences correctly (so they aren't misread as literal data) and names the negotiated options; extracts a bounded preview of literal data bytes. Verified against 99 real payloads across two captures — 76 plain-text (including a real captured `"ls\r\n"` command and a real OpenBSD login banner) and 23 IAC sequences, one of which decoded to exactly the standard option set a real Linux/BSD telnet client sends on connect. **A limitation stated plainly rather than glossed over**: unlike this project's other protocols (FTP's `PASS`, RADIUS's `User-Password`, LDAP's bind credential), Telnet has no wire-level field distinguishing a password from any other keystroke — a login sequence is indistinguishable from any other typed text at the protocol level, so the extracted preview may contain credentials if one was captured. This is Telnet's own well-documented security weakness, not a gap in this dissector's carefulness — flagged explicitly so the limitation isn't silently implied away. |
 | DNP3 | IEEE 1815 | `dpi_dnp3_parser.c` | Data Link Layer (direction, link function, destination/source addresses) plus Transport/Application Layer (FIR/FIN/sequence, application function code) for frames whose user data fits in a single 16-byte block — DNP3 requires a CRC after every 16 bytes, and reassembling data spanning multiple such blocks isn't attempted in this pass (flagged, not silently misparsed). **Verification methodology differs from most of this project**: IEEE 1815 is a paid standard not available to search here, so the field layout was instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other and with an official-looking function-code reference — a genuine discrepancy in a third (blog) source was found and discarded in favor of the two mutually-consistent captures. Header CRC (polynomial 0x3D65) is not verified. |
 | DNS | RFC 1035 | `dpi_dns_parser.c` | Query name (bounds-checked, cycle-safe compression pointer decoding — verified against a cyclic-pointer adversarial test case). **Answer, authority, and additional records all now walked** (A/AAAA/CNAME/NS types), sharing one bounds-checked section-walking function across all three. |
 | MQTT | MQTT v3.1.1/v5 | `dpi_mqtt_parser.c` | CONNECT/CONNACK/PUBLISH/SUBSCRIBE message types, client ID, topic names. TCP-based (or TLS-over-TCP); reachable via the TCP capture path's generic dispatch fallback. |
@@ -297,7 +299,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (42 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (44 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -556,7 +558,22 @@ system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
 
-## Real-world validation against a real capture
+## Real-world validation against real captures
+
+This section originally covered validation against a single capture
+(Johannes Weber's "Ultimate PCAP"). The user has since provided 10
+additional real pcaps, including a genuine ICS/SCADA capture
+(`ics.pcapng`, 203,192 packets) and several general-purpose network
+captures from a 2009 monitored network (`net-2009-11-13/14/15`), a
+well-known forensics training capture (`nitroba.pcap`), FTP session
+captures (`set1.pcap`), and others. Findings from these new sources
+are added below, each labeled with which capture it came from —
+`ics.pcapng` in particular turned out to have 87,281 real Modbus
+messages (a large-scale stress test for the existing Modbus
+dissector's correctness, not just a handful of examples — all 87,281
+passed with zero failures, across 4 distinct function codes) and
+22,116 real S7comm packets (Siemens' proprietary PLC protocol,
+previously entirely absent from this project).
 
 Everything above this point had been verified against constructed test
 vectors and RFC/spec examples — never actual captured network traffic.
@@ -766,6 +783,36 @@ just descriptions of the logic):**
   for EIGRP-over-IPv6 — the same check that already paid off for ESP —
   turned up 62 real packets, essentially matching the IPv4 count, so
   both IP versions are wired in.
+- **Modbus, at scale**: the user's uploaded `ics.pcapng` (a genuine
+  ICS/SCADA capture, 203,192 packets) contained 87,281 real Modbus
+  messages — a two-order-of-magnitude larger sample than the original
+  38-packet validation. All 87,281 passed with zero failures, across
+  4 distinct function codes (Read Holding Registers dominant at
+  87,157, plus Write Multiple Registers, Write Multiple Coils, Read
+  Coils). This is the kind of validation scale that can surface rare
+  edge cases a small sample wouldn't — none were found.
+- **S7comm (new protocol)**: verified against all 22,116 real packets
+  in `ics.pcapng` — 100% valid TPKT, 100% COTP DT frames, 100% S7COMM
+  protocol ID confirmed, exactly even Job Request/Ack-Data counts
+  (11,058 each). A real structural detail was caught mid-verification:
+  an early check's fixed 10-byte header assumption produced function-
+  code garbage for literally every Ack-Data message — the exact count
+  match to that message type's total was the signal something was
+  systematically wrong, not a coincidence to explain away. The real
+  fix (Ack-Data has 2 extra bytes for Error Class+Code) made every
+  function code pair up exactly between request and response after
+  correcting it.
+- **Telnet (new protocol, from user-uploaded `telnet.pcap` and
+  `hackersview.pcap`)**: verified against 99 real payloads, 99/99
+  detected with zero dissect crashes. A real IAC negotiation sequence
+  decoded to exactly the option set a genuine Linux/BSD telnet client
+  sends (Suppress-Go-Ahead, Terminal-Type, NAWS, Terminal-Speed,
+  Remote-Flow-Control, Linemode), and real plain-text payloads
+  included an actual OpenBSD login banner and a real typed `ls`
+  command. Documented a genuine, inherent limitation rather than
+  implying a safety guarantee this protocol can't support: Telnet has
+  no structural way to distinguish a password from ordinary keystrokes,
+  unlike every other credential-adjacent protocol in this project.
 
 **A second mistake caught during this process** (same failure mode as
 the DNS one below, different root cause): an early GRE verification
@@ -812,7 +859,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **159 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **167 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include

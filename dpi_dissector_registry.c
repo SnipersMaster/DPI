@@ -272,6 +272,9 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "isakmp", "ISAKMP" },
     { "ldp",    "LDP" },
     { "eigrp",  "EIGRP" },
+    { "s7comm", "S7comm" },
+    { "telnet", "Telnet" },
+    { "ah",     "AH" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -413,6 +416,9 @@ static void register_all_dissectors(void) {
     extern void register_isakmp_dissector(void);
     extern void register_ldp_protocol_dissector(void);
     extern void register_eigrp_dissector(void);
+    extern void register_s7comm_dissector(void);
+    extern void register_telnet_dissector(void);
+    extern void register_ah_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -460,6 +466,9 @@ static void register_all_dissectors(void) {
     register_isakmp_dissector();
     register_ldp_protocol_dissector();
     register_eigrp_dissector();
+    register_s7comm_dissector();
+    register_telnet_dissector();
+    register_ah_dissector();
 
     apply_protocol_config_to_registry();
 
