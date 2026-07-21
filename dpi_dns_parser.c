@@ -33,6 +33,13 @@
  *     contributed to it.
  */
 
+#ifndef DPI_DNS_PARSER_INCLUDED
+#define DPI_DNS_PARSER_INCLUDED
+/* Guard added so this file can be safely #included from more than one
+ * place in the same translation unit — dpi_mdns_parser.c reuses
+ * dns_decode_name() directly (mDNS shares DNS's exact wire format)
+ * rather than duplicating name-decompression logic a second time. */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -332,3 +339,5 @@ static const uint16_t dns_hint_ports[] = { DNS_PORT };
 void register_dns_dissector(void) {
     register_dissector("DNS", dns_detect, dns_dissect, dns_hint_ports, 1);
 }
+
+#endif /* DPI_DNS_PARSER_INCLUDED */
