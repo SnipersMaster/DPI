@@ -83,6 +83,7 @@
 #include "dpi_6in4_parser.c"
 #include "dpi_isakmp_parser.c"
 #include "dpi_ldp_parser.c"
+#include "dpi_eigrp_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"

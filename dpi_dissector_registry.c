@@ -271,6 +271,7 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "sixin4", "6in4" },
     { "isakmp", "ISAKMP" },
     { "ldp",    "LDP" },
+    { "eigrp",  "EIGRP" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -411,6 +412,7 @@ static void register_all_dissectors(void) {
     extern void register_sixin4_dissector(void);
     extern void register_isakmp_dissector(void);
     extern void register_ldp_protocol_dissector(void);
+    extern void register_eigrp_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -457,6 +459,7 @@ static void register_all_dissectors(void) {
     register_sixin4_dissector();
     register_isakmp_dissector();
     register_ldp_protocol_dissector();
+    register_eigrp_dissector();
 
     apply_protocol_config_to_registry();
 
