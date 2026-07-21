@@ -266,6 +266,8 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "ssdp",   "SSDP" },
     { "syslog", "Syslog" },
     { "mdns",   "mDNS" },
+    { "esp",    "ESP" },
+    { "hsrp",   "HSRP" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -401,6 +403,8 @@ static void register_all_dissectors(void) {
     extern void register_ssdp_dissector(void);
     extern void register_syslog_dissector(void);
     extern void register_mdns_dissector(void);
+    extern void register_esp_dissector(void);
+    extern void register_hsrp_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -442,6 +446,8 @@ static void register_all_dissectors(void) {
     register_ssdp_dissector();
     register_syslog_dissector();
     register_mdns_dissector();
+    register_esp_dissector();
+    register_hsrp_dissector();
 
     apply_protocol_config_to_registry();
 

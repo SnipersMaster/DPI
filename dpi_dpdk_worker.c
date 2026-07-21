@@ -116,6 +116,8 @@
 #include "dpi_ssdp_parser.c"
 #include "dpi_syslog_parser.c"
 #include "dpi_mdns_parser.c"
+#include "dpi_esp_parser.c"
+#include "dpi_hsrp_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -217,6 +219,7 @@ static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, ui
 static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ospf_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_igmp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -362,6 +365,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 50 /* ESP */) {
+        dissect_esp_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -369,7 +378,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, nor IGMP: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, nor ESP: not handled */
         return;
     }
 
@@ -719,6 +728,37 @@ static inline void dissect_igmp_datagram(const struct ipv4_result *ip_result, ui
     log_ring_try_push(queue_id, &rec);
 }
 
+static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "ESP", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr >> 24) & 0xFF, (ip_result->src_addr >> 16) & 0xFF,
+             (ip_result->src_addr >> 8) & 0xFF, ip_result->src_addr & 0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr >> 24) & 0xFF, (ip_result->dst_addr >> 16) & 0xFF,
+             (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
+
+    struct flow_log_record rec = {0};
+    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
+    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
+    strncpy(rec.category, "ESP", sizeof(rec.category) - 1);
+    const char *spi = dissect_result_get(&dissect_out, "esp_spi");
+    if (spi) {
+        strncpy(rec.app_name, spi, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else {
+        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
+
 static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -892,6 +932,30 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         const char *type = dissect_result_get(&dissect_out, "ospf_type");
         if (type) {
             strncpy(rec.app_name, type, sizeof(rec.app_name) - 1);
+            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        } else {
+            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        }
+
+        log_ring_try_push(queue_id, &rec);
+        return;
+    }
+
+    if (ip6_result.next_header == 50 /* ESP */) {
+        if (ip6_result.payload_len == 0) return;
+
+        struct dissect_result dissect_out;
+        bool matched = dispatch_dissection(ip6_result.payload, ip6_result.payload_len,
+                                            0, "ESP", &dissect_out);
+        if (!matched) return;
+
+        struct flow_log_record rec = {0};
+        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
+        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        strncpy(rec.category, "ESP", sizeof(rec.category) - 1);
+        const char *spi = dissect_result_get(&dissect_out, "esp_spi");
+        if (spi) {
+            strncpy(rec.app_name, spi, sizeof(rec.app_name) - 1);
             strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
         } else {
             strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
