@@ -90,6 +90,7 @@
 #include "dpi_netbios_parser.c"
 #include "dpi_pop3_parser.c"
 #include "dpi_msnp_parser.c"
+#include "dpi_smb1_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
