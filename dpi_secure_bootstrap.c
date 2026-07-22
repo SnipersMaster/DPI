@@ -87,6 +87,7 @@
 #include "dpi_s7comm_parser.c"
 #include "dpi_telnet_parser.c"
 #include "dpi_ah_parser.c"
+#include "dpi_netbios_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
