@@ -276,6 +276,7 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "telnet", "Telnet" },
     { "ah",     "AH" },
     { "netbios", "NetBIOS" },
+    { "pop3",   "POP3" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -421,6 +422,7 @@ static void register_all_dissectors(void) {
     extern void register_telnet_dissector(void);
     extern void register_ah_dissector(void);
     extern void register_netbios_dissector(void);
+    extern void register_pop3_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -472,6 +474,7 @@ static void register_all_dissectors(void) {
     register_telnet_dissector();
     register_ah_dissector();
     register_netbios_dissector();
+    register_pop3_dissector();
 
     apply_protocol_config_to_registry();
 
