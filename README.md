@@ -304,7 +304,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (49 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (50 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -562,6 +562,48 @@ translation units for simplicity (see the `#include "..."` lines inside
 system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
+
+## 802.11 (WiFi) support — standalone, not yet integrated
+
+`dpi_80211_parser.c` is architecturally different from every other
+file in this project and is called out separately for that reason,
+not folded into the protocols table above. Every other dissector here
+runs over Ethernet framing, reached through `dpi_dpdk_worker.c`'s or
+`dpi_secure_bootstrap.c`'s capture path, which assumes a fixed 14-byte
+Ethernet header and an EtherType field. IEEE 802.11 has no such fixed
+header — frame length and field presence vary by frame type, and even
+the address-field count varies within Data frames. This file is a
+complete, real-traffic-verified MAC-frame parser, but it is **not
+wired into either capture path** — that would need a pcap-linktype
+branch added at the capture path's entry point (checking for
+LINKTYPE_IEEE802_11 = 105) before any 802.11 frame could reach it from
+a live capture. Stated plainly as a real, unfinished integration step,
+not implied to be done.
+
+**What is done**: full Frame Control decode (type/subtype, named;
+Protected Frame bit), address fields, sequence number; SSID extraction
+for Beacon frames; algorithm/sequence/status for Authentication
+frames (correctly deferring to an "encrypted" flag when the Protected
+bit is set, rather than misreading a WEP-encrypted body as plaintext).
+Verified against all 26 real 802.11 frames across 3 genuine captures —
+a complete real WEP Shared-Key authentication handshake. Two real
+findings from that verification: first, one Authentication frame's
+body decoded to nonsensical values until the Protected Frame bit was
+checked — that frame, and only that frame, was WEP-encrypted, its body
+correctly flagged rather than misread once the bit was checked before
+parsing. Second, a "failed" authentication capture's final frame had a
+body that doesn't decode to any real 802.11 algorithm number at all
+(confirmed to be a property of that specific file — byte-for-byte
+identical to the successful sequence's matching frame everywhere
+except the body — not a parsing bug), and this dissector reports
+whatever value is actually present rather than crashing or guessing,
+confirmed against that real anomalous case specifically.
+
+Has its own fuzz harness (`fuzz_80211_parser.c`) and 7 real seeds
+covering every frame type found (Beacon, clean Authentication,
+WEP-encrypted Authentication, the anomalous-body Authentication, ACK,
+Association Request, Data) — built and seeded to the same standard as
+everything else here, despite not being wired in yet.
 
 ## Real-world validation against real captures
 
@@ -959,7 +1001,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **198 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **205 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
