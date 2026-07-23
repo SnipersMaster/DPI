@@ -279,6 +279,8 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "pop3",   "POP3" },
     { "msnp",   "MSNP" },
     { "smb1",   "SMB1" },
+    { "lldp",   "LLDP" },
+    { "kerberos", "Kerberos" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -427,6 +429,8 @@ static void register_all_dissectors(void) {
     extern void register_pop3_dissector(void);
     extern void register_msnp_dissector(void);
     extern void register_smb1_dissector(void);
+    extern void register_lldp_dissector(void);
+    extern void register_kerberos_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -481,6 +485,8 @@ static void register_all_dissectors(void) {
     register_pop3_dissector();
     register_msnp_dissector();
     register_smb1_dissector();
+    register_lldp_dissector();
+    register_kerberos_dissector();
 
     apply_protocol_config_to_registry();
 

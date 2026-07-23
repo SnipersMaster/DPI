@@ -91,6 +91,8 @@
 #include "dpi_pop3_parser.c"
 #include "dpi_msnp_parser.c"
 #include "dpi_smb1_parser.c"
+#include "dpi_lldp_parser.c"
+#include "dpi_kerberos_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -905,8 +907,26 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ethertype == 0x88CC /* LLDP */) {
+        struct dissect_result lldp_out;
+        bool matched = dispatch_dissection((const uint8_t *)payload, (uint16_t)payload_len,
+                                            0, "LLDP", &lldp_out);
+        if (matched) {
+            const char *mac = dissect_result_get(&lldp_out, "lldp_chassis_id_mac");
+            const char *port_id = dissect_result_get(&lldp_out, "lldp_port_id");
+            const char *sys_name = dissect_result_get(&lldp_out, "lldp_system_name");
+            const char *mgmt_ip = dissect_result_get(&lldp_out, "lldp_management_address");
+            printf("{\"protocol\":\"LLDP\",\"lldp_chassis_id_mac\":\"%s\","
+                   "\"lldp_port_id\":\"%s\",\"lldp_system_name\":\"%s\","
+                   "\"lldp_management_address\":\"%s\"}\n",
+                   mac ? mac : "", port_id ? port_id : "",
+                   sys_name ? sys_name : "", mgmt_ip ? mgmt_ip : "");
+        }
+        return;
+    }
+
     if (ethertype != ETH_P_IP) {
-        return;   /* not IPv4, IPv6, ARP, or MPLS: not handled */
+        return;   /* not IPv4, IPv6, ARP, MPLS, or LLDP: not handled */
     }
 
     struct ipv4_result ip_result;

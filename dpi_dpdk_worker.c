@@ -129,6 +129,8 @@
 #include "dpi_pop3_parser.c"
 #include "dpi_msnp_parser.c"
 #include "dpi_smb1_parser.c"
+#include "dpi_lldp_parser.c"
+#include "dpi_kerberos_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -344,8 +346,36 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ethertype == 0x88CC /* LLDP */) {
+        /* Like ARP and MPLS, dispatched directly — LLDP has no IP
+         * header or ports at all, it's a raw Ethernet-frame protocol
+         * identified purely by EtherType. */
+        struct dissect_result lldp_out;
+        bool matched = dispatch_dissection(ip_start, ip_len, 0, "LLDP", &lldp_out);
+        if (matched) {
+            struct flow_log_record rec = {0};
+            const char *mac = dissect_result_get(&lldp_out, "lldp_chassis_id_mac");
+            const char *mgmt_ip = dissect_result_get(&lldp_out, "lldp_management_address");
+            const char *sys_name = dissect_result_get(&lldp_out, "lldp_system_name");
+            if (mac) strncpy(rec.src_ip, mac, sizeof(rec.src_ip) - 1);   /* MAC, not an IP, but this
+                                                                           * is the only stable
+                                                                           * identifier LLDP provides */
+            if (mgmt_ip) strncpy(rec.dst_ip, mgmt_ip, sizeof(rec.dst_ip) - 1);
+            strncpy(rec.category, "LLDP", sizeof(rec.category) - 1);
+            if (sys_name) {
+                strncpy(rec.app_name, sys_name, sizeof(rec.app_name) - 1);
+                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            } else {
+                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            }
+            log_ring_try_push(queue_id, &rec);
+        }
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ethertype != RTE_ETHER_TYPE_IPV4) {
-        rte_pktmbuf_free(m);   /* not IPv4, IPv6, ARP, or MPLS: not handled */
+        rte_pktmbuf_free(m);   /* not IPv4, IPv6, ARP, MPLS, or LLDP: not handled */
         return;
     }
 
