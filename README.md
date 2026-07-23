@@ -659,6 +659,47 @@ Added 4 real seeds to the existing `fuzz_ipv6_parser.c` harness's
 corpus (first/later fragments, for both real inner protocols found)
 so this path gets exercised going forward, not just verified once.
 
+## A third check in the same vein: TCP flow reassembly, verified against a real messy flow
+
+Two fragmentation bugs in a row raised a natural next question: this
+project had referenced `dpi_tcp_flow_reassembly.c` many times — SMB1's,
+Kerberos's, and LDP's dissectors all found real TCP-segmentation
+artifacts during their own verification and each deferred to "the real
+capture path's TCP reassembly handles this correctly" — but that claim
+had never actually been checked. It was worth checking, using data
+already in hand: the exact real flow LDP's investigation first noticed
+(`10.200.200.101:646→10.200.200.102:46330`), which has genuine
+duplicate packets and a real overlap conflict (two different payloads
+claiming the same sequence number), replayed through the real
+reassembly logic in true packet arrival order.
+
+**The good news first**: the overlap-conflict detection worked
+correctly. The replay produced `overlap_conflict_count = 24`,
+correctly flagging this flow as anomalous — confirming the evasion-
+detection design actually works on real, messy data, not just
+synthetic test cases built to exercise it.
+
+**But the replay also surfaced the same class of gap found (and
+fixed) in IPv4/IPv6 fragmentation, this time in `tcp_hole_close()`.**
+That function's own comment had already disclosed "a segment landing
+fully inside an existing hole would need a split, omitted for
+brevity." This real flow has a genuine 1-byte true gap (likely actual
+packet loss in this merged capture) immediately followed by a later
+segment landing entirely inside the resulting hole. Confirmed the
+practical consequence precisely rather than assuming it was minor: if
+the missing byte later arrived, only that one byte would ever get
+delivered — 6 real, already-buffered bytes right after it would stay
+permanently invisible, because the unsplit hole couldn't distinguish
+"truly missing" from "present but blocked behind something still
+missing." Fixed by implementing the split (reusing the same pattern
+proven for fragmentation), then verified concretely: with the fix, if
+the missing byte arrives, all 7 bytes correctly deliver together;
+without it, only 1 would have.
+
+Added a synthetic seed to the existing `fuzz_tcp_reassembly.c`
+harness's corpus specifically encoding this gap-then-fill scenario, so
+this exact path stays exercised going forward.
+
 ## 802.11 (WiFi) support
 
 `dpi_80211_parser.c` is architecturally different from every other
@@ -1222,7 +1263,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **234 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **235 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include

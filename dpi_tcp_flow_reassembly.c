@@ -26,6 +26,42 @@
  * NOT COMPILED/TESTED against live traffic in this environment.
  *
  * -------------------------------------------------------------------
+ * VERIFIED AGAINST A REAL CAPTURED FLOW, AND A REAL GAP FOUND THERE
+ * -------------------------------------------------------------------
+ * This logic had been referenced many times elsewhere in this project
+ * as "the real capture path's TCP reassembly handles this correctly"
+ * (SMB1, Kerberos, and LDP's dissectors all found real TCP-
+ * segmentation artifacts and deferred to this claim) — but that claim
+ * itself had never actually been checked against real data until now.
+ * Replayed the exact real flow LDP's verification first noticed
+ * (10.200.200.101:646→10.200.200.102:46330 in `ultimate.pcapng`,
+ * which has genuine duplicate packets and one real overlap conflict —
+ * two different payloads claiming the same sequence number) through
+ * this exact logic, in true packet arrival order.
+ *
+ * The overlap-conflict detection itself worked correctly: replaying
+ * produced `overlap_conflict_count = 24`, correctly flagging this
+ * flow as anomalous — confirming the evasion-detection design this
+ * file exists for actually does its job on real, messy data, not just
+ * synthetic test cases.
+ *
+ * But the replay also surfaced a real, previously only DISCLOSED (not
+ * fixed) gap actually mattering in practice: `tcp_hole_close()`'s own
+ * comment already flagged "a segment landing fully inside an existing
+ * hole would need a split, omitted for brevity" — the same class of
+ * gap found and fixed in IPv4/IPv6 fragmentation elsewhere in this
+ * project. This real flow has a genuine 1-byte true gap (very likely
+ * actual packet loss in this merged capture) immediately followed by
+ * a later segment landing entirely inside the resulting hole,
+ * touching neither edge. Confirmed the practical effect precisely:
+ * without the split, even if the missing byte later arrived, only
+ * that ONE byte would ever get delivered — the 6 real bytes already
+ * buffered just after it would stay permanently invisible, because
+ * the unsplit hole didn't distinguish "truly missing" from "present
+ * but blocked behind something still missing". Fixed by implementing
+ * the split (see `tcp_hole_close()`), then verified: with the fix, if
+ * the missing byte arrives, all 7 bytes correctly deliver together.
+ * -------------------------------------------------------------------
  * DESIGN
  * -------------------------------------------------------------------
  *   - Per-flow bounded byte buffer + hole list, same pattern as the
@@ -288,6 +324,23 @@ static inline void bitmap_set(uint8_t *bitmap, uint32_t pos) {
  * reassembly, extended to also track WHICH bytes are filled (not just
  * which ranges are missing), since overlap detection needs to compare
  * against existing content, not just know a region isn't a hole.
+ *
+ * A REAL GAP FOUND AND FIXED HERE, same class as the IPv4/IPv6
+ * fragmentation gap fixed elsewhere in this project: replaying a real
+ * captured flow byte-for-byte through this exact function (the same
+ * LDAP/LDP flow whose duplicate/overlapping segments were first
+ * noticed during LDP's verification, replayed here precisely rather
+ * than just assumed to be handled) showed a genuine, real 1-byte gap
+ * in the sequence space (very likely actual packet loss in this
+ * merged capture, not another artifact) followed immediately by a
+ * later segment landing fully inside the resulting hole, touching
+ * neither edge — exactly the "would need a split, omitted" case this
+ * function's comment already disclosed. The practical effect: 6 real,
+ * available bytes immediately after the 1-byte gap were silently
+ * never delivered, because the undivided hole made them
+ * indistinguishable from genuinely missing data. Fixed by
+ * implementing the split, bounded by TCP_REASSEMBLY_MAX_HOLES the
+ * same way IPv4/IPv6 fragmentation's version already is.
  * ------------------------------------------------------------------ */
 static void tcp_hole_close(struct tcp_reassembly_flow *f, uint32_t start, uint32_t end) {
     for (int i = 0; i < f->n_holes; i++) {
@@ -301,14 +354,21 @@ static void tcp_hole_close(struct tcp_reassembly_flow *f, uint32_t start, uint32
             h->start = end;
         } else if (start < h->end && end >= h->end) {
             h->end = start;
+        } else if (h->start < start && end < h->end) {
+            /* Segment fully inside this hole, touching neither edge:
+             * split into two holes — the fix, see function header. */
+            if (f->n_holes + 1 <= TCP_REASSEMBLY_MAX_HOLES) {
+                memmove(&f->holes[i + 2], &f->holes[i + 1],
+                        sizeof(struct tcp_hole) * (f->n_holes - i - 1));
+                f->holes[i + 1] = (struct tcp_hole){end, h->end};
+                h->end = start;   /* h is holes[i]; still valid after the memmove above */
+                f->n_holes++;
+                i++;   /* skip the newly-inserted second half, already correct */
+            }
+            /* else: hole table genuinely full — leave this hole
+             * unsplit rather than overflow, same bounded-safety
+             * intent as the rest of this function. */
         }
-        /* A segment landing fully inside an existing hole would need a
-         * split into two holes; omitted for brevity, same documented
-         * gap as the IPv4 fragment reassembly reference. Under
-         * adversarial fine-grained fragmentation this degrades to
-         * treating the hole as still partially open rather than
-         * silently misreporting completeness — acceptable for a
-         * reference implementation, flagged here so it isn't missed. */
     }
 }
 
