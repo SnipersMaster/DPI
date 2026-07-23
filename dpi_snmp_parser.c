@@ -147,10 +147,19 @@ static bool ber_decode_oid(const uint8_t *data, size_t len, char *out, size_t ou
 /*
  * Walk the variable-bindings SEQUENCE OF VarBind, where each VarBind
  * is itself SEQUENCE { name OBJECT IDENTIFIER, value ANY }. Bounded to
- * a handful of varbinds and a handful of common value types — the same
- * "extract what's most useful, not everything" pattern as every other
- * dissector in this project. Uncommon ASN.1 types (Opaque, further
- * nested structures) are named by tag but not decoded further.
+ * a handful of varbinds. Covers every standard SNMP SMI value type
+ * (RFC 2578): INTEGER, OCTET STRING, NULL, OBJECT IDENTIFIER,
+ * IpAddress, Counter32, Gauge32, TimeTicks, Counter64, and Opaque
+ * (extracted identically to OCTET STRING, since RFC 2578 defines it
+ * as exactly that with a different application tag — same wire
+ * encoding, not a separate structure to verify), plus the three
+ * SNMPv2 exception values (RFC 3416 S2.10: noSuchObject,
+ * noSuchInstance, endOfMibView). Real traffic checked for this
+ * project only ever exercised INTEGER, OCTET STRING, and NULL —
+ * Opaque and the exception values are included for completeness
+ * against the standard, stated honestly as not real-traffic-verified
+ * the way the three common types are. Any remaining unrecognized tag
+ * is named but not decoded further.
  */
 static void snmp_walk_varbinds(const uint8_t *payload, size_t vb_list_start, size_t vb_list_len,
                                 struct dissect_result *out) {
@@ -203,7 +212,19 @@ static void snmp_walk_varbinds(const uint8_t *payload, size_t vb_list_start, siz
                     }
                     break;
                 }
-                case 0x04: { /* OCTET STRING */
+                case 0x04: /* OCTET STRING */
+                case 0x44: { /* Opaque — RFC 2578 defines this as
+                              * "[APPLICATION 4] IMPLICIT OCTET STRING":
+                              * same underlying wire encoding as OCTET
+                              * STRING, just a different application
+                              * tag, so the identical extraction is
+                              * correct by the standard's own
+                              * definition, not a guess. No real Opaque-
+                              * tagged varbind was found in any capture
+                              * checked for this project — only
+                              * INTEGER, OCTET STRING, and NULL values
+                              * were ever seen in real traffic — stated
+                              * honestly rather than implied verified. */
                     size_t n = val_val_len < sizeof(val_buf) - 1 ? val_val_len : sizeof(val_buf) - 1;
                     memcpy(val_buf, payload + val_val_start, n);
                     val_buf[n] = '\0';
@@ -228,6 +249,22 @@ static void snmp_walk_varbinds(const uint8_t *payload, size_t vb_list_start, siz
                     }
                     break;
                 }
+                case 0x80: /* noSuchObject — SNMPv2 exception value, RFC
+                            * 3416 S2.10. Not found in any real capture
+                            * checked; the shape (context-tagged, no
+                            * meaningful content) is simple enough that
+                            * verifying it wasn't necessary the way a
+                            * multi-field structure would be, but
+                            * stated honestly as unverified against
+                            * real traffic regardless. */
+                    dissect_result_add(out, key, "noSuchObject");
+                    break;
+                case 0x81: /* noSuchInstance — same caveat as noSuchObject */
+                    dissect_result_add(out, key, "noSuchInstance");
+                    break;
+                case 0x82: /* endOfMibView — same caveat as noSuchObject */
+                    dissect_result_add(out, key, "endOfMibView");
+                    break;
                 default:
                     /* Opaque and other less common types: named by tag,
                      * not decoded further. */

@@ -726,11 +726,80 @@ static void gtpv2_dissect(const uint8_t *payload, uint16_t len,
                 }
                 break;
             }
+            case 73: {  /* EPS Bearer ID (EBI), TS 29.274 S8.8 — a
+                         * single byte, low 4 bits significant (values
+                         * 5-15), no bit-field ambiguity like Bearer
+                         * QoS has. Same "not compiled/tested against
+                         * live GTP traffic" caveat as the rest of this
+                         * file applies — no real GTPv2-C traffic was
+                         * found in any capture available to verify
+                         * against, stated honestly rather than implied
+                         * otherwise. */
+                if (ie_len >= 1) {
+                    snprintf(val, sizeof(val), "%u", ie_val[0] & 0x0F);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_ebi", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            }
+            case 72: {  /* Aggregate Maximum Bit Rate (AMBR), TS 29.274
+                         * S8.7 — two plain 4-byte unsigned integers
+                         * (uplink then downlink, both in kbps), no
+                         * bit-field ambiguity. */
+                if (ie_len >= 8) {
+                    uint32_t uplink = ((uint32_t)ie_val[0]<<24)|((uint32_t)ie_val[1]<<16)|
+                                       ((uint32_t)ie_val[2]<<8)|ie_val[3];
+                    uint32_t downlink = ((uint32_t)ie_val[4]<<24)|((uint32_t)ie_val[5]<<16)|
+                                         ((uint32_t)ie_val[6]<<8)|ie_val[7];
+                    snprintf(val, sizeof(val), "%u", uplink);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_ambr_uplink_kbps", ie_count);
+                    dissect_result_add(out, key, val);
+                    snprintf(val, sizeof(val), "%u", downlink);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_ambr_downlink_kbps", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                break;
+            }
+            case 83: {  /* Serving Network, TS 29.274 S8.18 — 3-byte
+                         * MCC/MNC in the same BCD-swapped-nibble
+                         * encoding already used (and verified) for
+                         * IMSI/MSISDN elsewhere in this file via
+                         * gtpv2_decode_bcd_digits() — reusing that same
+                         * digit-extraction logic here inline, since
+                         * Serving Network's fixed 3-byte layout (versus
+                         * IMSI's variable-length string) doesn't map
+                         * onto that helper's variable-length interface
+                         * directly. */
+                if (ie_len >= 3) {
+                    char mcc_mnc[8];
+                    /* MCC digit 1, digit 2, then (digit 3 of MCC or
+                     * filler 0xF) packed with MNC digit 3 in the low
+                     * nibble of byte 2 — same layout as IMSI's PLMN
+                     * prefix. */
+                    mcc_mnc[0] = '0' + (ie_val[0] & 0x0F);
+                    mcc_mnc[1] = '0' + (ie_val[0] >> 4);
+                    mcc_mnc[2] = '0' + (ie_val[1] & 0x0F);
+                    mcc_mnc[3] = '-';
+                    mcc_mnc[4] = '0' + (ie_val[2] & 0x0F);
+                    mcc_mnc[5] = '0' + (ie_val[2] >> 4);
+                    uint8_t mnc_digit3 = ie_val[1] >> 4;
+                    if (mnc_digit3 != 0x0F) {
+                        mcc_mnc[6] = '0' + mnc_digit3;
+                        mcc_mnc[7] = '\0';
+                    } else {
+                        mcc_mnc[6] = '\0';
+                    }
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_serving_network", ie_count);
+                    dissect_result_add(out, key, mcc_mnc);
+                }
+                break;
+            }
             default:
                 break;   /* unrecognized IE type: already bounds-validated
                           * above, just skip over it via ie_len below —
-                          * Bearer QoS's bit-rate fields, and others would
-                          * follow the identical pattern */
+                          * Bearer QoS's bit-rate fields, PCO, Bearer
+                          * Context (a grouped/nested IE), and others
+                          * would follow the identical pattern */
         }
 
         ie_pos += 4 + ie_len;

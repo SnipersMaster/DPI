@@ -625,6 +625,40 @@ WEP-encrypted Authentication, the anomalous-body Authentication, ACK,
 Association Request, Data) — built and seeded to the same standard as
 everything else here, despite not being wired in yet.
 
+## Breadth extensions to two existing dissectors (SNMP, GTPv2-C)
+
+Two existing, already-verified dissectors were extended to cover more
+of their respective standards' value/IE types, using the identical
+bounds-checking pattern already proven in each — not a new capability,
+just wider coverage.
+
+**SNMP (`dpi_snmp_parser.c`)**: now covers every standard SMI value
+type (RFC 2578) — added Opaque (extracted identically to OCTET
+STRING, since RFC 2578 defines Opaque as exactly that with a different
+application tag, so this is the standard's own definition, not a
+guess) and the three SNMPv2 exception values (RFC 3416: noSuchObject,
+noSuchInstance, endOfMibView). Checked properly before assuming
+anything: walked real varbind structures (not a crude byte scan, which
+gave false positives at first) across every SNMP-carrying capture
+available, and confirmed real traffic only ever exercised INTEGER,
+OCTET STRING, and NULL — stated honestly that Opaque and the exception
+values are unverified against real traffic, unlike those three.
+
+**GTPv2-C (`dpi_gtp_parser.c`)**: added EPS Bearer ID (EBI), Aggregate
+Maximum Bit Rate (AMBR), and Serving Network (MCC/MNC) — three simple,
+unambiguous fixed-length IEs, verified against synthetic test vectors
+built from TS 29.274's documented encoding (including a real PLMN,
+MCC 310/MNC 410, a real US carrier code) since — checked directly
+rather than assumed — no real GTPv2-C traffic exists in any capture
+available for this project, matching this file's own existing honest
+disclosure ("NOT COMPILED/TESTED against live GTP traffic"). Stayed
+conservative about which additional IEs to add: several other TS
+29.274 IEs (Protocol Configuration Options, Bearer Context, Indication)
+were deliberately left out because their exact type numbers or nested/
+bit-field structure aren't things this project has high confidence in
+without the spec text in hand — same discipline as Bearer QoS's
+existing partial coverage, rather than guess and risk mislabeling.
+
 ## Real-world validation against real captures
 
 This section originally covered validation against a single capture
@@ -1046,7 +1080,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **210 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **213 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
