@@ -563,22 +563,40 @@ system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
 
-## 802.11 (WiFi) support — standalone, not yet integrated
+## 802.11 (WiFi) support
 
 `dpi_80211_parser.c` is architecturally different from every other
 file in this project and is called out separately for that reason,
-not folded into the protocols table above. Every other dissector here
-runs over Ethernet framing, reached through `dpi_dpdk_worker.c`'s or
-`dpi_secure_bootstrap.c`'s capture path, which assumes a fixed 14-byte
-Ethernet header and an EtherType field. IEEE 802.11 has no such fixed
-header — frame length and field presence vary by frame type, and even
-the address-field count varies within Data frames. This file is a
-complete, real-traffic-verified MAC-frame parser, but it is **not
-wired into either capture path** — that would need a pcap-linktype
-branch added at the capture path's entry point (checking for
-LINKTYPE_IEEE802_11 = 105) before any 802.11 frame could reach it from
-a live capture. Stated plainly as a real, unfinished integration step,
-not implied to be done.
+not folded into the protocols table above (it isn't a
+`protocols.ini`-registered, `dispatch_dissection()`-reached protocol
+the way everything else is — it operates at the link layer, one level
+below where the rest of this project starts). Every other dissector
+here runs over Ethernet framing, assumed at the capture path's entry
+point (`struct rte_ether_hdr`, a fixed 14-byte header, an EtherType
+field). IEEE 802.11 has no such fixed header — frame length and field
+presence vary by frame type, and even the address-field count varies
+within Data frames.
+
+**Integration status, stated precisely**:
+- `dpi_secure_bootstrap.c` **now calls this dissector**, via an opt-in
+  `--link-type=80211` command-line flag
+  (`./bootstrap <interface> --link-type=80211`), for when the program
+  is pointed at a monitor-mode wireless interface rather than a normal
+  wired one. This works because an AF_PACKET raw socket (what this
+  file already uses to capture) delivers whatever link-layer frames
+  the bound interface actually produces — a monitor-mode WiFi
+  interface produces raw 802.11 frames over that exact same mechanism,
+  which is how tools like tcpdump capture wireless traffic on Linux.
+  Default behavior (no flag) is unchanged: still Ethernet, so this is
+  purely additive.
+- `dpi_dpdk_worker.c` does **not** call this dissector, and that's a
+  deliberate, permanent architectural choice, not a missing step:
+  DPDK's poll-mode-driver model targets wired NIC hardware directly
+  (10/25/40/100G Ethernet adapters) and has no realistic path to
+  receive raw 802.11 frames from a wireless adapter — monitor-mode
+  WiFi capture goes through Linux's mac80211/cfg80211 kernel
+  subsystem, an entirely different mechanism DPDK doesn't touch.
+  There's no meaningful "integrate into DPDK" step left undone here.
 
 **What is done**: full Frame Control decode (type/subtype, named;
 Protected Frame bit), address fields, sequence number; SSID extraction

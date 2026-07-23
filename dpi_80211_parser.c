@@ -8,14 +8,27 @@
  * 802.11 has no such fixed header: frame length and field presence
  * vary by frame type (Management/Control/Data), and even the address-
  * field count varies within Data frames depending on the ToDS/FromDS
- * bits. This file is a self-contained MAC-frame parser; it is NOT
- * wired into `dpi_dpdk_worker.c`/`dpi_secure_bootstrap.c`'s capture
- * paths, both of which are hardcoded to Ethernet and would need a
- * pcap-linktype branch added at their entry point (checking for
- * LINKTYPE_IEEE802_11 = 105, confirmed via real capture files' global
- * headers) before this dissector could be reached from a live
- * capture — stated plainly as a real, unfinished integration step
- * rather than implied to be wired in already.
+ * bits.
+ *
+ * INTEGRATION STATUS, stated precisely rather than left vague:
+ *   - `dpi_secure_bootstrap.c` (the AF_PACKET raw-socket capture path)
+ *     NOW calls this dissector, via an opt-in `--link-type=80211`
+ *     command-line flag, for when the program is pointed at a
+ *     monitor-mode wireless interface instead of a normal wired one —
+ *     an AF_PACKET raw socket delivers whatever link-layer frames the
+ *     bound interface actually produces, and a monitor-mode WiFi
+ *     interface produces raw 802.11 frames, the same mechanism tools
+ *     like tcpdump use to capture wireless traffic on Linux. Default
+ *     behavior (no flag) is unchanged: still Ethernet.
+ *   - `dpi_dpdk_worker.c` does NOT call this dissector, and that's a
+ *     deliberate, permanent architectural choice, not a missing step:
+ *     DPDK's poll-mode-driver model targets wired NIC hardware
+ *     directly (10/25/40/100G Ethernet adapters) and has no realistic
+ *     path to receive raw 802.11 frames from a wireless adapter —
+ *     monitor-mode WiFi capture goes through Linux's mac80211/
+ *     cfg80211 kernel subsystem, an entirely different mechanism DPDK
+ *     doesn't touch. There's no meaningful "integrate 802.11 into
+ *     DPDK" step left undone here.
  *
  * NOT COMPILED/TESTED in this environment.
  *

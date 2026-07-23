@@ -91,6 +91,15 @@
 #include "dpi_pop3_parser.c"
 #include "dpi_msnp_parser.c"
 #include "dpi_smb1_parser.c"
+/* 802.11 is a genuinely different link layer from everything else
+ * this file processes — see dpi_80211_parser.c's own header comment.
+ * Included here specifically to support the optional --link-type=80211
+ * mode added to main() below, for when this program is pointed at a
+ * monitor-mode wireless interface (which delivers raw 802.11 frames
+ * over the same AF_PACKET raw-socket mechanism used for Ethernet —
+ * confirmed by how tools like tcpdump capture wireless traffic on
+ * Linux) rather than a normal wired one. */
+#include "dpi_80211_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -788,6 +797,34 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
     /* Other next_header values: not handled. */
 }
 
+static void parse_80211_frame(const unsigned char *buf, ssize_t len) {
+    if (len < 0) return;
+
+    struct dissect_result dissect_out;
+    dot11_dissect_frame((const uint8_t *)buf, (size_t)len, &dissect_out);
+
+    const char *type = dissect_result_get(&dissect_out, "dot11_type");
+    const char *subtype = dissect_result_get(&dissect_out, "dot11_subtype");
+    const char *addr1 = dissect_result_get(&dissect_out, "dot11_addr1");
+    const char *addr2 = dissect_result_get(&dissect_out, "dot11_addr2");
+    const char *addr3 = dissect_result_get(&dissect_out, "dot11_addr3");
+    const char *ssid = dissect_result_get(&dissect_out, "dot11_beacon_ssid");
+    const char *auth_algo = dissect_result_get(&dissect_out, "dot11_auth_algorithm");
+    const char *auth_status = dissect_result_get(&dissect_out, "dot11_auth_status");
+    const char *auth_encrypted = dissect_result_get(&dissect_out, "dot11_auth_encrypted");
+
+    if (!type) return;   /* header too short to even parse — see dot11_parse_header */
+
+    printf("{\"link_type\":\"802.11\",\"dot11_type\":\"%s\",\"dot11_subtype\":\"%s\","
+           "\"addr1\":\"%s\",\"addr2\":\"%s\",\"addr3\":\"%s\","
+           "\"beacon_ssid\":\"%s\",\"auth_algorithm\":\"%s\","
+           "\"auth_status\":\"%s\",\"auth_encrypted\":\"%s\"}\n",
+           type, subtype ? subtype : "",
+           addr1 ? addr1 : "", addr2 ? addr2 : "", addr3 ? addr3 : "",
+           ssid ? ssid : "", auth_algo ? auth_algo : "",
+           auth_status ? auth_status : "", auth_encrypted ? auth_encrypted : "");
+}
+
 static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     if (len < ETH_HDR_LEN) {
         /* Too short to even contain an Ethernet header. Drop, don't guess. */
@@ -1078,12 +1115,26 @@ static void bootstrap_signal_handler(int signum) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <interface>\n", argv[0]);
+    bool link_type_80211 = false;
+    const char *ifname = NULL;
+
+    /* Optional second argument: --link-type=80211, for when this
+     * program is pointed at a monitor-mode wireless interface rather
+     * than a normal wired one — see the include comment above for why
+     * that changes what recv() actually returns. Defaults to Ethernet
+     * (the existing, unchanged behavior) if not specified, so this is
+     * purely additive and doesn't change any existing invocation. */
+    if (argc == 2) {
+        ifname = argv[1];
+    } else if (argc == 3 && strcmp(argv[2], "--link-type=80211") == 0) {
+        ifname = argv[1];
+        link_type_80211 = true;
+    } else {
+        fprintf(stderr, "usage: %s <interface> [--link-type=80211]\n", argv[0]);
         return 1;
     }
 
-    int sock = open_capture_socket(argv[1]);
+    int sock = open_capture_socket(ifname);
     if (sock < 0) return 1;
 
     if (drop_privileges(UNPRIV_USER) != 0) {
@@ -1117,7 +1168,11 @@ int main(int argc, char **argv) {
             perror("recv");
             break;
         }
-        parse_ethernet_frame(buf, n);
+        if (link_type_80211) {
+            parse_80211_frame(buf, n);
+        } else {
+            parse_ethernet_frame(buf, n);
+        }
     }
 
     close(sock);
