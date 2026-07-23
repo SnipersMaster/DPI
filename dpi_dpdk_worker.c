@@ -131,6 +131,7 @@
 #include "dpi_smb1_parser.c"
 #include "dpi_lldp_parser.c"
 #include "dpi_kerberos_parser.c"
+#include "dpi_l2tpv3_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -236,6 +237,7 @@ static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uin
 static inline void dissect_sixin4_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_eigrp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ah_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -433,6 +435,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 115 /* L2TPv3 */) {
+        dissect_l2tpv3_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -440,7 +448,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, nor AH: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, nor L2TPv3: not handled */
         return;
     }
 
@@ -813,6 +821,49 @@ static inline void dissect_ah_datagram(const struct ipv4_result *ip_result, uint
     const char *inner_proto = dissect_result_get(&dissect_out, "ah_inner_protocol");
     if (inner_proto) {
         strncpy(rec.app_name, inner_proto, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else {
+        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
+
+static inline void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "L2TPv3", &dissect_out);
+    if (!matched) return;
+
+    struct flow_log_record rec = {0};
+    /* Like GRE/6in4's decapsulation, the outer IPv4 addresses are just
+     * the two tunnel endpoints — the inner addresses are what's
+     * actually communicating. Prefer inner IP if the tunneled frame
+     * carried one (plain IPv4); fall back to inner MACs otherwise
+     * (MPLS/Loopback payloads, confirmed real but not IP-addressed). */
+    const char *inner_src_ip = dissect_result_get(&dissect_out, "l2tpv3_inner_src_ip");
+    const char *inner_dst_ip = dissect_result_get(&dissect_out, "l2tpv3_inner_dst_ip");
+    const char *inner_src_mac = dissect_result_get(&dissect_out, "l2tpv3_inner_src_mac");
+    const char *inner_dst_mac = dissect_result_get(&dissect_out, "l2tpv3_inner_dst_mac");
+    const char *inner_sni = dissect_result_get(&dissect_out, "l2tpv3_inner_sni");
+    const char *inner_proto = dissect_result_get(&dissect_out, "l2tpv3_inner_protocol");
+
+    if (inner_src_ip) strncpy(rec.src_ip, inner_src_ip, sizeof(rec.src_ip) - 1);
+    else if (inner_src_mac) strncpy(rec.src_ip, inner_src_mac, sizeof(rec.src_ip) - 1);
+    if (inner_dst_ip) strncpy(rec.dst_ip, inner_dst_ip, sizeof(rec.dst_ip) - 1);
+    else if (inner_dst_mac) strncpy(rec.dst_ip, inner_dst_mac, sizeof(rec.dst_ip) - 1);
+    strncpy(rec.category, "L2TPv3", sizeof(rec.category) - 1);
+
+    if (inner_sni) {
+        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else if (inner_proto) {
+        strncpy(rec.app_name, inner_proto, sizeof(rec.app_name) - 1);
+        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    } else if (inner_dst_ip) {
+        strncpy(rec.app_name, inner_dst_ip, sizeof(rec.app_name) - 1);
         strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
     } else {
         strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);

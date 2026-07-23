@@ -93,6 +93,7 @@
 #include "dpi_smb1_parser.c"
 #include "dpi_lldp_parser.c"
 #include "dpi_kerberos_parser.c"
+#include "dpi_l2tpv3_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -236,6 +237,7 @@ static void dissect_esp_datagram(const struct ipv4_result *ip_result);
 static void dissect_sixin4_datagram(const struct ipv4_result *ip_result);
 static void dissect_eigrp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ah_datagram(const struct ipv4_result *ip_result);
+static void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -441,6 +443,31 @@ static void dissect_ah_datagram(const struct ipv4_result *ip_result) {
     printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"protocol\":\"AH\","
            "\"ah_spi\":\"%s\",\"ah_inner_protocol\":\"%s\"}\n",
            src_ip_str, dst_ip_str, spi ? spi : "", inner_proto ? inner_proto : "");
+}
+
+static void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "L2TPv3", &dissect_out);
+    if (!matched) return;
+
+    const char *inner_src_ip = dissect_result_get(&dissect_out, "l2tpv3_inner_src_ip");
+    const char *inner_dst_ip = dissect_result_get(&dissect_out, "l2tpv3_inner_dst_ip");
+    const char *inner_src_mac = dissect_result_get(&dissect_out, "l2tpv3_inner_src_mac");
+    const char *inner_dst_mac = dissect_result_get(&dissect_out, "l2tpv3_inner_dst_mac");
+    const char *session_id = dissect_result_get(&dissect_out, "l2tpv3_session_id");
+    const char *inner_proto = dissect_result_get(&dissect_out, "l2tpv3_inner_protocol");
+    const char *inner_sni = dissect_result_get(&dissect_out, "l2tpv3_inner_sni");
+
+    printf("{\"protocol\":\"L2TPv3\",\"l2tpv3_session_id\":\"%s\","
+           "\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_mac\":\"%s\",\"dst_mac\":\"%s\","
+           "\"inner_protocol\":\"%s\",\"inner_sni\":\"%s\"}\n",
+           session_id ? session_id : "",
+           inner_src_ip ? inner_src_ip : "", inner_dst_ip ? inner_dst_ip : "",
+           inner_src_mac ? inner_src_mac : "", inner_dst_mac ? inner_dst_mac : "",
+           inner_proto ? inner_proto : "", inner_sni ? inner_sni : "");
 }
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
@@ -974,13 +1001,18 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ip_result.protocol == 115 /* L2TPv3 */) {
+        dissect_l2tpv3_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, nor AH: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, nor L2TPv3: not handled */
     }
 
     struct tcp_result tcp_result;
