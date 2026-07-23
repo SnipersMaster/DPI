@@ -837,6 +837,18 @@ just descriptions of the logic):**
   not misparsed) rather than crash. Also found a real VLAN-tagged
   gratuitous ARP reply, traced through `dpi_arp_parser.c`'s exact field
   offsets successfully.
+
+  **Stated explicitly rather than left ambiguous**: every single one
+  of those 16,371 frames was single-tagged. A dedicated check across
+  every pcap available to this project (10 files, including the two
+  largest) found **zero real double-tagged (QinQ, 802.1ad) frames**
+  anywhere. The double-tag stripping path exists, is bounded the same
+  way the rest of this project's nested/recursive logic is, and reuses
+  the same tag-parsing code path already proven correct on 16,371 real
+  single tags — but it has no real-traffic verification of its own,
+  and that shouldn't be allowed to blend into the 16,371 figure by
+  implication. Flagged here so it can't be mistaken for something it
+  isn't.
 - **Modbus/TCP**: all **38** real Modbus payloads in the capture
   accepted by `modbus_detect()`'s logic, exercising **8 different
   function codes** in real traffic (Read Coils, Read Discrete Inputs,
