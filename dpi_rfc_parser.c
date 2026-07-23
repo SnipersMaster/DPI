@@ -181,6 +181,65 @@ struct frag_hole {
     uint16_t end;    /* exclusive */
 };
 
+/* Shared hole-list update core, used by both IPv4's and IPv6's
+ * fragment reassembly (the algorithm itself doesn't depend on which
+ * IP version is involved, only the flow-key lookup around it does —
+ * extracted here specifically so the two known, real, verified fixes
+ * below (see the header comment on the caller) live in exactly one
+ * place rather than being duplicated and risking drifting out of
+ * sync with each other). Updates `holes`/`*n_holes` in place for a
+ * newly-inserted fragment spanning from frag_off up to (but not
+ * including) frag_end, then clips
+ * against `total_len` if it's already known (non-zero). Returns true
+ * if this closes out the last hole (reassembly complete). */
+static bool frag_holes_update(struct frag_hole *holes, int *n_holes,
+                               uint16_t frag_off, uint16_t frag_end,
+                               uint16_t total_len) {
+    for (int i = 0; i < *n_holes; i++) {
+        struct frag_hole *h = &holes[i];
+        if (frag_off <= h->start && frag_end >= h->end) {
+            /* fragment fully covers this hole */
+            memmove(&holes[i], &holes[i + 1],
+                    sizeof(struct frag_hole) * (*n_holes - i - 1));
+            (*n_holes)--;
+            i--;
+        } else if (frag_off <= h->start && frag_end > h->start) {
+            h->start = frag_end;
+        } else if (frag_off < h->end && frag_end >= h->end) {
+            h->end = frag_off;
+        } else if (h->start < frag_off && frag_end < h->end) {
+            /* Fragment fully inside this hole, touching neither edge:
+             * split into two holes. */
+            if (*n_holes + 1 <= FRAG_MAX_HOLES) {
+                memmove(&holes[i + 2], &holes[i + 1],
+                        sizeof(struct frag_hole) * (*n_holes - i - 1));
+                holes[i + 1] = (struct frag_hole){frag_end, h->end};
+                h->end = frag_off;   /* h is holes[i]; still valid after the memmove above */
+                (*n_holes)++;
+                i++;   /* skip the newly-inserted second half, already correct */
+            }
+            /* else: hole table genuinely full — leave this hole
+             * unsplit rather than overflow, same bounded-safety
+             * intent as the rest of this function. */
+        }
+    }
+
+    /* Once the real datagram length is known, discard/clip any hole
+     * that represents unclaimed buffer space beyond it rather than
+     * real missing data. */
+    if (total_len != 0) {
+        int w = 0;
+        for (int i = 0; i < *n_holes; i++) {
+            if (holes[i].start >= total_len) continue;   /* not real: drop */
+            if (holes[i].end > total_len) holes[i].end = total_len;
+            holes[w++] = holes[i];
+        }
+        *n_holes = w;
+    }
+
+    return total_len != 0 && *n_holes == 0;
+}
+
 struct frag_entry {
     bool     in_use;
     uint32_t src_addr, dst_addr;
@@ -267,54 +326,10 @@ static bool frag_insert(struct frag_entry *e, uint16_t frag_off_bytes,
         e->total_len = frag_off_bytes + data_len;
     }
 
-    /* Close the hole this fragment fills. Reference implementation:
-     * linear scan/update, adequate for FRAG_MAX_HOLES=64. A production
-     * version under adversarial fragmentation needs this bounded more
-     * carefully (an attacker can try to maximize hole-list churn). */
     uint16_t frag_end = frag_off_bytes + data_len;
-    for (int i = 0; i < e->n_holes; i++) {
-        struct frag_hole *h = &e->holes[i];
-        if (frag_off_bytes <= h->start && frag_end >= h->end) {
-            /* fragment fully covers this hole */
-            memmove(&e->holes[i], &e->holes[i + 1],
-                    sizeof(struct frag_hole) * (e->n_holes - i - 1));
-            e->n_holes--;
-            i--;
-        } else if (frag_off_bytes <= h->start && frag_end > h->start) {
-            h->start = frag_end;
-        } else if (frag_off_bytes < h->end && frag_end >= h->end) {
-            h->end = frag_off_bytes;
-        } else if (h->start < frag_off_bytes && frag_end < h->end) {
-            /* Fragment fully inside this hole, touching neither edge:
-             * split into two holes. Fix #2, see function header. */
-            if (e->n_holes + 1 <= FRAG_MAX_HOLES) {
-                memmove(&e->holes[i + 2], &e->holes[i + 1],
-                        sizeof(struct frag_hole) * (e->n_holes - i - 1));
-                e->holes[i + 1] = (struct frag_hole){frag_end, h->end};
-                h->end = frag_off_bytes;   /* h is holes[i]; still valid after the memmove above */
-                e->n_holes++;
-                i++;   /* skip the newly-inserted second half, already correct */
-            }
-            /* else: hole table genuinely full — leave this hole
-             * unsplit rather than overflow, same bounded-safety
-             * intent as the rest of this function. */
-        }
-    }
-
-    /* Fix #1, see function header: once the real datagram length is
-     * known, discard/clip any hole that represents unclaimed buffer
-     * space beyond it rather than real missing data. */
-    if (e->total_len != 0) {
-        int w = 0;
-        for (int i = 0; i < e->n_holes; i++) {
-            if (e->holes[i].start >= e->total_len) continue;   /* not real: drop */
-            if (e->holes[i].end > e->total_len) e->holes[i].end = e->total_len;
-            e->holes[w++] = e->holes[i];
-        }
-        e->n_holes = w;
-    }
-
-    if (e->total_len != 0 && e->n_holes == 0) {
+    bool complete = frag_holes_update(e->holes, &e->n_holes, frag_off_bytes,
+                                       frag_end, e->total_len);
+    if (complete) {
         *out_len = e->total_len;
         return true;
     }

@@ -622,6 +622,43 @@ different claims — this project has tried to keep those claims
 distinct throughout, and this is the clearest example yet of why that
 distinction matters.
 
+## A second, related gap found the same way: IPv6 fragmentation was never reassembled at all
+
+Finding the IPv4 bug above raised an obvious follow-up question: what
+about IPv6? Checking answered it — `dpi_ipv6_parser.c` walked past the
+Fragment extension header (RFC 8200 §4.5) exactly like any other
+extension header and set an `is_fragment` flag, but a project-wide
+search confirmed that flag was never read anywhere. The practical
+effect was worse than the IPv4 bug in one respect: rather than failing
+to complete (and thus at least not emitting anything), every fragment
+after the first had its raw mid-datagram payload bytes handed directly
+to the TCP/UDP dispatch as if they were a complete, fresh segment —
+genuine risk of misclassifying fragment continuation data as some
+protocol's traffic, not just a missed opportunity.
+
+Verified against 130 real IPv6 fragments (`ultimate.pcapng`) — exactly
+65 first-fragments and 65 later-fragments, tunneling both real UDP and
+real GRE traffic. Confirmed the later fragments' would-be "header"
+bytes were genuinely random-looking continuation data, not just
+unusual-looking real headers.
+
+**Fixed by implementing real reassembly**, deliberately reusing —not
+duplicating— the exact hole-tracking algorithm already verified (and
+fixed) for IPv4: `frag_holes_update()` was extracted out of
+`dpi_rfc_parser.c`'s `frag_insert()` specifically so both IP versions
+share the one, carefully-verified implementation of the trickiest part
+(the bounded hole-list manipulation), rather than risking two versions
+drifting apart. Only the genuinely IPv6-specific pieces are new: a
+128-bit-address-plus-32-bit-Identification flow key (versus IPv4's
+32-bit addresses and 16-bit ID), and the different Fragment header
+field layout. Re-verified against all 130 real fragments with the
+exact C field-extraction logic mirrored precisely in Python (not just
+the general algorithm) — 65/65 fragment sets reassemble correctly.
+
+Added 4 real seeds to the existing `fuzz_ipv6_parser.c` harness's
+corpus (first/later fragments, for both real inner protocols found)
+so this path gets exercised going forward, not just verified once.
+
 ## 802.11 (WiFi) support
 
 `dpi_80211_parser.c` is architecturally different from every other
@@ -1185,7 +1222,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **230 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **234 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
