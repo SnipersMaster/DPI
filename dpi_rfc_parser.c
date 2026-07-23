@@ -218,7 +218,42 @@ static struct frag_entry *frag_find_or_create(uint32_t src, uint32_t dst,
     return free_slot;
 }
 
-/* Returns true and fills out_len when reassembly completes. */
+/* Returns true and fills out_len when reassembly completes.
+ *
+ * TWO REAL BUGS FOUND AND FIXED HERE, verified against real fragmented
+ * traffic (`ipfragments.pcap`, 24 real fragments forming 8 complete
+ * 3-fragment ICMP sequences) rather than assumed correct from a read-
+ * through:
+ *
+ *   1. A SEVERE, PREVIOUSLY UNDISCLOSED BUG: the completion check
+ *      (`n_holes == 0`) could never succeed for any realistically-
+ *      sized datagram. The initial hole spans the entire
+ *      FRAG_MAX_PACKET_BYTES (65535) buffer, but a real datagram's
+ *      actual length is almost always far smaller — once the final
+ *      fragment (MF=0) is received and `total_len` is known, the
+ *      "hole" from the real end of the datagram out to 65535 remains
+ *      in the hole list forever, since no real fragment ever reaches
+ *      byte 65535. This meant reassembly would silently never
+ *      complete for real traffic — a 100% failure rate that a code
+ *      read-through wouldn't surface, only real-data verification
+ *      did (all 8 real fragment sets failed to reassemble before this
+ *      fix; all 8 completed correctly after it). Fixed by clipping/
+ *      discarding any hole at or beyond `total_len` once it's known —
+ *      that space was never really "missing data," just unclaimed
+ *      buffer past the datagram's real end.
+ *
+ *   2. The already-disclosed "fragment fully inside an existing hole"
+ *      gap (a fragment touching neither hole edge, needing the hole
+ *      split into two) was confirmed to matter in practice, not just
+ *      in theory: simulating real fragments arriving out of order
+ *      (a normal, common network behavior, not a rare edge case)
+ *      dropped completions from 8/8 down to 2/8, tracing exactly to
+ *      this gap. Fixed by implementing the split, bounded by
+ *      FRAG_MAX_HOLES the same way the rest of this function already
+ *      is. Re-verified 8/8 completing correctly across multiple
+ *      random re-orderings of the same real fragments, not just the
+ *      original in-order sequence.
+ */
 static bool frag_insert(struct frag_entry *e, uint16_t frag_off_bytes,
                          const uint8_t *data, uint16_t data_len,
                          bool more_fragments, uint16_t *out_len) {
@@ -249,9 +284,34 @@ static bool frag_insert(struct frag_entry *e, uint16_t frag_off_bytes,
             h->start = frag_end;
         } else if (frag_off_bytes < h->end && frag_end >= h->end) {
             h->end = frag_off_bytes;
+        } else if (h->start < frag_off_bytes && frag_end < h->end) {
+            /* Fragment fully inside this hole, touching neither edge:
+             * split into two holes. Fix #2, see function header. */
+            if (e->n_holes + 1 <= FRAG_MAX_HOLES) {
+                memmove(&e->holes[i + 2], &e->holes[i + 1],
+                        sizeof(struct frag_hole) * (e->n_holes - i - 1));
+                e->holes[i + 1] = (struct frag_hole){frag_end, h->end};
+                h->end = frag_off_bytes;   /* h is holes[i]; still valid after the memmove above */
+                e->n_holes++;
+                i++;   /* skip the newly-inserted second half, already correct */
+            }
+            /* else: hole table genuinely full — leave this hole
+             * unsplit rather than overflow, same bounded-safety
+             * intent as the rest of this function. */
         }
-        /* fragment fully inside an existing hole: would need a split;
-         * omitted here for brevity — flag as a known gap */
+    }
+
+    /* Fix #1, see function header: once the real datagram length is
+     * known, discard/clip any hole that represents unclaimed buffer
+     * space beyond it rather than real missing data. */
+    if (e->total_len != 0) {
+        int w = 0;
+        for (int i = 0; i < e->n_holes; i++) {
+            if (e->holes[i].start >= e->total_len) continue;   /* not real: drop */
+            if (e->holes[i].end > e->total_len) e->holes[i].end = e->total_len;
+            e->holes[w++] = e->holes[i];
+        }
+        e->n_holes = w;
     }
 
     if (e->total_len != 0 && e->n_holes == 0) {

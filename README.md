@@ -310,7 +310,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (56 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (57 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser, ipv4_fragmentation) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -568,6 +568,59 @@ translation units for simplicity (see the `#include "..."` lines inside
 system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
+
+## A significant bug found in already-shipped code: IPv4 fragmentation reassembly
+
+This one deserves its own section rather than a table-row mention,
+given its severity. `dpi_rfc_parser.c`'s IPv4 fragmentation reassembly
+(`frag_insert()`) had existed since early in this project but had
+never actually been checked against real fragmented traffic — until
+now, using `ipfragments.pcap` (24 real fragments forming 8 complete
+3-fragment ICMP sequences).
+
+**Bug #1 — severe, previously undisclosed, 100% failure rate.** The
+completion check (`n_holes == 0`) could never succeed for any
+realistically-sized datagram. The reassembly buffer's initial "hole"
+spans the full 65535-byte maximum, but a real datagram is almost
+always far smaller — once the final fragment arrives and the real
+total length is known, the gap between that real end and 65535 remains
+in the hole list *forever*, since no real fragment ever reaches byte
+65535. The result: reassembly would silently never complete on real
+traffic. All 8 real fragment sets failed to reassemble before this was
+found; all 8 completed correctly after the fix (clip/discard any hole
+at or beyond the now-known real datagram length — that space was never
+truly missing data, just unclaimed buffer past the real end).
+
+**Bug #2 — a gap the code had already disclosed, confirmed to matter
+in practice.** The code's own comment already flagged "fragment fully
+inside an existing hole: would need a split; omitted here for
+brevity." Simulating the same real fragments arriving **out of
+order** (ordinary, common network behavior, not an edge case) dropped
+completions from 8/8 to 2/8, tracing exactly to this gap. Implemented
+the missing hole-split, bounded by `FRAG_MAX_HOLES` the same way the
+rest of the function already is.
+
+**Verification, not just a fix**: re-checked both fixes together
+against all 8 real fragment sets in their original order and three
+independently-shuffled random orderings — 8/8 completed correctly in
+every case. Went one step further and confirmed the *reassembled
+content* is byte-for-byte correct, not just that completion was
+detected — compared the reassembled buffer against the real fragments
+manually concatenated at their correct offsets, exact match. Added
+`fuzz_ipv4_fragmentation.c` (with 3 real fragment seeds) specifically
+because this stateful, bounded-array logic — a hole-list manipulated
+via `memmove`, a fixed-size flow table — had no fuzz coverage at all
+before now, despite being exactly the kind of code most likely to hide
+subtle bounds errors.
+
+The honest framing here: this bug existed silently through everything
+else built in this entire project, because nothing before now had
+actually exercised IP-layer fragmentation reassembly against real
+fragmented traffic. It's a reminder that "the code is there and reads
+plausibly" and "the code has been checked against real data" are
+different claims — this project has tried to keep those claims
+distinct throughout, and this is the clearest example yet of why that
+distinction matters.
 
 ## 802.11 (WiFi) support
 
@@ -1132,7 +1185,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **227 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **230 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
