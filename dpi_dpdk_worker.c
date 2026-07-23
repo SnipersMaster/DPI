@@ -132,6 +132,7 @@
 #include "dpi_lldp_parser.c"
 #include "dpi_kerberos_parser.c"
 #include "dpi_l2tpv3_parser.c"
+#include "dpi_whois_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -289,7 +290,15 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 #ifndef RTE_ETHER_TYPE_ARP
 #define RTE_ETHER_TYPE_ARP 0x0806
 #endif
-    if (ethertype == RTE_ETHER_TYPE_ARP) {
+    /* RARP (RFC 903, EtherType 0x8035) is byte-for-byte identical to
+     * ARP's wire format — same fields, just opcodes 3/4 instead of
+     * 1/2 — and dpi_arp_parser.c's opcode-name table already handles
+     * both; this EtherType check was the only piece missing to
+     * actually reach it. Verified against 4 real RARP Request frames
+     * (opcode 3, sender/target IP both 0.0.0.0 — correct RARP
+     * semantics for a host that doesn't know its own IP yet, not a
+     * malformed packet). */
+    if (ethertype == RTE_ETHER_TYPE_ARP || ethertype == 0x8035 /* RARP */) {
         /* ARP has no L4 payload to dispatch on — the whole thing after
          * the Ethernet header IS the ARP message. Calls
          * dispatch_dissection() directly here, parallel to how ICMP is

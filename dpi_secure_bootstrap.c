@@ -94,6 +94,7 @@
 #include "dpi_lldp_parser.c"
 #include "dpi_kerberos_parser.c"
 #include "dpi_l2tpv3_parser.c"
+#include "dpi_whois_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -894,7 +895,15 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
 #ifndef ETH_P_ARP
 #define ETH_P_ARP 0x0806
 #endif
-    if (ethertype == ETH_P_ARP) {
+    /* RARP (RFC 903, EtherType 0x8035) is byte-for-byte identical to
+     * ARP's wire format — same fields, just opcodes 3/4 instead of
+     * 1/2 — and dpi_arp_parser.c's opcode-name table already handles
+     * both; this EtherType check was the only piece missing to
+     * actually reach it. Verified against 4 real RARP Request frames
+     * (opcode 3, sender/target IP both 0.0.0.0 — correct RARP
+     * semantics for a host that doesn't know its own IP yet, not a
+     * malformed packet). */
+    if (ethertype == ETH_P_ARP || ethertype == 0x8035 /* RARP */) {
         struct dissect_result arp_out;
         bool matched = dispatch_dissection((const uint8_t *)payload, (uint16_t)payload_len,
                                             0, "ARP", &arp_out);
