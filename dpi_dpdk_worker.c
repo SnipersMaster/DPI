@@ -133,6 +133,8 @@
 #include "dpi_kerberos_parser.c"
 #include "dpi_l2tpv3_parser.c"
 #include "dpi_whois_parser.c"
+#include "dpi_tftp_parser.c"
+#include "dpi_wol_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -385,8 +387,26 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ethertype == 0x0842 /* Wake-on-LAN Magic Packet */) {
+        /* Like ARP/MPLS/LLDP, dispatched directly — no IP header, no
+         * ports, identified purely by EtherType. */
+        struct dissect_result wol_out;
+        bool matched = dispatch_dissection(ip_start, ip_len, 0, "WoL", &wol_out);
+        if (matched) {
+            struct flow_log_record rec = {0};
+            const char *target_mac = dissect_result_get(&wol_out, "wol_target_mac");
+            if (target_mac) strncpy(rec.dst_ip, target_mac, sizeof(rec.dst_ip) - 1);
+            strncpy(rec.category, "WoL", sizeof(rec.category) - 1);
+            strncpy(rec.app_name, "Magic Packet", sizeof(rec.app_name) - 1);
+            strncpy(rec.confidence, target_mac ? "high" : "low", sizeof(rec.confidence) - 1);
+            log_ring_try_push(queue_id, &rec);
+        }
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ethertype != RTE_ETHER_TYPE_IPV4) {
-        rte_pktmbuf_free(m);   /* not IPv4, IPv6, ARP, MPLS, or LLDP: not handled */
+        rte_pktmbuf_free(m);   /* not IPv4, IPv6, ARP, MPLS, LLDP, or WoL: not handled */
         return;
     }
 

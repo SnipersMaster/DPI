@@ -95,6 +95,8 @@
 #include "dpi_kerberos_parser.c"
 #include "dpi_l2tpv3_parser.c"
 #include "dpi_whois_parser.c"
+#include "dpi_tftp_parser.c"
+#include "dpi_wol_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -961,8 +963,22 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ethertype == 0x0842 /* Wake-on-LAN Magic Packet */) {
+        struct dissect_result wol_out;
+        bool matched = dispatch_dissection((const uint8_t *)payload, (uint16_t)payload_len,
+                                            0, "WoL", &wol_out);
+        if (matched) {
+            const char *target_mac = dissect_result_get(&wol_out, "wol_target_mac");
+            const char *secureon = dissect_result_get(&wol_out, "wol_secureon_password_present");
+            printf("{\"protocol\":\"WoL\",\"wol_target_mac\":\"%s\","
+                   "\"wol_secureon_password_present\":\"%s\"}\n",
+                   target_mac ? target_mac : "", secureon ? secureon : "false");
+        }
+        return;
+    }
+
     if (ethertype != ETH_P_IP) {
-        return;   /* not IPv4, IPv6, ARP, MPLS, or LLDP: not handled */
+        return;   /* not IPv4, IPv6, ARP, MPLS, LLDP, or WoL: not handled */
     }
 
     struct ipv4_result ip_result;
