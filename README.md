@@ -210,6 +210,7 @@ everything else is not touched by this engine at all yet.
 | SNMP | RFC 1157 (v1), RFC 3416 (v2c/v3 common PDU) | `dpi_snmp_parser.c` | BER/ASN.1 decoding — a genuinely different parsing paradigm from the fixed-field/TLV approach used everywhere else in this project. Community string, PDU type, request-id, **and now the full variable-bindings list**: OID decoding (BER's base-40/base-128 encoding, verified against constructed OIDs including a multi-byte sub-identifier) plus value decoding for INTEGER/Counter32/Gauge32/TimeTicks/Counter64/OCTET STRING/IpAddress/NULL/OID — verified end-to-end against a constructed GetResponse with real varbind data (OID decode + OCTET STRING + Counter32 all confirmed). |
 | ARP (+ RARP) | RFC 826 (+ RFC 903) | `dpi_arp_parser.c` | Opcode, sender/target MAC+IP for the common Ethernet+IPv4 case. Runs directly over its own EtherType (0x0806) — never has an IP header at all, so it needs its own capture-path branch parallel to IPv4/IPv6, not routed through TCP/UDP dispatch. Gratuitous-ARP and zero-target-MAC-in-reply are flagged (useful ARP-spoofing signals) without being judged as malicious, since both patterns have legitimate uses too. **RARP folded in rather than built as a separate dissector** (only 4 real packets — not enough to justify a whole new file, and RARP shares ARP's exact wire format byte-for-byte, just a different EtherType and opcodes 3/4 instead of 1/2). The opcode-name table had already anticipated both values; the only missing piece was routing EtherType 0x8035 to the same handler, done in both capture paths. Verified against all 4 real RARP Request frames — sender/target IP both correctly 0.0.0.0, the genuine RARP semantics for a host that doesn't yet know its own IP, not malformed data. |
 | STUN | RFC 5389 | `dpi_stun_parser.c` | Message type, magic cookie validation, transaction ID, basic attribute walking. Works over UDP or TCP. TURN relay semantics not implemented — this is STUN message parsing only. |
+| 802.11 (WiFi) | IEEE 802.11 | `dpi_80211_parser.c` | **Architecturally distinct from every row above** — not `protocols.ini`-gated or reached via `dispatch_dissection()`, since it operates at the link layer itself (no IP header, no fixed Ethernet-style framing). Full Frame Control decode, Beacon SSID, Authentication algorithm/status (correctly deferring to an "encrypted" flag under WEP rather than misreading ciphertext), and — now — Data frame payload recursion (SNAP-encapsulated ARP/IPv4) plus Radiotap-header support for monitor-mode captures that wrap frames in radio metadata. See the dedicated "802.11 (WiFi) support" section below for the full verification history (64 real frames total across 4 genuine captures, several real gaps found and closed along the way). |
 
 ### Detected / scored, not fully dissected
 
@@ -347,44 +348,85 @@ fully-parsed table above. What remains:
 
 ## Honest status per file — read before trusting any of it
 
+Nothing in this project has been compiled — there's no C toolchain in
+any sandbox this project has been built in, stated once here rather
+than repeated in every row. "Tested against real data?" means
+something different: dozens of dissectors below **have** been checked
+against genuine captured traffic, byte-for-byte, using Python mirrors
+of the exact C logic — that's what "Yes" means in this table. Where a
+file has never had real traffic available to check it against, that's
+stated plainly too, not left ambiguous.
+
 | File | Compiled? | Tested against real data? | Known gaps |
 |---|---|---|---|
-| `dpi_secure_bootstrap.c` | No (missing dev headers in this sandbox) | No | Now includes 6 other files as one translation unit — a real compile is more likely to surface something here than before. `printf`-per-flow is fine at this scale. |
-| `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant. Now handles both TCP and UDP. Output goes through the async ring buffer, not a hot-path `printf()`. |
-| `dpi_async_output.c` | No | No | ~52 MB static footprint at default sizing (documented in-file); drain thread sleeps 1ms when idle rather than busy-spinning — reasonable default, tune if your latency requirements differ |
-| `dpi_rfc_parser.c` | No | No | Fragment reassembly cache still has no timeout eviction or memory ceiling (unlike the TCP flow reassembly layer, which does — this remains a real gap specific to the IPv4 fragment cache); TCP overlap-resolution policy is implemented in `dpi_tcp_flow_reassembly.c` |
-| `dpi_tcp_flow_reassembly.c` | No | No | O(n) per-partition flow table scan (documented tradeoff); no hole-splitting for a segment landing fully inside an existing hole (documented gap, matches the IPv4 fragment reassembly's same limitation); **256 flows per lcore partition at default sizing (4096 total / 16 partitions)** — this is a real capacity ceiling per core, tune `TCP_REASSEMBLY_NUM_PARTITIONS`/`MAX_FLOWS` deliberately for your expected concurrent-flow count |
+| `dpi_secure_bootstrap.c` | No | No | Now includes many more files as one translation unit — a real compile is more likely to surface something here than before. `printf`-per-flow is fine at this scale. |
+| `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant. Handles TCP, UDP, ARP/RARP, LLDP, WoL, and IP-protocol-based tunnels. Output goes through the async ring buffer, not a hot-path `printf()`. |
+| `dpi_async_output.c` | No | No | ~52 MB static footprint at default sizing (documented in-file); drain thread sleeps 1ms when idle rather than busy-spinning |
+| `dpi_rfc_parser.c` | No | **Yes — real bug found and fixed** | IPv4 fragmentation reassembly had a severe, previously undisclosed bug (completion check could never succeed for realistically-sized datagrams) — found and fixed against `ipfragments.pcap`'s 8 real fragment sets, re-verified 8/8 across multiple random re-orderings. A second, already-disclosed gap (mid-hole fragment splitting) was also closed after confirming it mattered under real out-of-order arrival. |
+| `dpi_tcp_flow_reassembly.c` | No | **Yes — real bug found and fixed** | Same class of mid-hole-split gap as IPv4 fragmentation, found mattering in a real messy flow (LDP's real duplicate/overlap capture) — 1-byte real gap was silently blocking 6 already-buffered real bytes from ever being delivered. Fixed and verified: 7 bytes now deliver correctly once the gap fills, vs. 1 before the fix. Overlap-conflict detection itself verified correct on real data (`overlap_conflict_count=24` on the real anomalous flow). |
+| `dpi_ipv6_parser.c` | No | **Yes — real bug found and fixed** | Fragment (extension header) handling previously wasn't reassembled at all — every fragment after the first had raw mid-datagram bytes handed to TCP/UDP dispatch as if complete. Found and fixed against 130 real fragments (65 sets, real UDP and GRE traffic) — 65/65 now reassemble correctly, re-verified with the exact C field-extraction logic mirrored in Python. |
 | `dpi_app_classifier.c` | No | No | JA3 fallback is stubbed, not implemented |
-| `dpi_domain_rules_loader.c` | No | No | Reload swap is now a lock-free atomic pointer exchange with a bounded 4-slot grace-period retirement list (not full RCU/hazard pointers — appropriate for infrequent config-file reloads, not a general-purpose concurrent data structure pattern) |
-| `domain_rules.ini` | N/A | No | Seed list from general knowledge, not live-verified; will have stale/missing entries. ~435 rules across 21 categories including `[dns_over_https]` |
+| `dpi_domain_rules_loader.c` | No | No | Reload swap is a lock-free atomic pointer exchange with a bounded 4-slot grace-period retirement list |
+| `domain_rules.ini` | N/A | No | Seed list from general knowledge, not live-verified; ~435 rules across 21 categories |
 | `dpi_dga_detector.c` | No | No | Weights are literature-informed starting points, not tuned against a labeled dataset |
-| `dpi_vpn_detector.c` | No | No | OpenVPN and IKE (both port-500 and port-4500 NAT-T paths) verified against real traffic; WireGuard remains logic-reviewed only — a real-traffic check found zero genuine WireGuard traffic anywhere available (an initial positive was a false ephemeral-port coincidence, corrected); largely blind to obfuscated/VPN-over-TLS traffic by design |
-| `dpi_doh_dot_detector.c` | No | No | DoT structural detection verified against 80 real payloads; DoH detection is inherently limited to SNI-list matching (no structural fallback exists) |
-| `dpi_dissector_registry.c` | No | No | O(n) dispatch noted as a possible future bottleneck at very high dissector counts. The new `SIGUSR1` reload path (`reload_protocol_config()`) has an untested edge case worth flagging: if `protocols.ini` is reloaded WHILE a burst is being processed on another lcore, that lcore sees the new `enabled` values mid-burst rather than all-or-nothing per burst — harmless in practice (each packet's dispatch decision is independently consistent, just not synchronized to a single "before/after" instant), but worth stating rather than silently assuming perfect atomicity across the whole reload |
-| `dpi_dpdk_worker.c` (signal handling) | No | No | `SIGUSR1` reload is checked only by the queue-0 lcore, every 4096 poll iterations — chosen to keep the check's overhead negligible on the hot path; means a reload can take a moment to actually apply under light traffic (few polls happening), not instant |
-| `dpi_secure_bootstrap.c` (signal handling) | No | No | Checked every loop iteration (single-threaded, much lower packet rate expected, so no throttling needed the way the DPDK version needs it) |
-| `dpi_radius_parser.c` | No | No | Otherwise structurally complete for the core RFC 2865 fields covered |
-| `dpi_quic_parser.c` | No | No | SNI extraction wired end-to-end. The key-derivation-through-decryption **algorithm** is now verified against RFC 9001 Appendix A.2's real published test vector (via an independent Python + `cryptography`-library reimplementation — successful decryption recovering the RFC's own "example.com" example is strong confirmation the algorithm is right). This is a meaningfully higher confidence level than "cross-checked against pseudocode" alone, but it is **not** the same as compiling and running this actual C file against that vector — that step still hasn't happened (no compiler available in any sandbox this project has been built in) and remains the honest next step. Packet-number reconstruction simplified (correct for a connection's first Initial packet only — the case the verified vector covers); no CRYPTO frame reassembly across multiple packets. |
-| `dpi_protocol_config.c` | No | No | Simple, low-risk file — startup-only config load, no ongoing state to get wrong |
-| `dpi_ipv6_parser.c` | No | No | Extension chain walking verified by hand against a 20-header adversarial case (correctly rejected); a real fuzzing pass (`fuzz_ipv6_parser.c`) would give much broader coverage than the handful of hand-checked cases here |
-| `dpi_vlan_parser.c` | No | No | Stripping logic verified in Python against 5 cases (single tag, QinQ, over-nesting, truncation, untagged); the VLAN ID(s) themselves are extracted (`vlan_id_outer`/`vlan_id_inner`) but NOT yet threaded into `flow_log_record`/the JSON output — same category of gap as when IPv6 addresses first needed new output fields. A tagged frame is now correctly dispatched to the right protocol, but its VLAN membership isn't visible in the resulting flow record yet. |
-| `dpi_http1_parser.c` | No | No | No chunked transfer-encoding or body parsing; only Host/User-Agent headers extracted, not a general header map |
-| `dpi_http2_parser.c` | No | No | CONTINUATION reassembly across a TCP boundary only covers a split landing cleanly at a frame boundary, not mid-frame (see gap table above); SETTINGS_HEADER_TABLE_SIZE now correctly resizes the OPPOSITE direction's table (a real directional bug was found and fixed, not just documented — see gap table above) — the residual simplification is not distinguishing multiple SETTINGS frames with different values over a connection's lifetime, which is minor since real endpoints rarely change this value mid-connection |
-| `dpi_ssh_parser.c` | No | No | Only 8 of RFC 4253's 10 KEXINIT name-lists extracted (languages lists omitted, almost always empty in practice); nothing past KEXINIT is parsed (correctly — it's encrypted from there) |
-| `dpi_dhcp_parser.c` | No | No | Only a handful of the most useful options extracted (message type, requested IP, hostname, vendor class), not a general option map |
-| `dpi_sip_rtp_parser.c` | No | No | SIP: only Call-ID/From/To headers extracted, not a general header map. RTP: no port hint exists by protocol design (negotiated via SDP), so `dst_port` is unused in `rtp_detect()` |
-| `dpi_icmp_parser.c` | No | No | Embedded original-packet dissection now implemented for both ICMPv4 (ports only, per RFC 792's 8-byte guarantee) and ICMPv6 (full TCP/UDP header, since RFC 4443 guarantees much more data) — verified against constructed test packets in Python before shipping |
-| `dpi_smtp_parser.c` | No | No | RFC 5322 message headers (Subject/From/To/Date) now extracted when in the same buffer as DATA (verified against a constructed multi-header message); the actual mail BODY/MIME structure remains deliberately out of scope (see gap table above) |
-| `dpi_hpack_connection_state.c` | No | No | ~8 MB additional static memory for the pending-CONTINUATION buffers (computed explicitly in the file) — worth knowing before treating this as a "small" addition; connection entries capped at `HPACK_CONN_PER_PARTITION` (32) per partition |
-| `dpi_hpack_decoder.c` | No | No | Huffman table verified against 3 real RFC test vectors (high confidence) — this remains the most novel, least-precedented code in this project, worth prioritizing for fuzzing. Dynamic table ownership was refactored to support external/persistent tables; `hpack_decode_header_block_fresh()` preserves the original per-call behavior for callers without flow context |
-| `dpi_tcp_flow_reassembly.c` (updated) | No | No | Flow key now supports IPv6 (128-bit addresses, explicit version tag) via `tcp_flow_key_make_v4()`/`_v6()` constructors — all call sites updated; verify this compiles cleanly given the struct layout change touched multiple files. Also gained `tcp_flow_key_reverse()` (swap src/dst) for looking up the opposite direction's connection state — verified involutive in Python; used by HTTP/2's SETTINGS_HEADER_TABLE_SIZE fix (see gap table above) |
-| `dpi_gtp_parser.c` | No | No | GTP-in-GTP recursion depth verified in Python (proceeds at depth 0→1, correctly blocked at 1→2); F-TEID/PDN Address Allocation byte offsets verified against constructed test vectors; Bearer QoS's bit fields and rate fields now fully decoded and verified against constructed test vectors, following authoritative spec research; a few less common GTPv2-C IE types (e.g. Protocol Configuration Options, Bearer Context) still unwalked |
-| `dpi_arp_parser.c` | No | No | Only decodes the Ethernet+IPv4 case (HLEN=6/PLEN=4) — other hardware/protocol type combinations exist per RFC 826 but aren't generalized; seed verified byte-for-byte against the SHA/SPA/THA/TPA offsets this session |
-| `dpi_mqtt_parser.c` | No | No | Only CONNECT (protocol name/client ID) and PUBLISH (topic name) payloads parsed; other message types are named but not parsed further; seed verified byte-for-byte against the full CONNECT parse this session |
-| `dpi_ntp_parser.c` | No | No | Extension fields/MAC (RFC 5905 §7.5) detected as present but not parsed; seed verified against the LI/VN/Mode bit-packing this session |
-| `dpi_snmp_parser.c` | No | No | SNMPv3 detected but not parsed (structurally different — no plaintext community string); community string extraction flagged with the same credential-handling care as RADIUS's User-Password. Two seeds now verified — a bare stub and one with a real request-id exercising more of the BER TLV walk |
-| `dpi_stun_parser.c` | No | No | IPv6 XOR-MAPPED-ADDRESS (family 0x02, which XORs with the transaction ID too, not just the magic cookie) not implemented — flagged, not mishandled. Two seeds verified this session — a bare header and one with a real XOR-MAPPED-ADDRESS attribute, confirming the XOR decode math is correct |
-| `dpi_modbus_parser.c` | No | No | Read-function response shape (byte count + raw data) isn't distinguished from request shape (address+quantity) without request/response transaction tracking — interpretation is only reliable for requests, noted in the code rather than asserted unconditionally. Verified against constructed Read Holding Registers and exception-response test vectors |
+| `dpi_vpn_detector.c` | No | **Yes, thoroughly** | OpenVPN: 1,778/1,778 real port-1194 payloads correct. IKE: 232/232 real port-500 + 640/640 real port-4500 NAT-T payloads correct (the NAT-T check split cleanly into 68 genuine IKE + 572 genuine ESP, confirmed by checking sequence-number increments). WireGuard: a real-traffic check found **zero** genuine WireGuard traffic anywhere available — an initial 1,067-hit positive was a false ephemeral-port coincidence (a 2009 DNS query, years before WireGuard existed), caught before being reported as a real verification. Remains logic-reviewed only. |
+| `dpi_doh_dot_detector.c` | No | **Yes** | DoT: 80/80 real port-853 payloads, every score individually explained (handshake records, Application Data, ChangeCipherSpec, capture artifacts, TCP-continuation fragments — zero unexplained). DoH has no structural fallback by design (ordinary HTTPS at the wire level). |
+| `dpi_dissector_registry.c` | No | No | O(n) dispatch at very high dissector counts; `SIGUSR1` reload mid-burst is per-packet-consistent but not synchronized to a single before/after instant |
+| `dpi_dpdk_worker.c` (signal handling) | No | No | `SIGUSR1` reload checked only by the queue-0 lcore, every 4096 poll iterations |
+| `dpi_secure_bootstrap.c` (signal handling) | No | No | Checked every loop iteration (single-threaded, much lower packet rate) |
+| `dpi_radius_parser.c` | No | No | Structurally complete for the core RFC 2865 fields covered; no real RADIUS capture was available to check against |
+| `dpi_quic_parser.c` | No | **Algorithm yes, this file no** | SNI extraction wired end-to-end. The key-derivation-through-decryption algorithm is verified against RFC 9001 Appendix A.2's real published test vector via an independent Python + `cryptography` reimplementation (successful decryption recovering the RFC's own "example.com"). That confirms the algorithm, not this specific C file — no compiler available. Packet-number reconstruction simplified to a connection's first Initial packet only. |
+| `dpi_protocol_config.c` | No | No | Simple, low-risk — startup-only config load |
+| `dpi_vlan_parser.c` | No | **Yes, extensively** | All 16,371 real VLAN-tagged frames in one capture parsed successfully — zero malformed, zero over-nested rejections. Real traffic included VLAN+PPPoE, VLAN+IPv6 (incl. a real RIPng packet traced end-to-end), VLAN+IPv4, VLAN+EAPOL, VLAN+MACsec, a genuine 802.3/LLC-SNAP frame (confirmed to fail gracefully), and a real VLAN-tagged gratuitous ARP reply. All 16,371 were single-tagged — the double-tag (QinQ) path has zero real-traffic verification, stated explicitly rather than left to blend into that figure by implication; synthetically verified sound instead. |
+| `dpi_http1_parser.c` | No | No | No chunked transfer-encoding or body parsing; only Host/User-Agent headers extracted |
+| `dpi_http2_parser.c` | No | **Logic yes, via construction** | CONTINUATION reassembly now covers both a clean frame-boundary split AND a split in the middle of a CONTINUATION frame's own payload (verified against constructed multi-delivery scenarios — two-way split, three-way split, split-then-more-frames-follow, all byte-for-byte correct). No real capture available happened to include a TCP boundary landing inside a CONTINUATION frame's payload specifically — stated honestly as logic-verified, not real-traffic-verified, for that specific path. SETTINGS_HEADER_TABLE_SIZE correctly resizes the opposite direction's table (a real directional bug was found and fixed). |
+| `dpi_ssh_parser.c` | No | No | Only 8 of RFC 4253's 10 KEXINIT name-lists extracted; nothing past KEXINIT is parsed (correctly encrypted from there) |
+| `dpi_dhcp_parser.c` | No | **Yes, base fields** | Real DHCP/BOOTP traffic confirmed across 6 captures. A real gap found: DHCP option 90 (Authentication, RFC 3118) and option 82 (Relay Agent Information) are both present with real data in real captures but not yet extracted — only options 53/50/12/60 are decoded today, flagged as the next breadth-extension candidate. |
+| `dpi_sip_rtp_parser.c` | No | No | SIP: only Call-ID/From/To headers extracted. RTP: no port hint exists by protocol design (negotiated via SDP) |
+| `dpi_icmp_parser.c` | No | No | Embedded original-packet dissection implemented for both ICMPv4 (ports only) and ICMPv6 (full TCP/UDP header) — verified against constructed test packets, no real ICMP capture checked yet |
+| `dpi_smtp_parser.c` | No | No | RFC 5322 message headers extracted when in the same buffer as DATA — verified against a constructed multi-header message, not yet a real capture |
+| `dpi_hpack_connection_state.c` | No | No | ~33 KB per connection entry (both frame-boundary and mid-frame-split CONTINUATION state) — ~17 MB total at default sizing, computed explicitly in-file |
+| `dpi_hpack_decoder.c` | No | **Yes, the Huffman table** | Verified against 3 real RFC 7541 Appendix C test vectors — the most novel, least-precedented code in this project, worth prioritizing for fuzzing |
+| `dpi_gtp_parser.c` | No | No | GTP-in-GTP recursion depth verified in Python (not real traffic); F-TEID/PDN Address Allocation/Bearer QoS byte offsets verified against constructed test vectors following authoritative spec research; no real GTP traffic exists in any capture checked for this project |
+| `dpi_arp_parser.c` | No | **Yes, extensively, 3 real findings** | Only decodes the Ethernet+IPv4 case (HLEN=6/PLEN=4). RARP folded in and verified against 4 real RARP frames. A real, historically documented information-disclosure class ("Etherleak") found and flagged: 73 of 105 real frames in a dedicated capture showed non-zero Ethernet padding, several containing a recognizable leaked SNMP community string from an unrelated prior packet. A cleaner real ARP-poisoning signal (IP-MAC binding conflict, 8/14 real packets in a poisoning capture) was verified but not yet implemented — needs a partitioned table design first. |
+| `dpi_mqtt_parser.c` | No | No | Only CONNECT and PUBLISH parsed; other message types named but not parsed further; verified byte-for-byte against a constructed CONNECT, not real traffic |
+| `dpi_ntp_parser.c` | No | No | Extension fields/MAC detected as present but not parsed; verified against constructed bit-packing, not real traffic |
+| `dpi_snmp_parser.c` | No | **Yes, base types; Opaque/exceptions no** | SNMPv3 detected but not parsed. Community string/PDU type/request-id/varbind walking verified end-to-end against a constructed GetResponse. Opaque and the SNMPv2 exception values were added later but real traffic checked only ever exercised INTEGER/OCTET STRING/NULL — stated honestly. |
+| `dpi_stun_parser.c` | No | No | IPv6 XOR-MAPPED-ADDRESS not implemented; verified against constructed test vectors including a real XOR-decode math check, not real traffic |
+| `dpi_modbus_parser.c` | No | No | Read-function response shape isn't distinguished from request shape without transaction tracking; verified against constructed test vectors |
+| `dpi_gre_parser.c` | No | **Yes** | 744 real packets (459 IPv4, 285 IPv6), zero parse failures |
+| `dpi_mpls_parser.c` | No | **Yes** | 724 real packets, 100% single-label in this traffic; multi-label stacking and inner IPv6 implemented but not real-traffic-exercised |
+| `dpi_ospf_parser.c` | No | **Yes** | 586 real packets (278 v2, 308 v3), zero failures — a real bounding bug caught during this process (the third instance of the same bug class in this project) |
+| `dpi_bgp_parser.c` | No | **Yes** | 98 real TCP payloads (119 total messages), zero failures — found real traffic needed multi-message-per-segment walking (5 of 98 carried more than one) |
+| `dpi_ldap_parser.c` | No | **Yes, CLDAP only** | 14 real CLDAP/UDP packets, zero failures. TCP path implemented per RFC 4511 but no real LDAP/TCP traffic was available to check |
+| `dpi_ftp_parser.c` | No | **Yes** | 144 real payloads, 0 false acceptances of a real FTPS-upgraded encrypted session; a real plaintext password was visible in this capture, confirming the never-extract-PASS discipline matters |
+| `dpi_igmp_parser.c` | No | **Yes** | 25 real packets — real v3 reports correctly targeted mDNS's own multicast address, consistent with mDNS traffic in the same capture |
+| `dpi_rip_parser.c` | No | **Yes** | 68 real RIPv2 + 124 real RIPng packets — real default routes and genuine /64 IPv6 prefixes |
+| `dpi_ssdp_parser.c` | No | **Yes — real bug found and fixed** | A real off-by-one string-length bug silently rejected all 87 real M-SEARCH messages during verification; fixed and re-verified to 99/99 |
+| `dpi_syslog_parser.c` | No | **Yes, two real formats** | 6 real UDP packets (Cisco device logs) + 91 real TCP payloads (Palo Alto firewall structured logs) |
+| `dpi_mdns_parser.c` | No | **Yes** | 339 real packets — confirmed real QDCOUNT=0 announcements (178/339) and real QU-bit/cache-flush-bit usage, not assumed from the RFC text alone |
+| `dpi_esp_parser.c` | No | **Yes** | 542 real IPv4 + 1,051 real IPv6 packets — 8 distinct real Security Associations with correctly independent, correctly incrementing sequence numbers |
+| `dpi_hsrp_parser.c` | No | **Yes, v1 only** | Real traffic is a genuine mix of HSRPv1 (167 packets, verified) and an unrecognized 72-byte variant (156 packets, almost certainly HSRPv2 — correctly flagged as unrecognized rather than guessed at, since HSRPv2 was never formally RFC-standardized) |
+| `dpi_6in4_parser.c` | No | **Yes** | 180 real packets, zero failures — real inner addresses matched Hurricane Electric's known tunnel-broker prefix |
+| `dpi_isakmp_parser.c` | No | **Yes** | 230 real packets, zero length-field mismatches — real traffic dominated by Aggressive Mode (198/230) |
+| `dpi_ldp_parser.c` | No | **Yes** | 290 real UDP Hello + 76 real TCP session payloads — a real capture artifact (duplicate packets, one sequence-number collision) found and correctly attributed to TCP reassembly's job, not this dissector's |
+| `dpi_eigrp_parser.c` | No | **Yes** | 60 real IPv4 + 62 real IPv6 packets — TLV walk consumed the exact whole buffer with zero trailing bytes on every packet |
+| `dpi_s7comm_parser.c` | No | **Yes — real bug found and fixed** | A real structural bug (Ack-Data's header length assumed wrong) produced garbage function codes on all 11,058 real Ack-Data messages; fixed and re-verified — all 22,116 real packets (100%) pass, every function code pairing exactly |
+| `dpi_telnet_parser.c` | No | **Yes** | 99 real payloads across two captures — a real captured `ls` command, a real OpenBSD login banner, and a real client option-negotiation sequence matching the standard set |
+| `dpi_ah_parser.c` | No | **Yes** | 82 real packets, 100% showed a genuine, valid inner OSPFv3 Hello — all 82 were IPv6 (zero IPv4), caught by checking both versions explicitly rather than assuming |
+| `dpi_netbios_parser.c` | No | **Yes, extensively** | 1,611 real NBNS + 1,205 real NBDS packets across 7 captures — real decoded names including a genuine Windows auto-generated hostname |
+| `dpi_pop3_parser.c` | No | **Yes, RETR only** | 340 real payloads — only 6 matched POP3's shape (real RETR + real +OK); the other 334 were investigated, not dismissed (122 capture artifact, 212 real base64 email content correctly out of scope) |
+| `dpi_msnp_parser.c` | No | **Yes** | 37 real payloads, 28/37 matched; all 9 rejections confirmed to be the same capture artifact found elsewhere, not assumed |
+| `dpi_smb1_parser.c` | No | **Yes, extensively** | 917 real messages across 4 captures — 907/917 clean, the other 10 confirmed to be real TCP-segmentation (a standard MSS boundary), not a parsing bug |
+| `dpi_lldp_parser.c` | No | **Yes, extensively** | 8,616 real frames across 3 captures — 100% clean parse, the largest clean real-traffic sample in this project |
+| `dpi_kerberos_parser.c` | No | **Yes, and a real bug-shaped investigation** | 44 real packets (17 with data), 3 genuinely complete messages correctly identified out of the 17 after tracing a real port-survey discrepancy to a VLAN-stripping gap; a strict length-sanity check verified to correctly separate all 3 complete messages from all 14 incomplete/fragment ones |
+| `dpi_l2tpv3_parser.c` | No | **Yes — detector widened after a real finding** | 20 real packets — what a port survey called generic "L2TP" turned out to be L2TPv3 Ethernet pseudowire once decoded; the detector initially passed only 16/20, investigating the 4 rejections (rather than accepting the partial pass) found two more genuinely real tunneled protocols, widened to 20/20 |
+| `dpi_whois_parser.c` | No | **Yes** | 5 real payloads with data — a real query for the pcap author's own domain and a real DENIC-format response |
+| `dpi_tftp_parser.c` | No | **Yes, WRQ only — 1 real packet** | Only 1 real TFTP packet exists in any capture checked, but it's a complete, self-contained WRQ (a real Cisco lab router config upload), confirmed to consume the packet to its exact last byte. DATA/ACK/ERROR implemented from spec, not real-traffic-verified |
+| `dpi_wol_parser.c` | No | **Yes — 1 real packet, but a complete one** | Only 1 real packet exists, but WoL's entire protocol IS one fixed-shape packet with no session or variation — the sync stream and all 16 MAC repeats were confirmed programmatically to match, a real Raspberry Pi Foundation OUI target |
+| `dpi_dnp3_parser.c` | No | **Yes, unusually verified** | IEEE 1815 is a paid standard, not searchable here — field layout instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other (a genuine discrepancy in a third blog source was found and discarded) |
+| `dpi_dns_parser.c` | No | No | Query name decoding (cycle-safe compression pointers) verified against a constructed adversarial cyclic-pointer case, not real traffic directly — though `dpi_mdns_parser.c` reuses this same logic and IS real-traffic-verified (339 real packets) |
+| `dpi_80211_parser.c` | No | **Yes, extensively, 3 real gaps found and closed** | 64 real frames across 4 genuine captures. A complete real WEP handshake (26 frames) — caught a WEP-encrypted body being misread as plaintext until the Protected bit was checked. A real "failed auth" capture's anomalous body correctly reported rather than misparsed. Radiotap encapsulation (link-type 127) found unsupported and added, verified against 38 real frames with a consistent 20-byte header. Data-frame payload recursion found entirely missing and added — all 38 real frames were genuine SNAP-encapsulated ARP Probes (real iPhone Wi-Fi-startup traffic), 38/38 correctly decoded. |
 
 ## Sample JSON output, one per fully-parsed protocol
 
@@ -875,11 +917,40 @@ except the body — not a parsing bug), and this dissector reports
 whatever value is actually present rather than crashing or guessing,
 confirmed against that real anomalous case specifically.
 
-Has its own fuzz harness (`fuzz_80211_parser.c`) and 7 real seeds
+Has its own fuzz harness (`fuzz_80211_parser.c`) and 10 real seeds
 covering every frame type found (Beacon, clean Authentication,
 WEP-encrypted Authentication, the anomalous-body Authentication, ACK,
-Association Request, Data) — built and seeded to the same standard as
-everything else here, despite not being wired in yet.
+Association Request, Data, plus the three added below) — built and
+seeded to the same standard as everything else here, and genuinely
+wired into the bootstrap capture path (see above), not just sitting
+unreachable.
+
+**Two further real gaps found and closed**, from a later capture
+(`arp-iphonestartup.pcapng`, pcap linktype 127) that neither of the
+first two captures' link-types exercised:
+
+- **Radiotap encapsulation.** Some monitor-mode interfaces prepend a
+  self-describing block of radio metadata (signal strength, channel,
+  rate) before each real 802.11 frame — confirmed against all 38 real
+  frames in this capture, a consistent 20-byte Radiotap header every
+  time. Added a second capture-path flag,
+  `--link-type=80211-radiotap`, which skips exactly that many bytes
+  (using Radiotap's own length field, not a guess) before handing the
+  rest to the same, unmodified 802.11 dissector.
+- **Data frames had zero payload recursion.** This dissector
+  previously only ever looked inside Beacon and Authentication frame
+  bodies — a Data frame's payload was never examined at all. Checking
+  this real capture found all 38 frames were Data frames carrying real
+  ARP traffic via IEEE 802 SNAP encapsulation (RFC 1042) — every one a
+  genuine ARP Probe (RFC 5227: sender IP `0.0.0.0`, checking whether
+  an about-to-be-used address is already taken), both Request and
+  Reply opcodes present — real iPhone Wi-Fi-startup address-conflict-
+  detection traffic, not synthetic. Added `dot11_dissect_data()`,
+  verified against all 38 real frames: 38/38 correctly decoded. IPv4
+  payloads recurse via `parse_ipv4()` the same way GRE/MPLS/L2TPv3
+  already do for their own inner packets; IPv6 is named but not
+  recursed into, no real example to verify against, same honest limit
+  those files' own IPv6 paths already have.
 
 ## Breadth extensions to two existing dissectors (SNMP, GTPv2-C)
 
@@ -960,6 +1031,65 @@ access exists in this sandbox, so a pcapng parser was written from
 scratch in Python (same "verify independently, don't assume a library
 does it right" discipline as everything else here) rather than relying
 on scapy/dpkt.
+
+**At a glance — every real-traffic validation in this project:**
+
+| Protocol | Real traffic checked | Result |
+|---|---|---|
+| VLAN stripping | 16,371 frames | 100% — zero malformed, zero over-nested rejections |
+| Modbus/TCP | 38 payloads, then **87,281** at scale (`ics.pcapng`) | 100% both passes |
+| DNS name decompression | 2,229 packets | 100% |
+| GRE decapsulation | 744 packets (459 v4, 285 v6) | 100% |
+| MPLS decapsulation | 724 packets | 100% (single-label in this traffic) |
+| OSPF | 586 packets (278 v2, 308 v3) | 100% — a real bounding bug found & fixed |
+| BGP | 98 TCP payloads (119 messages) | 100% — found real traffic needs multi-message-per-segment walking |
+| LDAP / CLDAP | 14 CLDAP/UDP packets | 100% — TCP path unverified, no real LDAP/TCP traffic available |
+| FTP | 144 payloads | 100%, 0 false accepts of an upgraded FTPS session |
+| IGMP | 25 packets | 100% |
+| RIP / RIPng | 68 + 124 packets | 100% |
+| SSDP | 99 messages | **Real bug found & fixed** (off-by-one silently rejected all 87 real M-SEARCH messages) |
+| Syslog | 6 UDP + 91 TCP payloads | 100%, two genuinely different real formats |
+| mDNS | 339 packets | 100% — confirmed real QDCOUNT=0 and QU-bit usage |
+| ESP (IPsec) | 542 IPv4 + 1,051 IPv6 | 100% — 8 real Security Associations, correct independent sequence numbers |
+| HSRP | 338 packets | v1 100% (167); unrecognized v2-shaped traffic correctly flagged, not guessed at (171) |
+| 6in4 tunnel | 180 packets | 100% — real HE.net tunnelbroker prefix |
+| ISAKMP / IKE | 230 packets | 100% |
+| LDP | 290 UDP + 76 TCP | 100% |
+| EIGRP | 60 IPv4 + 62 IPv6 | 100% |
+| S7comm | 22,116 packets | **Real bug found & fixed** (Ack-Data header length), then 100% |
+| Telnet | 99 payloads | 100% |
+| AH (IPsec) | 82 packets | 100% — all real traffic was IPv6, caught by checking both versions |
+| NetBIOS (NBNS+NBDS) | 1,611 + 1,205 packets | 100% |
+| POP3 | 340 payloads | 6/340 matched POP3's shape; the other 334 individually investigated, not dismissed |
+| MSNP | 37 payloads | 28/37 matched; 9 rejections confirmed as a known capture artifact |
+| SMB1 | 917 messages | 907/917 clean; 10 confirmed as real TCP segmentation, not a bug |
+| LLDP | 8,616 frames | 100% — largest clean real-traffic sample in this project |
+| Kerberos | 44 packets (17 w/ data) | 3 genuinely complete messages correctly separated from 14 fragments |
+| L2TPv3 | 20 packets | Detector widened after investigating real rejections — 16/20 → 20/20 |
+| WHOIS | 5 payloads | 100% |
+| RARP (folded into ARP) | 4 packets | 100% |
+| TFTP | 1 packet | Complete real WRQ, verified to the exact last byte |
+| WoL | 1 packet | Complete Magic Packet, all 16 MAC repeats verified to match |
+| 802.11 (WiFi) | 64 frames, 4 captures | 3 real gaps found & closed (WEP-body misread, missing Radiotap support, missing Data-frame recursion) |
+| ARP (Etherleak padding) | 105 frames | 73/105 real frames leaked prior-packet data — flagged |
+| IPv4 fragmentation | 8 fragment sets | **Severe real bug found & fixed** (0/8 → 8/8 reassembling correctly) |
+| IPv6 fragmentation | 65 fragment sets (130 fragments) | **Not reassembled at all → fixed**, 65/65 |
+| TCP flow reassembly | 1 real messy flow | **Real gap found & fixed** (mid-hole split silently dropping real bytes) |
+| DoT | 80 payloads | 100%, every score individually explained |
+| OpenVPN | 1,778 payloads | 100% |
+| IKE (VPN detector) | 232 + 640 payloads | 100% — real NAT-T traffic correctly split into IKE vs. ESP |
+| WireGuard | — | **Zero real traffic exists** — an initial 1,067-hit positive was a false ephemeral-port coincidence, caught before being reported |
+| RDP, Gnutella | — | Honestly deferred — real traffic either fully encrypted or a different protocol entirely (plain HTTP), not built unverified |
+
+*(DNP3 is a notable exception to the "real pcap traffic" pattern above:
+IEEE 1815 is a paid standard, so instead of one large real capture,
+its field layout was cross-checked against two independently-captured
+real DNP3 frames that agreed with each other.)*
+
+The rest of this section is the detailed, source-cited story behind
+each row above — worth reading for the specific real findings (a
+leaked SNMP community string, a real Cisco lab router config, a
+real DENIC WHOIS response, and more), not just the pass/fail count.
 
 **Results, checked against the real, byte-exact source files (not
 just descriptions of the logic):**
@@ -1415,7 +1545,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **240 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **245 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
