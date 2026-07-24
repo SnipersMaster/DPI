@@ -361,7 +361,7 @@ stated plainly too, not left ambiguous.
 
 | File | Compiled? | Tested against real data? | Known gaps |
 |---|---|---|---|
-| `dpi_secure_bootstrap.c` | No | No | Now includes many more files as one translation unit — a real compile is more likely to surface something here than before. `printf`-per-flow is fine at this scale. |
+| `dpi_secure_bootstrap.c` | No | **Logic yes, via Python mirror; not compiled** | Now includes many more files as one translation unit — a real compile is more likely to surface something here than before. `printf`-per-flow is fine at this scale. Gained a `--pcap-file=<path>` offline mode (classic pcap only, not pcapng) specifically so this engine can be tested against a saved capture without a live interface — the exact endianness-detection and packet-walking logic was mirrored in Python and verified against real classic-pcap files, including confirming correct handling of a real file that uses the less-common big-endian pcap magic number. |
 | `dpi_dpdk_worker.c` | No | No | Needs the IOMMU/VFIO/hugepage lab setup described in its header before it's even relevant. Handles TCP, UDP, ARP/RARP, LLDP, WoL, and IP-protocol-based tunnels. Output goes through the async ring buffer, not a hot-path `printf()`. |
 | `dpi_async_output.c` | No | No | ~52 MB static footprint at default sizing (documented in-file); drain thread sleeps 1ms when idle rather than busy-spinning |
 | `dpi_rfc_parser.c` | No | **Yes — real bug found and fixed** | IPv4 fragmentation reassembly had a severe, previously undisclosed bug (completion check could never succeed for realistically-sized datagrams) — found and fixed against `ipfragments.pcap`'s 8 real fragment sets, re-verified 8/8 across multiple random re-orderings. A second, already-disclosed gap (mid-hole fragment splitting) was also closed after confirming it mattered under real out-of-order arrival. |
@@ -628,6 +628,60 @@ translation units for simplicity (see the `#include "..."` lines inside
 system, split these into proper headers + separately compiled `.o`
 files — the `#include`-a-`.c`-file pattern used here is fine for a
 reference/prototype stage but not for a maintained codebase.
+
+## Testing the engine against a saved capture (no live interface needed)
+
+`dpi_secure_bootstrap.c` now has an offline mode specifically so this
+engine can be exercised against a `.pcap` file and produce real JSON
+output, without needing root, `CAP_NET_RAW`, or a live interface at
+all:
+
+```
+gcc -O2 -Wall -Wextra -o dpi_bootstrap dpi_secure_bootstrap.c -lseccomp -lcap
+
+./dpi_bootstrap --pcap-file=capture.pcap
+./dpi_bootstrap --pcap-file=capture.pcap > output.json    # JSON to a file
+./dpi_bootstrap --pcap-file=capture.pcap --link-type=80211-radiotap
+```
+
+Every dissected packet's JSON line goes to **stdout** exactly the way
+it already did for live capture (see `parse_ethernet_frame()`'s and
+`parse_80211_frame()`'s existing `printf()` calls) — redirecting that
+to a file is all `> output.json` does. Per-file summary information
+(link type detected, packet counts, any skipped/malformed records)
+goes to **stderr**, so it won't pollute the JSON output file.
+
+**Classic pcap only, not pcapng** — stated plainly rather than
+silently unsupported. Several real captures used throughout this
+project are pcapng (the newer, block-structured format many modern
+tools default to); this reader only handles the older, simpler classic
+format (a 24-byte global header + a flat sequence of 16-byte-header-
+prefixed packet records). If `--pcap-file` reports an unrecognized
+magic number, convert first:
+```
+tshark -F pcap -r capture.pcapng -w capture.pcap
+```
+(or Wireshark's File → Save As..., choosing the "pcap" format instead
+of "pcapng" in the dropdown).
+
+**Link type is auto-detected from the file's own global header**
+(Ethernet, raw 802.11, or Radiotap+802.11 — the three this project's
+capture paths already handle) — the `--link-type` flags remain
+available as a manual override for the rare case where a file's
+declared link type doesn't match what it actually needs. A link type
+this project doesn't have a dissection path for yet (e.g. Linux
+"cooked capture," linktype 113 — found in one real capture surveyed
+earlier in this project but never wired up) is reported and the file
+is skipped, rather than silently misinterpreted as Ethernet.
+
+**Verified against real files before shipping this**, the same
+discipline as every dissector in this project: the exact endianness-
+detection and packet-walking logic was mirrored in Python and run
+against real classic-pcap files already in hand, including confirming
+correct big-endian detection on a real file (`packet.pcap`) found
+earlier in this project specifically because it uses the less-common
+big-endian pcap magic number — the file reader handles both byte
+orders, not just the far more common little-endian case.
 
 ## A significant bug found in already-shipped code: IPv4 fragmentation reassembly
 

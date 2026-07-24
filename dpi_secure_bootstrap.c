@@ -13,9 +13,23 @@
  * Build (requires dev packages, e.g. `apt install libseccomp-dev libcap-dev`):
  *   gcc -O2 -Wall -Wextra -o dpi_bootstrap dpi_secure_bootstrap.c -lseccomp -lcap
  *
- * Run (needs CAP_NET_RAW, not full root — see setcap note at bottom):
+ * Run against a LIVE interface (needs CAP_NET_RAW, not full root — see
+ * setcap note at bottom):
  *   sudo setcap cap_net_raw,cap_net_admin=eip ./dpi_bootstrap
  *   ./dpi_bootstrap eth0
+ *
+ * Run OFFLINE against a saved capture instead — no root, no capabilities,
+ * no live interface needed at all:
+ *   ./dpi_bootstrap --pcap-file=capture.pcap
+ *   ./dpi_bootstrap --pcap-file=capture.pcap > output.json   # JSON to a file
+ *   ./dpi_bootstrap --pcap-file=capture.pcap --link-type=80211-radiotap
+ *
+ * The offline mode only reads CLASSIC pcap files (the older, simpler
+ * format), not pcapng (the newer, block-structured one many modern
+ * capture tools default to) — see process_pcap_file()'s own header
+ * comment for why, and the one-line conversion command if you have a
+ * pcapng file (`tshark -F pcap -r in.pcapng -w out.pcap`, or
+ * Wireshark's own File -> Save As... and the format dropdown).
  */
 
 #include <stdio.h>
@@ -97,6 +111,8 @@
 #include "dpi_whois_parser.c"
 #include "dpi_tftp_parser.c"
 #include "dpi_wol_parser.c"
+#include "dpi_wow_parser.c"
+#include "dpi_bt_dht_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -1191,23 +1207,210 @@ static void bootstrap_signal_handler(int signum) {
     if (signum == SIGUSR1) reload_config_requested = 1;
 }
 
+/* ------------------------------------------------------------------
+ * PCAP FILE READING — added so this engine can be tested offline
+ * against a saved capture, not just a live interface. Classic pcap
+ * format only (the older, simpler format: a 24-byte global header
+ * followed by a sequence of 16-byte-header-prefixed packet records) —
+ * pcapng (the newer, block-structured format several real captures in
+ * this project actually use) is NOT handled here, stated honestly
+ * rather than silently mishandled; converting pcapng to classic pcap
+ * first (`tshark -F pcap -r in.pcapng -w out.pcap`, or Wireshark's own
+ * "Save As") works as a practical workaround today.
+ *
+ * The pcap FILE format has its own endianness (declared by the magic
+ * number, since either a little- or big-endian host could have
+ * written it) — this affects ONLY the pcap-specific metadata fields
+ * (the global header, and each packet record's header). The actual
+ * captured PACKET BYTES are untouched by this and remain in real
+ * network byte order exactly as every dissector in this project
+ * already assumes — this file's own byte-order handling is entirely
+ * separate from, and doesn't touch, the dissection pipeline itself.
+ * ------------------------------------------------------------------ */
+
+#define PCAP_MAGIC_MICROSEC        0xa1b2c3d4u
+#define PCAP_MAGIC_MICROSEC_SWAP   0xd4c3b2a1u
+#define PCAP_MAGIC_NANOSEC         0xa1b23c4du
+#define PCAP_MAGIC_NANOSEC_SWAP    0x4d3cb2a1u
+
+#define LINKTYPE_ETHERNET          1
+#define LINKTYPE_IEEE802_11        105
+#define LINKTYPE_IEEE802_11_RADIOTAP 127
+
+static uint32_t pcap_read_u32(const uint8_t *p, bool swap) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    if (!swap) return v;
+    return ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8) |
+           ((v & 0x00ff0000u) >> 8)  | ((v & 0xff000000u) >> 24);
+}
+
+/*
+ * Reads and dissects every packet in a classic-format pcap file.
+ * Returns 0 on success (including "file had zero packets"), nonzero
+ * on a file-level error (couldn't open, bad magic, truncated global
+ * header). A single malformed PACKET record inside an otherwise-good
+ * file is logged and skipped, not treated as fatal — matches this
+ * project's "reject the bad packet, not the whole stream" discipline
+ * everywhere else.
+ */
+static int process_pcap_file(const char *path, bool link_type_80211_arg,
+                              bool link_type_80211_radiotap_arg) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    uint8_t global_hdr[24];
+    if (fread(global_hdr, 1, sizeof(global_hdr), f) != sizeof(global_hdr)) {
+        fprintf(stderr, "%s: truncated pcap global header (need 24 bytes)\n", path);
+        fclose(f);
+        return 1;
+    }
+
+    uint32_t magic = pcap_read_u32(global_hdr, false);
+    bool swap;
+    bool nanosec;
+    if (magic == PCAP_MAGIC_MICROSEC)          { swap = false; nanosec = false; }
+    else if (magic == PCAP_MAGIC_MICROSEC_SWAP) { swap = true;  nanosec = false; }
+    else if (magic == PCAP_MAGIC_NANOSEC)       { swap = false; nanosec = true;  }
+    else if (magic == PCAP_MAGIC_NANOSEC_SWAP)  { swap = true;  nanosec = true;  }
+    else {
+        fprintf(stderr, "%s: not a classic pcap file (unrecognized magic 0x%08x — "
+                        "if this is pcapng, convert it first: "
+                        "tshark -F pcap -r %s -w converted.pcap)\n", path, magic, path);
+        fclose(f);
+        return 1;
+    }
+    (void)nanosec;   /* timestamps aren't used by any dissector here — kept for clarity only */
+
+    uint32_t network = pcap_read_u32(global_hdr + 20, swap);
+
+    const char *link_name =
+        network == LINKTYPE_ETHERNET ? "Ethernet" :
+        network == LINKTYPE_IEEE802_11 ? "raw 802.11" :
+        network == LINKTYPE_IEEE802_11_RADIOTAP ? "Radiotap + 802.11" : "unsupported";
+    fprintf(stderr, "%s: link type %u (%s)\n", path, network, link_name);
+
+    if (network != LINKTYPE_ETHERNET && network != LINKTYPE_IEEE802_11 &&
+        network != LINKTYPE_IEEE802_11_RADIOTAP) {
+        fprintf(stderr, "%s: link type %u has no dissection path in this engine "
+                        "yet (only Ethernet, raw 802.11, and Radiotap+802.11 are "
+                        "wired up) — nothing to do\n", path, network);
+        fclose(f);
+        return 1;
+    }
+
+    /* The explicit --link-type flags remain available as an OVERRIDE
+     * for a file whose own header claims Ethernet but actually needs
+     * 802.11 handling (or vice versa) — genuinely rare, but cheaper to
+     * allow than to assume the file header is always trustworthy. */
+    bool use_80211 = link_type_80211_arg || network == LINKTYPE_IEEE802_11;
+    bool use_radiotap = link_type_80211_radiotap_arg || network == LINKTYPE_IEEE802_11_RADIOTAP;
+
+    unsigned char buf[SNAPLEN];
+    uint32_t packet_count = 0, skipped_count = 0;
+
+    for (;;) {
+        uint8_t rec_hdr[16];
+        size_t got = fread(rec_hdr, 1, sizeof(rec_hdr), f);
+        if (got == 0) break;               /* clean EOF between records */
+        if (got != sizeof(rec_hdr)) {
+            fprintf(stderr, "%s: truncated packet record header near packet %u\n",
+                    path, packet_count);
+            break;
+        }
+
+        uint32_t incl_len = pcap_read_u32(rec_hdr + 8, swap);
+        if (incl_len > sizeof(buf)) {
+            fprintf(stderr, "%s: packet %u claims %u bytes, more than this engine's "
+                            "%d-byte snaplen — skipping just this packet\n",
+                    path, packet_count, incl_len, SNAPLEN);
+            /* Still have to consume the bytes to stay synced with the
+             * file, or every later record would be read from the
+             * wrong offset. */
+            if (fseek(f, (long)incl_len, SEEK_CUR) != 0) break;
+            skipped_count++;
+            packet_count++;
+            continue;
+        }
+
+        size_t data_got = fread(buf, 1, incl_len, f);
+        if (data_got != incl_len) {
+            fprintf(stderr, "%s: truncated packet data at packet %u (wanted %u, got %zu)\n",
+                    path, packet_count, incl_len, data_got);
+            break;
+        }
+
+        if (use_radiotap) {
+            if (incl_len >= 4) {
+                uint16_t radiotap_len = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+                if (radiotap_len <= incl_len) {
+                    parse_80211_frame(buf + radiotap_len, (ssize_t)(incl_len - radiotap_len));
+                }
+            }
+        } else if (use_80211) {
+            parse_80211_frame(buf, (ssize_t)incl_len);
+        } else {
+            parse_ethernet_frame(buf, (ssize_t)incl_len);
+        }
+
+        packet_count++;
+    }
+
+    fprintf(stderr, "%s: %u packets read, %u skipped (oversized)\n",
+            path, packet_count, skipped_count);
+    fclose(f);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bool link_type_80211 = false;
+    bool link_type_80211_radiotap = false;
     const char *ifname = NULL;
+    const char *pcap_file_path = NULL;
 
-    /* Optional second argument: --link-type=80211, for when this
-     * program is pointed at a monitor-mode wireless interface rather
-     * than a normal wired one — see the include comment above for why
-     * that changes what recv() actually returns. Defaults to Ethernet
-     * (the existing, unchanged behavior) if not specified, so this is
-     * purely additive and doesn't change any existing invocation. */
-    if (argc == 2) {
-        ifname = argv[1];
-    } else if (argc == 3 && strcmp(argv[2], "--link-type=80211") == 0) {
-        ifname = argv[1];
-        link_type_80211 = true;
-    } else {
-        fprintf(stderr, "usage: %s <interface> [--link-type=80211]\n", argv[0]);
+    /* Argument parsing rewritten as a flexible flag scan (rather than
+     * the previous rigid argc==2/argc==3 positional checks) so
+     * --pcap-file=<path> can combine with either --link-type flag,
+     * the same way <interface> already could. First non-flag
+     * argument is the interface name (live-capture modes only —
+     * ignored/unused in --pcap-file mode). */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--pcap-file=", 12) == 0) {
+            pcap_file_path = argv[i] + 12;
+        } else if (strcmp(argv[i], "--link-type=80211") == 0) {
+            link_type_80211 = true;
+        } else if (strcmp(argv[i], "--link-type=80211-radiotap") == 0) {
+            link_type_80211_radiotap = true;
+        } else if (argv[i][0] != '-' && ifname == NULL) {
+            ifname = argv[i];
+        } else {
+            fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
+            fprintf(stderr, "usage: %s <interface> [--link-type=80211|--link-type=80211-radiotap]\n", argv[0]);
+            fprintf(stderr, "   or: %s --pcap-file=<path.pcap> [--link-type=80211|--link-type=80211-radiotap]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    /* -------------------------------------------------------------
+     * OFFLINE MODE: read a saved classic-format pcap file instead of
+     * a live interface. Added specifically so this engine can be
+     * tested against a capture without needing CAP_NET_RAW, a real
+     * interface, or root at all — register_all_dissectors() is the
+     * only setup needed; no socket, no privilege drop, no seccomp
+     * filter (there's no live, attacker-reachable file descriptor to
+     * defend here the way there is for a raw capture socket).
+     * ------------------------------------------------------------- */
+    if (pcap_file_path) {
+        register_all_dissectors();
+        return process_pcap_file(pcap_file_path, link_type_80211, link_type_80211_radiotap);
+    }
+
+    if (!ifname) {
+        fprintf(stderr, "usage: %s <interface> [--link-type=80211|--link-type=80211-radiotap]\n", argv[0]);
+        fprintf(stderr, "   or: %s --pcap-file=<path.pcap> [--link-type=80211|--link-type=80211-radiotap]\n", argv[0]);
         return 1;
     }
 
@@ -1245,7 +1448,12 @@ int main(int argc, char **argv) {
             perror("recv");
             break;
         }
-        if (link_type_80211) {
+        if (link_type_80211_radiotap) {
+            if (n < 4) continue;   /* not even enough for Radiotap's own length field */
+            uint16_t radiotap_len = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+            if (radiotap_len > n) continue;   /* claims more than we received: drop, don't guess */
+            parse_80211_frame(buf + radiotap_len, n - radiotap_len);
+        } else if (link_type_80211) {
             parse_80211_frame(buf, n);
         } else {
             parse_ethernet_frame(buf, n);
