@@ -511,7 +511,11 @@ report_stats:
  * eventually exhaust TCP_REASSEMBLY_FLOWS_PER_PARTITION and start
  * silently dropping every subsequent test case rather than exercising
  * fresh state each iteration.
+ *
+ * Marked __attribute__((unused)): called from fuzz harnesses, not
+ * from every translation unit this file gets included into.
  */
+static void tcp_reassembly_reset_partition_for_testing(uint16_t partition_id) __attribute__((unused));
 static void tcp_reassembly_reset_partition_for_testing(uint16_t partition_id) {
     if (partition_id >= TCP_REASSEMBLY_NUM_PARTITIONS) return;
     memset(g_tcp_flows[partition_id], 0, sizeof(g_tcp_flows[partition_id]));

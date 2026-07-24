@@ -12,7 +12,7 @@
  * NOT COMPILED/TESTED in this environment.
  *
  * Reuses the exact BER TLV-walking approach already verified for
- * dpi_snmp_parser.c's BER/ASN.1 decoding (ber_read_tlv — long-form
+ * dpi_snmp_parser.c's BER/ASN.1 decoding (ldap_ber_read_tlv — long-form
  * length parsing, up to 4 length-of-length bytes). Verified separately
  * against 14 real CLDAP UDP packets from a genuine capture (Johannes
  * Weber's "Ultimate PCAP") — all 14 parsed with zero failures,
@@ -64,7 +64,7 @@ struct ber_tlv {
     size_t next_pos;
 };
 
-static bool ber_read_tlv(const uint8_t *data, size_t length, size_t pos, struct ber_tlv *out) {
+static bool ldap_ber_read_tlv(const uint8_t *data, size_t length, size_t pos, struct ber_tlv *out) {
     if (pos >= length) return false;
     uint8_t tag = data[pos]; pos++;
     if (pos >= length) return false;
@@ -129,14 +129,14 @@ static double ldap_detect(const uint8_t *payload, uint16_t len,
     if (len < 6) return 0.0;
 
     struct ber_tlv seq;
-    if (!ber_read_tlv(payload, len, 0, &seq) || seq.tag != 0x30) return 0.0;
+    if (!ldap_ber_read_tlv(payload, len, 0, &seq) || seq.tag != 0x30) return 0.0;
 
     struct ber_tlv msgid;
-    if (!ber_read_tlv(payload, seq.val_start + seq.val_len, seq.val_start, &msgid) ||
+    if (!ldap_ber_read_tlv(payload, seq.val_start + seq.val_len, seq.val_start, &msgid) ||
         msgid.tag != 0x02) return 0.0;
 
     struct ber_tlv op;
-    if (!ber_read_tlv(payload, seq.val_start + seq.val_len, msgid.next_pos, &op)) return 0.0;
+    if (!ldap_ber_read_tlv(payload, seq.val_start + seq.val_len, msgid.next_pos, &op)) return 0.0;
     /* protocolOp tags are APPLICATION-class constructed/primitive,
      * i.e. the top two bits are 01 or 01+1 — 0x40-0x7F range covers
      * every real LDAP operation tag. */
@@ -159,13 +159,13 @@ static void ldap_dissect_one_message(const uint8_t *payload, size_t msg_end,
 
     if (op->tag == 0x60 /* BindRequest */) {
         struct ber_tlv version_tlv;
-        if (ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &version_tlv) &&
+        if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &version_tlv) &&
             version_tlv.tag == 0x02 && version_tlv.val_len >= 1) {
             snprintf(buf, sizeof(buf), "%u", payload[version_tlv.val_start]);
             dissect_result_add(out, "ldap_bind_version", buf);
 
             struct ber_tlv name_tlv;
-            if (ber_read_tlv(payload, op->val_start + op->val_len, version_tlv.next_pos, &name_tlv) &&
+            if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, version_tlv.next_pos, &name_tlv) &&
                 name_tlv.tag == 0x04 /* OCTET STRING */) {
                 char dn[256];
                 ldap_copy_string(payload + name_tlv.val_start, name_tlv.val_len, dn, sizeof(dn));
@@ -180,14 +180,14 @@ static void ldap_dissect_one_message(const uint8_t *payload, size_t msg_end,
         }
     } else if (op->tag == 0x63 /* SearchRequest */) {
         struct ber_tlv base_tlv;
-        if (ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &base_tlv) &&
+        if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &base_tlv) &&
             base_tlv.tag == 0x04) {
             char base_dn[256];
             ldap_copy_string(payload + base_tlv.val_start, base_tlv.val_len, base_dn, sizeof(base_dn));
             dissect_result_add(out, "ldap_search_base_dn", base_dn);
 
             struct ber_tlv scope_tlv;
-            if (ber_read_tlv(payload, op->val_start + op->val_len, base_tlv.next_pos, &scope_tlv) &&
+            if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, base_tlv.next_pos, &scope_tlv) &&
                 scope_tlv.tag == 0x0A /* ENUMERATED */ && scope_tlv.val_len >= 1) {
                 const char *scope_names[] = {"baseObject", "singleLevel", "wholeSubtree"};
                 uint8_t scope_val = payload[scope_tlv.val_start];
@@ -199,7 +199,7 @@ static void ldap_dissect_one_message(const uint8_t *payload, size_t msg_end,
          * list follow — not decoded, see file header. */
     } else if (op->tag == 0x64 /* SearchResultEntry */) {
         struct ber_tlv name_tlv;
-        if (ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &name_tlv) &&
+        if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &name_tlv) &&
             name_tlv.tag == 0x04) {
             char dn[256];
             ldap_copy_string(payload + name_tlv.val_start, name_tlv.val_len, dn, sizeof(dn));
@@ -207,13 +207,13 @@ static void ldap_dissect_one_message(const uint8_t *payload, size_t msg_end,
         }
     } else if (op->tag == 0x61 || op->tag == 0x65 || op->tag == 0x67 || op->tag == 0x69 ||
                op->tag == 0x6B || op->tag == 0x6D || op->tag == 0x6F || op->tag == 0x78) {
-        /* Every *Response/*Done message shares the LDAPResult prefix:
+        /* Every *Response or *Done message shares the LDAPResult prefix:
          * resultCode(ENUMERATED) + matchedDN(OCTET STRING) +
          * diagnosticMessage(OCTET STRING) — extract resultCode, the
          * single most useful field (success/failure visibility)
          * across all of them. */
         struct ber_tlv rc_tlv;
-        if (ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &rc_tlv) &&
+        if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &rc_tlv) &&
             rc_tlv.tag == 0x0A && rc_tlv.val_len >= 1) {
             snprintf(buf, sizeof(buf), "%u", payload[rc_tlv.val_start]);
             dissect_result_add(out, "ldap_result_code", buf);
@@ -225,7 +225,7 @@ static void ldap_dissect_one_message(const uint8_t *payload, size_t msg_end,
          * relevant signal worth surfacing the same way this project's
          * DoT/DoH detectors surface their own structural signals. */
         struct ber_tlv oid_tlv;
-        if (ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &oid_tlv) &&
+        if (ldap_ber_read_tlv(payload, op->val_start + op->val_len, op->val_start, &oid_tlv) &&
             oid_tlv.tag == 0x80) {
             char oid[64];
             ldap_copy_string(payload + oid_tlv.val_start, oid_tlv.val_len, oid, sizeof(oid));
@@ -248,20 +248,20 @@ static void ldap_dissect(const uint8_t *payload, uint16_t len,
 
     while (pos < len && n_messages < LDAP_MAX_MESSAGES_PER_BUFFER) {
         struct ber_tlv seq;
-        if (!ber_read_tlv(payload, len, pos, &seq) || seq.tag != 0x30) {
+        if (!ldap_ber_read_tlv(payload, len, pos, &seq) || seq.tag != 0x30) {
             if (n_messages == 0) dissect_result_add(out, "parse_warning", "ldap_not_a_sequence");
             break;
         }
         size_t msg_end = seq.val_start + seq.val_len;
 
         struct ber_tlv msgid;
-        if (!ber_read_tlv(payload, msg_end, seq.val_start, &msgid) || msgid.tag != 0x02) {
+        if (!ldap_ber_read_tlv(payload, msg_end, seq.val_start, &msgid) || msgid.tag != 0x02) {
             dissect_result_add(out, "parse_warning", "ldap_missing_message_id");
             break;
         }
 
         struct ber_tlv op;
-        if (!ber_read_tlv(payload, msg_end, msgid.next_pos, &op)) {
+        if (!ldap_ber_read_tlv(payload, msg_end, msgid.next_pos, &op)) {
             dissect_result_add(out, "parse_warning", "ldap_missing_protocol_op");
             break;
         }

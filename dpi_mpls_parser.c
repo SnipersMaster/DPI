@@ -105,7 +105,8 @@ static bool mpls_walk_stack(const uint8_t *data, uint16_t len, struct mpls_stack
 
 static double mpls_detect(const uint8_t *payload, uint16_t len,
                            uint16_t dst_port, const char *l4_proto) {
-    (void)dst_port;
+    (void)dst_port; (void)payload;   /* not read: this check is purely
+                                        length + protocol-string based */
     if (strcmp(l4_proto, "MPLS") != 0) return 0.0;
     if (len < MPLS_LABEL_ENTRY_LEN) return 0.0;
     return 0.9;   /* identified by EtherType at the capture-path level

@@ -99,7 +99,7 @@ static double ldp_detect(const uint8_t *payload, uint16_t len,
     if (version != 1) return 0.0;
 
     uint16_t pdu_len = (payload[2] << 8) | payload[3];
-    if (pdu_len < 6 || (size_t)(pdu_len + 4) > len + 8) return 0.0;   /* generous:
+    if (pdu_len < 6 || (size_t)(pdu_len + 4) > (size_t)len + 8) return 0.0;   /* generous:
                                                                         * multi-message
                                                                         * buffers make an
                                                                         * exact bound

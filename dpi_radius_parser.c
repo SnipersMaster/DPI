@@ -102,6 +102,18 @@ static void radius_dissect(const uint8_t *payload, uint16_t len,
                             struct dissect_result *out) {
     (void)dst_port; (void)l4_proto;
 
+    /* Real defense-in-depth, not just relying on a comment that
+     * detect() already checked this: a compiler warning (this
+     * parameter was otherwise unused) was the prompt to actually
+     * check `len` here rather than just silence the warning.
+     * detect() and dissect() are always called on the SAME buffer by
+     * this project's registry design, so this should never actually
+     * fire in practice — but dissect() no longer silently trusts that
+     * invariant. If something ever calls dissect() directly (a fuzz
+     * harness bypassing detect(), a future refactor), this now fails
+     * safely instead of reading past the real buffer. */
+    if (len < RADIUS_HDR_LEN) return;
+
     uint8_t code = payload[0];
     uint8_t identifier = payload[1];
     uint16_t declared_len = (payload[2] << 8) | payload[3];
@@ -114,7 +126,8 @@ static void radius_dissect(const uint8_t *payload, uint16_t len,
     dissect_result_add(out, "radius_identifier", buf);
 
     size_t pos = RADIUS_HDR_LEN;
-    size_t end = declared_len;   /* already validated <= len in detect() */
+    size_t end = declared_len;
+    if (end > len) end = len;   /* clamp: declared_len is attacker-influenced */
 
     while (pos + 2 <= end) {
         uint8_t attr_type = payload[pos];

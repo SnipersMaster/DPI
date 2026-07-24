@@ -44,9 +44,11 @@
 
 static double esp_detect(const uint8_t *payload, uint16_t len,
                           uint16_t dst_port, const char *l4_proto) {
-    (void)dst_port; (void)l4_proto;   /* identified by IP protocol 50
-                                        * already at the capture path,
-                                        * same reasoning as GRE/OSPF */
+    (void)dst_port; (void)l4_proto; (void)payload;   /* identified by
+                                        IP protocol 50 already at the
+                                        capture path, same reasoning as
+                                        GRE/OSPF; not read here since
+                                        this check is purely length-based */
     if (len < ESP_HDR_LEN) return 0.0;
     return 0.85;   /* can't validate structure further than "long enough
                      * for the fixed header" — everything past it is

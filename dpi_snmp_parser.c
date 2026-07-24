@@ -34,7 +34,7 @@
  * encoding itself is the same X.690 rules) + value. Verified against
  * a real constructed message before use (see file header).
  */
-static bool ber_read_tlv(const uint8_t *data, size_t len, size_t *pos,
+static bool snmp_ber_read_tlv(const uint8_t *data, size_t len, size_t *pos,
                           uint8_t *out_tag, size_t *out_value_start, size_t *out_value_len) {
     if (*pos >= len) return false;
     uint8_t tag = data[*pos];
@@ -94,14 +94,14 @@ static double snmp_detect(const uint8_t *payload, uint16_t len,
 
     size_t pos = 0;
     uint8_t tag; size_t val_start, val_len;
-    if (!ber_read_tlv(payload, len, &pos, &tag, &val_start, &val_len)) return 0.0;
+    if (!snmp_ber_read_tlv(payload, len, &pos, &tag, &val_start, &val_len)) return 0.0;
 
     /* Descend into the outer SEQUENCE and check the version INTEGER
      * looks plausible (0, 1, or 3) — cheap structural validation
      * before committing to "this is SNMP". */
     size_t inner_pos = val_start;
     uint8_t ver_tag; size_t ver_val_start, ver_val_len;
-    if (!ber_read_tlv(payload, val_start + val_len, &inner_pos, &ver_tag, &ver_val_start, &ver_val_len)) {
+    if (!snmp_ber_read_tlv(payload, val_start + val_len, &inner_pos, &ver_tag, &ver_val_start, &ver_val_len)) {
         return 0.0;
     }
     if (ver_tag != 0x02 || ver_val_len != 1) return 0.0;   /* version must be a 1-byte INTEGER */
@@ -169,14 +169,14 @@ static void snmp_walk_varbinds(const uint8_t *payload, size_t vb_list_start, siz
 
     while (pos < end && vb_count < 16) {
         uint8_t vb_tag; size_t vb_val_start, vb_val_len;
-        if (!ber_read_tlv(payload, end, &pos, &vb_tag, &vb_val_start, &vb_val_len)) break;
+        if (!snmp_ber_read_tlv(payload, end, &pos, &vb_tag, &vb_val_start, &vb_val_len)) break;
         if (vb_tag != 0x30 /* SEQUENCE */) break;
 
         size_t inner = vb_val_start;
         size_t inner_end = vb_val_start + vb_val_len;
 
         uint8_t oid_tag; size_t oid_val_start, oid_val_len;
-        if (!ber_read_tlv(payload, inner_end, &inner, &oid_tag, &oid_val_start, &oid_val_len)) break;
+        if (!snmp_ber_read_tlv(payload, inner_end, &inner, &oid_tag, &oid_val_start, &oid_val_len)) break;
         if (oid_tag != 0x06 /* OBJECT IDENTIFIER */) break;
 
         char oid_str[256];
@@ -187,7 +187,7 @@ static void snmp_walk_varbinds(const uint8_t *payload, size_t vb_list_start, siz
         }
 
         uint8_t val_tag; size_t val_val_start, val_val_len;
-        if (ber_read_tlv(payload, inner_end, &inner, &val_tag, &val_val_start, &val_val_len)) {
+        if (snmp_ber_read_tlv(payload, inner_end, &inner, &val_tag, &val_val_start, &val_val_len)) {
             snprintf(key, sizeof(key), "snmp_varbind_%d_value", vb_count);
 
             switch (val_tag) {
@@ -289,13 +289,13 @@ static void snmp_dissect(const uint8_t *payload, uint16_t len,
 
     size_t pos = 0;
     uint8_t tag; size_t val_start, val_len;
-    if (!ber_read_tlv(payload, len, &pos, &tag, &val_start, &val_len)) return;
+    if (!snmp_ber_read_tlv(payload, len, &pos, &tag, &val_start, &val_len)) return;
 
     size_t msg_end = val_start + val_len;
     size_t inner_pos = val_start;
 
     uint8_t ver_tag; size_t ver_val_start, ver_val_len;
-    if (!ber_read_tlv(payload, msg_end, &inner_pos, &ver_tag, &ver_val_start, &ver_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, msg_end, &inner_pos, &ver_tag, &ver_val_start, &ver_val_len)) return;
     uint8_t version = payload[ver_val_start];
 
     const char *version_name = (version == 0) ? "v1" : (version == 1) ? "v2c" : "v3";
@@ -310,7 +310,7 @@ static void snmp_dissect(const uint8_t *payload, uint16_t len,
     }
 
     uint8_t comm_tag; size_t comm_val_start, comm_val_len;
-    if (!ber_read_tlv(payload, msg_end, &inner_pos, &comm_tag, &comm_val_start, &comm_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, msg_end, &inner_pos, &comm_tag, &comm_val_start, &comm_val_len)) return;
     if (comm_tag == 0x04 /* OCTET STRING */) {
         char community[256];
         size_t n = comm_val_len < sizeof(community) - 1 ? comm_val_len : sizeof(community) - 1;
@@ -325,7 +325,7 @@ static void snmp_dissect(const uint8_t *payload, uint16_t len,
     }
 
     uint8_t pdu_tag; size_t pdu_val_start, pdu_val_len;
-    if (!ber_read_tlv(payload, msg_end, &inner_pos, &pdu_tag, &pdu_val_start, &pdu_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, msg_end, &inner_pos, &pdu_tag, &pdu_val_start, &pdu_val_len)) return;
     dissect_result_add(out, "snmp_pdu_type", snmp_pdu_type_name(pdu_tag));
 
     if (pdu_tag == 0xA4 /* Trap-PDU, v1 — different structure, no request-id */) {
@@ -335,7 +335,7 @@ static void snmp_dissect(const uint8_t *payload, uint16_t len,
     size_t pdu_pos = pdu_val_start;
     size_t pdu_end = pdu_val_start + pdu_val_len;
     uint8_t reqid_tag; size_t reqid_val_start, reqid_val_len;
-    if (ber_read_tlv(payload, pdu_end, &pdu_pos, &reqid_tag, &reqid_val_start, &reqid_val_len)
+    if (snmp_ber_read_tlv(payload, pdu_end, &pdu_pos, &reqid_tag, &reqid_val_start, &reqid_val_len)
         && reqid_tag == 0x02 && reqid_val_len <= 4) {
         uint32_t request_id = 0;
         for (size_t i = 0; i < reqid_val_len; i++) {
@@ -352,11 +352,11 @@ static void snmp_dissect(const uint8_t *payload, uint16_t len,
      * INTEGER) rather than extract — meaningful mainly on responses,
      * and the varbind list itself is the higher-value target here. */
     uint8_t err_tag; size_t err_val_start, err_val_len;
-    if (!ber_read_tlv(payload, pdu_end, &pdu_pos, &err_tag, &err_val_start, &err_val_len)) return;
-    if (!ber_read_tlv(payload, pdu_end, &pdu_pos, &err_tag, &err_val_start, &err_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, pdu_end, &pdu_pos, &err_tag, &err_val_start, &err_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, pdu_end, &pdu_pos, &err_tag, &err_val_start, &err_val_len)) return;
 
     uint8_t vb_list_tag; size_t vb_list_val_start, vb_list_val_len;
-    if (!ber_read_tlv(payload, pdu_end, &pdu_pos, &vb_list_tag, &vb_list_val_start, &vb_list_val_len)) return;
+    if (!snmp_ber_read_tlv(payload, pdu_end, &pdu_pos, &vb_list_tag, &vb_list_val_start, &vb_list_val_len)) return;
     if (vb_list_tag != 0x30 /* SEQUENCE OF VarBind */) return;
 
     snmp_walk_varbinds(payload, vb_list_val_start, vb_list_val_len, out);

@@ -182,6 +182,16 @@ static struct hpack_connection_entry *hpack_get_connection_entry(uint16_t partit
     return free_slot;
 }
 
+/* Marked __attribute__((unused)): a convenience wrapper around
+ * hpack_get_connection_entry() for callers that only need the
+ * dynamic table, not the full connection entry — genuinely useful,
+ * but no current caller in THIS project needs just the table alone
+ * (dpi_http2_parser.c always wants the full entry, for the
+ * CONTINUATION-reassembly fields too). Kept as public API surface
+ * for a future caller rather than removed. */
+static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition_id,
+                                                                const struct tcp_flow_key *key)
+                                                                __attribute__((unused));
 static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition_id,
                                                                 const struct tcp_flow_key *key) {
     struct hpack_connection_entry *e = hpack_get_connection_entry(partition_id, key);
@@ -192,7 +202,10 @@ static struct hpack_dynamic_table *hpack_get_connection_table(uint16_t partition
  * Test/fuzzing-only helper, mirroring
  * tcp_reassembly_reset_partition_for_testing() — clears one
  * partition's HPACK connection state entirely. NOT for production use.
+ * Marked __attribute__((unused)): called from fuzz harnesses, not
+ * from every translation unit this file gets included into.
  */
+static void hpack_conn_reset_partition_for_testing(uint16_t partition_id) __attribute__((unused));
 static void hpack_conn_reset_partition_for_testing(uint16_t partition_id) {
     if (partition_id >= TCP_REASSEMBLY_NUM_PARTITIONS) return;
     memset(g_hpack_conns[partition_id], 0, sizeof(g_hpack_conns[partition_id]));

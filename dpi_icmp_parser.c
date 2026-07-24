@@ -72,7 +72,8 @@ static const char *icmpv4_type_name(uint8_t type) {
 
 static double icmpv4_detect(const uint8_t *payload, uint16_t len,
                              uint16_t dst_port, const char *l4_proto) {
-    (void)dst_port;
+    (void)dst_port; (void)payload;   /* not read: this check is purely
+                                        length + protocol-string based */
     if (strcmp(l4_proto, "ICMP") != 0) return 0.0;
     if (len < ICMP_HDR_LEN) return 0.0;
     return 0.9;   /* IP protocol number 1 already identified this as ICMP
@@ -208,7 +209,8 @@ static const char *icmpv6_type_name(uint8_t type) {
 
 static double icmpv6_detect(const uint8_t *payload, uint16_t len,
                              uint16_t dst_port, const char *l4_proto) {
-    (void)dst_port;
+    (void)dst_port; (void)payload;   /* not read: this check is purely
+                                        length + protocol-string based */
     if (strcmp(l4_proto, "ICMPv6") != 0) return 0.0;
     if (len < ICMPV6_HDR_LEN) return 0.0;
     return 0.9;   /* same reasoning as icmpv4_detect — identified by IPv6

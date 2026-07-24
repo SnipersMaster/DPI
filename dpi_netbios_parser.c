@@ -86,7 +86,7 @@ static size_t netbios_decode_name(const uint8_t *data, size_t avail,
                                    char *out, size_t out_cap, uint8_t *suffix) {
     if (avail < 1) return 0;
     uint8_t len = data[0];
-    if (len != NETBIOS_ENCODED_NAME_LEN || avail < 1 + len) return 0;
+    if (len != NETBIOS_ENCODED_NAME_LEN || avail < 1 + (size_t)len) return 0;
 
     uint8_t decoded[16];
     for (int i = 0; i < 16; i++) {

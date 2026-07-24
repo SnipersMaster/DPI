@@ -85,15 +85,21 @@ static _Atomic(struct domain_rule_table *) g_active_table = NULL;
 static struct domain_rule_table *g_retired[RETIRED_TABLE_GRACE_SLOTS] = {0};
 static int g_retired_next = 0;
 
+static void table_free(struct domain_rule_table *t) {
+    if (!t) return;
+    free(t->rules);
+    free(t);
+}
+
 static void retire_table(struct domain_rule_table *old) {
     if (!old) return;
     struct domain_rule_table *to_free = g_retired[g_retired_next];
     g_retired[g_retired_next] = old;
     g_retired_next = (g_retired_next + 1) % RETIRED_TABLE_GRACE_SLOTS;
-    if (to_free) {
-        free(to_free->rules);
-        free(to_free);
-    }
+    /* Was duplicating table_free()'s exact body inline here — a real
+     * compiler flagging table_free() as unused was the prompt to
+     * notice and fix this, not just silence the warning. */
+    table_free(to_free);
 }
 
 static char *trim(char *s) {
@@ -297,13 +303,15 @@ static time_t file_mtime(const char *path) {
  * when the file hasn't changed since it's just a stat() call).
  *
  * Returns true if a reload happened (new table swapped in).
+ *
+ * Marked __attribute__((unused)): this project's reference bootstrap
+ * path doesn't currently wire domain-rules hot-reload into its own
+ * SIGUSR1 handler the way dpi_dhcp_parser.c's protocol config reload
+ * is — this function is genuinely present and correct, just reserved
+ * for a real deployment's own reload trigger rather than called from
+ * every translation unit this file gets included into.
  */
-static void table_free(struct domain_rule_table *t) {
-    if (!t) return;
-    free(t->rules);
-    free(t);
-}
-
+static bool reload_domain_rules_if_changed(const char *path) __attribute__((unused));
 static bool reload_domain_rules_if_changed(const char *path) {
     time_t mtime = file_mtime(path);
     if (mtime == 0) return false;   /* file missing/unreadable: keep serving old table */

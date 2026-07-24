@@ -186,7 +186,13 @@ static double rtp_detect(const uint8_t *payload, uint16_t len,
 static void rtp_dissect(const uint8_t *payload, uint16_t len,
                          uint16_t dst_port, const char *l4_proto,
                          struct dissect_result *out) {
-    (void)dst_port; (void)l4_proto; (void)len;
+    (void)dst_port; (void)l4_proto;
+
+    /* Same real defense-in-depth as radius_dissect() gained after a
+     * compiler flagged its unused `len` parameter: don't rely solely
+     * on detect()'s len < RTP_MIN_HDR_LEN check having already run on
+     * this exact buffer — fail safely here too if it somehow wasn't. */
+    if (len < RTP_MIN_HDR_LEN) return;
 
     uint8_t byte0 = payload[0];
     uint8_t byte1 = payload[1];

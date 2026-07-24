@@ -248,7 +248,7 @@ enum http2_continuation_scan_result {
  * only if the frame's full declared payload is now available — in
  * that case *out_end_headers reports whether that (now complete)
  * frame had END_HEADERS set, and the frame's payload bytes have
- * already been appended to combined_block/*combined_len_ptr.
+ * already been appended to combined_block and *combined_len_ptr.
  */
 static size_t http2_resume_partial_continuation(struct hpack_connection_entry *conn,
                                                  const uint8_t *payload, size_t len,
