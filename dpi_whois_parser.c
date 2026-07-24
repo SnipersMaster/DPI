@@ -35,6 +35,27 @@
  * honestly rather than implying a structural signal that doesn't
  * exist.
  *
+ * A REAL FALSE POSITIVE FOUND AND FIXED: `dst_port` for a genuine
+ * WHOIS response is just the client's ephemeral port (confirmed by
+ * checking how the capture path actually invokes dispatch_dissection()
+ * — it passes the packet's real destination port, with no WHOIS-
+ * specific context); this file's detect() has no way to see the
+ * real source port (43) for a response at all. The original response-
+ * side check — "one printable-ASCII line ending in CRLF, on any
+ * port" — matched completely unrelated real traffic found later in
+ * this project: a proprietary steganography tool's session banner
+ * ("Invisible Secrets 4 - Ready\r\n", one short line on TCP port
+ * 10000) scored 0.4, clearing this project's dispatch threshold
+ * (0.3), which would have misclassified it as WHOIS. Real WHOIS
+ * responses are substantially different in shape — multi-line blocks
+ * of registry data, not a single short banner — confirmed against
+ * the real response already verified for this file (5 lines, 276+
+ * bytes). Tightened to require both multiple lines and a minimum
+ * length; re-verified this still correctly detects both real WHOIS
+ * payloads from the original verification (2/5 payloads with data —
+ * the query and the response) and now correctly rejects the real
+ * false-positive sample.
+ *
  * SCOPE: the full query line (bounded) for client-to-server traffic;
  * a bounded preview of the response text for server-to-client traffic
  * — same "extract a preview, note the privacy/structure limits
@@ -87,10 +108,36 @@ static double whois_detect(const uint8_t *payload, uint16_t len,
     }
 
     /* Response direction: no structural signal exists, see file
-     * header — lean on the port and basic printability only. */
+     * header — and a REAL FALSE POSITIVE was found here, worth
+     * stating precisely. `dst_port` for a genuine WHOIS response is
+     * just the client's ephemeral port (confirmed by checking how the
+     * capture path actually calls dispatch_dissection() — it passes
+     * the packet's real destination port, nothing WHOIS-specific);
+     * this detect() function has no way to see the response's real
+     * SOURCE port (43) at all. The previous version of this check —
+     * "one printable-ASCII line ending in CRLF, any port" — matched
+     * completely unrelated real traffic: a proprietary steganography
+     * tool's session banner ("Invisible Secrets 4 - Ready\r\n", a
+     * single short line on TCP port 10000) scored 0.4, comfortably
+     * above this project's dispatch threshold (0.3), which would have
+     * misclassified it as WHOIS. Real WHOIS responses are
+     * substantially different in shape — multi-line blocks of
+     * registry data, not a single short banner line — confirmed
+     * against the one real response already verified for this file
+     * (5 lines, 276+ bytes). Tightened to require BOTH multiple lines
+     * and a minimum length, re-verified this still matches the real
+     * response and correctly rejects the real false-positive sample. */
     size_t line_end = whois_find_line_end(payload, len);
     size_t check_len = line_end < 64 ? line_end : 64;
     if (!whois_line_looks_valid(payload, check_len)) return 0.0;
+
+    if (len < 50) return 0.0;
+    int newline_count = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        if (payload[i] == '\n') newline_count++;
+    }
+    if (newline_count < 2) return 0.0;
+
     return 0.4;
 }
 
