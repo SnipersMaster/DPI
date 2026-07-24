@@ -223,6 +223,7 @@ everything else is not touched by this engine at all yet.
 | OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. Verified against all 1,778 real port-1194 payloads found in a genuine capture — 1,778/1,778 correctly scored, with a plausible real opcode distribution (mostly P_DATA_V2 data-channel traffic, a smaller mix of control-channel opcodes) rather than a suspiciously uniform one. |
 | IKE / IPsec (IKEv1/IKEv2) | `dpi_vpn_detector.c` | Validates the ISAKMP header shape and version for a VPN-likelihood score. No payload/SA parsing. Verified against all 232 real port-500 payloads (232/232 correct) and, more importantly, all 640 real port-4500 NAT-T payloads across 3 captures — a genuinely distinct code path exercising the non-ESP-marker check. Real NAT-T traffic split cleanly into 68 genuine IKE control messages (correctly scored) and 572 genuine ESP data-channel packets sharing the same port (correctly rejected as not-IKE) — confirmed the 572 really are ESP, not malformed IKE, by checking their sequence numbers increment cleanly. |
 | Encrypted Client Hello (ECH) | `dpi_app_classifier.c` | Recognized only as "SNI absent, TLS 1.3 handshake" — not decoded (ECH decoding would require the ECH config's private key, which a network observer doesn't have by design). |
+| World of Warcraft | `dpi_wow_parser.c` | TCP port 3724, never formally documented by Blizzard (reverse-engineered from scratch against one real captured packet, not from community references). Verified against all 66,610 real packets in a genuine capture — the structural signal (a 2-byte size prefix that must exactly equal the remaining buffer length) correctly matched exactly 1 packet and correctly rejected all 50,778 others, since the protocol's own header becomes RC4-encrypted immediately after that one real client authentication message — not a gap in this dissector, an inherent property of the protocol post-handshake. That one message decoded cleanly: opcode 493 (CMSG_AUTH_SESSION), a real client build number (7799), and a real account name ("SCOTTBOT") extracted via a bounded scan rather than a fixed offset, since the exact byte layout wasn't independently confirmed across client versions. The account name is a username, not a password — the actual password-proof material is a one-way SHA1 digest, never the password itself, same credential discipline as this project's other username/password fields. |
 
 ### Not supported yet, and what's worth adding next
 
@@ -317,7 +318,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (58 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser, ipv4_fragmentation, http2_continuation_reassembly) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). `fuzz_http2_continuation_reassembly.c` is a second, separate HTTP/2 harness targeting specifically the stateful, multi-delivery `http2_dissect_with_flow_state()` path (mid-frame CONTINUATION splits across TCP boundaries) that the first one doesn't reach at all. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (59 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser, ipv4_fragmentation, http2_continuation_reassembly, wow_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). `fuzz_http2_continuation_reassembly.c` is a second, separate HTTP/2 harness targeting specifically the stateful, multi-delivery `http2_dissect_with_flow_state()` path (mid-frame CONTINUATION splits across TCP boundaries) that the first one doesn't reach at all. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -421,12 +422,13 @@ stated plainly too, not left ambiguous.
 | `dpi_lldp_parser.c` | No | **Yes, extensively** | 8,616 real frames across 3 captures — 100% clean parse, the largest clean real-traffic sample in this project |
 | `dpi_kerberos_parser.c` | No | **Yes, and a real bug-shaped investigation** | 44 real packets (17 with data), 3 genuinely complete messages correctly identified out of the 17 after tracing a real port-survey discrepancy to a VLAN-stripping gap; a strict length-sanity check verified to correctly separate all 3 complete messages from all 14 incomplete/fragment ones |
 | `dpi_l2tpv3_parser.c` | No | **Yes — detector widened after a real finding** | 20 real packets — what a port survey called generic "L2TP" turned out to be L2TPv3 Ethernet pseudowire once decoded; the detector initially passed only 16/20, investigating the 4 rejections (rather than accepting the partial pass) found two more genuinely real tunneled protocols, widened to 20/20 |
-| `dpi_whois_parser.c` | No | **Yes** | 5 real payloads with data — a real query for the pcap author's own domain and a real DENIC-format response |
+| `dpi_whois_parser.c` | No | **Yes, and a real false positive found & fixed** | 5 real payloads with data — a real query for the pcap author's own domain and a real DENIC-format response. Later found (via genuinely unrelated real traffic, a proprietary steganography tool's session banner) that the response-side detection fallback would misclassify any single printable CRLF-terminated line on any port as WHOIS, scoring above this project's dispatch threshold — tightened to require multiple lines and a minimum length; re-verified no regression on the original 2/5 real WHOIS detections. |
 | `dpi_tftp_parser.c` | No | **Yes, WRQ only — 1 real packet** | Only 1 real TFTP packet exists in any capture checked, but it's a complete, self-contained WRQ (a real Cisco lab router config upload), confirmed to consume the packet to its exact last byte. DATA/ACK/ERROR implemented from spec, not real-traffic-verified |
 | `dpi_wol_parser.c` | No | **Yes — 1 real packet, but a complete one** | Only 1 real packet exists, but WoL's entire protocol IS one fixed-shape packet with no session or variation — the sync stream and all 16 MAC repeats were confirmed programmatically to match, a real Raspberry Pi Foundation OUI target |
 | `dpi_dnp3_parser.c` | No | **Yes, unusually verified** | IEEE 1815 is a paid standard, not searchable here — field layout instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other (a genuine discrepancy in a third blog source was found and discarded) |
 | `dpi_dns_parser.c` | No | No | Query name decoding (cycle-safe compression pointers) verified against a constructed adversarial cyclic-pointer case, not real traffic directly — though `dpi_mdns_parser.c` reuses this same logic and IS real-traffic-verified (339 real packets) |
 | `dpi_80211_parser.c` | No | **Yes, extensively, 5 real gaps found and closed** | 2,172 real frames across 5 genuine captures. A complete real WEP handshake (26 frames) — caught a WEP-encrypted body being misread as plaintext until the Protected bit was checked. A real "failed auth" capture's anomalous body correctly reported rather than misparsed. Radiotap encapsulation (link-type 127) found unsupported and added, verified against 38 + 2,108 real frames across two captures with two genuinely different real header lengths (20 and 24 bytes), confirming the length is read per-packet, not assumed fixed. Data-frame payload recursion found entirely missing and added — all 38 real frames in the first capture were genuine SNAP-encapsulated ARP Probes (real iPhone Wi-Fi-startup traffic); the recursion was then extended one level further (IP→TCP→HTTP, not just IP addresses) after a second real capture showed 2,108 real Data frames, 125 of them genuine HTTP requests to real YouTube-era hostnames — verified end to end against all 125. A related gap was also found and fixed in `fuzz_80211_parser.c` itself: it had never actually registered anything for `dispatch_dissection()` to match against, silently only exercising the "no match" path for every ARP/HTTP-shaped seed in its own corpus. |
+| `dpi_wow_parser.c` | No | **Yes, appropriately scoped** | 66,610 real packets checked — the structural detector correctly matched exactly 1 (the client's one real authentication message) and correctly rejected the other 50,778 real TCP payloads with data, since the protocol's own header is RC4-encrypted for the rest of a real session, not a gap in this dissector. The one real message decoded cleanly: opcode, build number, and account name (via a bounded scan, not a hardcoded offset the byte layout wasn't independently confirmed to justify). |
 
 ## Sample JSON output, one per fully-parsed protocol
 
@@ -1101,6 +1103,7 @@ on scapy/dpkt.
 | TFTP | 1 packet | Complete real WRQ, verified to the exact last byte |
 | WoL | 1 packet | Complete Magic Packet, all 16 MAC repeats verified to match |
 | 802.11 (WiFi) | 2,172 frames, 5 captures | 5 real gaps found & closed (WEP-body misread, missing Radiotap support, missing Data-frame recursion, missing HTTP recursion, a fuzz-harness registration gap) |
+| World of Warcraft (new protocol) | 66,610 packets | Structural detector correctly matched exactly 1 (the real auth message) of 50,778 real payloads — the rest RC4-encrypted post-handshake, by protocol design, not a gap |
 | ARP (Etherleak padding) | 105 frames | 73/105 real frames leaked prior-packet data — flagged |
 | ARP (IP-MAC binding conflict) | 14 (poisoning) + 6 clean captures | 8/8 true positives, 0/0 false positives |
 | IPv4 fragmentation | 8 fragment sets | **Severe real bug found & fixed** (0/8 → 8/8 reassembling correctly) |
@@ -1576,11 +1579,51 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **250 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **253 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
 those bounded/adversarial cases).
+
+## A false positive found via genuinely unrelated real traffic
+
+Worth its own section, since every other "real bug found" story in
+this document came from checking a dissector against traffic it was
+*meant* to handle — this one came from the opposite direction: while
+surveying newly-uploaded captures for undiscovered protocols, two
+genuinely niche, unrelated real applications turned up
+(`app-is-pwdxfer.pcapng`, a proprietary steganography tool's session
+transfer, and `app-nodissector.pcapng`, a legacy system-diagnostics
+tool's remote query protocol — both correctly judged too narrow in
+applicability to warrant dedicated dissectors). Checking that this
+traffic correctly falls through as "unrecognized" rather than being
+silently misclassified — a defensive check, not an expected finding —
+turned up a real one anyway.
+
+`dpi_whois_parser.c`'s response-side detection had a documented,
+acknowledged weakness (no structural signal exists for a WHOIS
+response, so detection "leans on the port number almost entirely") —
+but checking that acknowledged weakness against genuinely unrelated
+traffic showed it was worse than documented. The fallback — "one
+printable-ASCII line ending in CRLF, on any port" — scored 0.4 on the
+steganography tool's plain session banner
+(`"Invisible Secrets 4 - Ready\r\n"`, on TCP port 10000, nothing to do
+with WHOIS at all), comfortably clearing this project's 0.3 dispatch
+threshold. Traced the root cause precisely: `dst_port` for a genuine
+WHOIS response is just the client's random ephemeral port (confirmed
+by checking how the capture path actually calls
+`dispatch_dissection()`), so this detect() function has no way to see
+the response's real source port (43) at all — the fallback wasn't
+really detecting "WHOIS," it was detecting "any short printable line,"
+which is a very different and much weaker claim than the file's own
+documentation implied.
+
+Fixed by requiring both multiple lines and a minimum length — real
+WHOIS responses are substantial multi-line registry-data blocks, not
+single short banners, confirmed against the one real response already
+verified for this file. Re-verified no regression: the original 2/5
+real WHOIS detections (the query and the response) still pass, and
+the real false-positive sample now correctly scores 0.0.
 
 ## Roadmap: protocols found in newly-uploaded captures, cross-matched against the arsenal
 

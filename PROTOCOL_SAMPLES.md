@@ -15,7 +15,7 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 54 samples, covering all 51 `protocols.ini` entries plus
+complete one. 68 samples, covering all 52 `protocols.ini` entries plus
 the baseline flow record, 802.11 (standalone, not `protocols.ini`-
 gated), and RARP (folded into ARP, same dissector).
 
@@ -183,6 +183,15 @@ legitimate captures):
 {"protocol":"STUN","stun_message_type":"Binding Success Response",
  "stun_transaction_id":"a1b2c3d4e5f6a1b2c3d4e5f6",
  "stun_xor_mapped_address":"203.0.113.7","stun_xor_mapped_port":"54321"}
+```
+
+**World of Warcraft** (the one real decodable message per session — real
+account name and build number verified against a real capture; everything
+after this one message is RC4-encrypted by the protocol itself, not a
+gap in this dissector):
+```json
+{"protocol":"WoW","wow_opcode":"CMSG_AUTH_SESSION","wow_client_build":"7799",
+ "wow_account_name":"SCOTTBOT"}
 ```
 
 **RADIUS**:
