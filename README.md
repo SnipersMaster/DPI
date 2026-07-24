@@ -217,10 +217,10 @@ everything else is not touched by this engine at all yet.
 |---|---|---|
 | QUIC | `dpi_quic_parser.c` | RFC 9000/9001: identifies Initial packets, derives keys, removes header protection, AEAD-decrypts the payload, locates the CRYPTO frame, and now extracts SNI from the enclosed ClientHello (wired to `extract_sni_from_clienthello_body()`, which was split out of the TLS-over-TCP SNI parser specifically because QUIC's CRYPTO frame has no TLS record-layer wrapper — RFC 9001 S4.1.3). Logic cross-checked against RFC 9001's own pseudocode line-by-line, **and the algorithm independently re-verified against RFC 9001 Appendix A.2's real published test vector** (keys derived from scratch via Python's `hashlib`/`hmac`, decrypted via the `cryptography` library — not a re-run of this C file — recovering a ClientHello containing "example.com", matching the RFC's own example exactly). This confirms the *algorithm* is correct against real bytes; it does not yet confirm this specific C file compiles and runs correctly, which awaits an actual compiler (see the status table below). |
 | DNS-over-HTTPS (DoH) | `dpi_doh_dot_detector.c` | No structural fingerprint exists — DoH is indistinguishable from ordinary HTTPS at the wire level. Detection is entirely SNI-based, matching against `domain_rules.ini`'s `[dns_over_https]` category. This is stated plainly rather than implying a cleverer detection method exists. |
-| DNS-over-TLS (DoT) | `dpi_doh_dot_detector.c` | Structural detection: port 853 + TLS ClientHello shape. Genuine structural signal, same discipline as the VPN detector below — no fields extracted beyond the detection itself, which is why this belongs here rather than in the fully-parsed table above (an earlier revision of this README miscategorized it there; caught and fixed on a later audit). |
-| WireGuard | `dpi_vpn_detector.c` | Fingerprints handshake message types/sizes to produce a VPN-likelihood score. Does not parse WireGuard's actual handshake cryptographic fields or transport data. |
-| OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. |
-| IKE / IPsec (IKEv1/IKEv2) | `dpi_vpn_detector.c` | Validates the ISAKMP header shape and version for a VPN-likelihood score. No payload/SA parsing. |
+| DNS-over-TLS (DoT) | `dpi_doh_dot_detector.c` | Structural detection: port 853 + TLS ClientHello shape. Genuine structural signal, same discipline as the VPN detector below — no fields extracted beyond the detection itself, which is why this belongs here rather than in the fully-parsed table above (an earlier revision of this README miscategorized it there; caught and fixed on a later audit). Verified against all 80 real port-853 payloads with data — every score individually explained: 8 real handshake records correctly matched, 20 real Application Data + 2 ChangeCipherSpec records correctly rejected as not ClientHello-shaped, and the rest confirmed to be the familiar capture artifact or TCP-continuation fragments rather than unexplained misses. |
+| WireGuard | `dpi_vpn_detector.c` | Fingerprints handshake message types/sizes to produce a VPN-likelihood score. Does not parse WireGuard's actual handshake cryptographic fields or transport data. **Checked against real traffic and found none exists**: an initial port-51820 scan found 1,067 hits, but the actual bytes turned out to be a single DNS query/response pair using that port as an ephemeral source port in a 2009 capture — years before WireGuard existed. Re-scanned properly (filtering ephemeral-port coincidences): zero genuine WireGuard traffic in any capture available here. Remains logic-reviewed only, stated honestly rather than backed by a verification that didn't actually happen. |
+| OpenVPN | `dpi_vpn_detector.c` | Recognizes the opcode byte pattern for a VPN-likelihood score. No further field extraction. Verified against all 1,778 real port-1194 payloads found in a genuine capture — 1,778/1,778 correctly scored, with a plausible real opcode distribution (mostly P_DATA_V2 data-channel traffic, a smaller mix of control-channel opcodes) rather than a suspiciously uniform one. |
+| IKE / IPsec (IKEv1/IKEv2) | `dpi_vpn_detector.c` | Validates the ISAKMP header shape and version for a VPN-likelihood score. No payload/SA parsing. Verified against all 232 real port-500 payloads (232/232 correct) and, more importantly, all 640 real port-4500 NAT-T payloads across 3 captures — a genuinely distinct code path exercising the non-ESP-marker check. Real NAT-T traffic split cleanly into 68 genuine IKE control messages (correctly scored) and 572 genuine ESP data-channel packets sharing the same port (correctly rejected as not-IKE) — confirmed the 572 really are ESP, not malformed IKE, by checking their sequence numbers increment cleanly. |
 | Encrypted Client Hello (ECH) | `dpi_app_classifier.c` | Recognized only as "SNI absent, TLS 1.3 handshake" — not decoded (ECH decoding would require the ECH config's private key, which a network observer doesn't have by design). |
 
 ### Not supported yet, and what's worth adding next
@@ -230,25 +230,31 @@ recommended in earlier versions of this README (IPv6, HTTP/1.1, DNS
 answer records, SSH, HTTP/2 at the frame level + HPACK + CONTINUATION
 reassembly across TCP boundaries + connection persistence, GTP
 inner-packet recursion including IPv6 and real bounded GTP-in-GTP
-recursion, DHCP, SIP/RTP, GTPv2-C IEs (10 types now), ICMP/ICMPv6
-including embedded-packet recursion, SMTP including RFC 5322 message
-headers, MQTT, NTP, SNMP, ARP, STUN, Modbus/TCP, DNP3) is now
-implemented. What's genuinely still missing:
+recursion, DHCP, SIP/RTP, GTPv2-C IEs (13 types now, including Bearer
+QoS's bit fields), ICMP/ICMPv6 including embedded-packet recursion,
+SMTP including RFC 5322 message headers, MQTT, NTP, SNMP (now
+including Opaque and the SNMPv2 exception values), ARP (+ RARP), STUN,
+Modbus/TCP, DNP3, SMB1, POP3, TFTP, WoL, LLDP, Kerberos, L2TPv3,
+WHOIS, and 802.11) is now implemented. **SMB/CIFS and POP3/IMAP in
+particular are no longer accurate entries here** — SMB1 (`dpi_
+smb1_parser.c`) and POP3 (`dpi_pop3_parser.c`) were both built and
+verified against real traffic earlier in this project; TFTP
+(`dpi_tftp_parser.c`) too. What's genuinely still missing:
 
 | Protocol | Value | Effort relative to what's built |
 |---|---|---|
-| **SMB/CIFS** | Medium — significant for internal/enterprise network visibility (file share access, lateral movement detection) | Higher — SMB2/3 has a more complex, binary, multi-command structure than the text protocols built so far |
-| **POP3/IMAP** | Low-medium — mail retrieval visibility, similar value profile to SMTP but for the receiving side | Low — text-based command/response, same shape as SMTP/SIP already built |
-| **TFTP** | Low, but very cheap | Very low — trivial fixed-format protocol, simpler than DHCP |
+| **SMB2/3** | **Higher than SMB1's was** — SMB1 is legacy and disabled by default on modern Windows (10/Server 2016+); real enterprise file-share traffic today is overwhelmingly SMB2/3, so SMB1's coverage, while a real and useful addition, doesn't cover what a real deployment would mostly see | Higher — SMB2/3's compound-request structure (multiple commands chained in one message) and different, more involved header format are a step up from SMB1's already-built shape, though SMB1's dissector provides a directly relevant structural template to build from |
+| **IMAP** | Low-medium — mail retrieval visibility; POP3 is already covered, but IMAP is the more commonly deployed protocol in real modern mail clients (POP3 has become comparatively rare) | Low — text-based command/response, same shape as POP3/SMTP/SIP already built, though IMAP's command set and multi-line response structure (e.g. FETCH) are somewhat richer than POP3's |
+| **NFS** | Low-medium — the Unix/Linux-world counterpart to SMB for network file shares, not yet represented at all | Medium — RPC-based (would need at least a minimal ONC RPC / XDR framing layer first, unlike SMB which is self-contained) |
 
 All of these would plug into `dpi_dissector_registry.c` following the
 same `detect()`/`dissect()` pattern already used throughout — register
-the new dissector, add it to `protocols.ini`, done. SMB is probably the
-next highest-value addition given how common internal file-share
-traffic is in enterprise environments — it's also now the last item on
-this list from the original "SMB, Modbus/DNP3, or POP3/IMAP" set of
-options, since Modbus and DNP3 are both done and POP3/IMAP is lower
-distinct value given SMTP already covers similar ground.
+the new dissector, add it to `protocols.ini`, done. **IMAP is probably
+the lowest-effort, most directly comparable next addition** given how
+closely it follows the POP3/SMTP shape already built and verified;
+**SMB2/3 is the higher-value target** if enterprise internal-network
+visibility is the priority, since SMB1 alone significantly undersells
+what real modern file-share traffic looks like.
 
 **An architectural note surfaced while wiring ARP in** (see the gap
 table below for the fuller story): most protocols in this project run
@@ -352,8 +358,8 @@ fully-parsed table above. What remains:
 | `dpi_domain_rules_loader.c` | No | No | Reload swap is now a lock-free atomic pointer exchange with a bounded 4-slot grace-period retirement list (not full RCU/hazard pointers — appropriate for infrequent config-file reloads, not a general-purpose concurrent data structure pattern) |
 | `domain_rules.ini` | N/A | No | Seed list from general knowledge, not live-verified; will have stale/missing entries. ~435 rules across 21 categories including `[dns_over_https]` |
 | `dpi_dga_detector.c` | No | No | Weights are literature-informed starting points, not tuned against a labeled dataset |
-| `dpi_vpn_detector.c` | No | No | Byte offsets for WireGuard/IKE unverified against real captures; largely blind to obfuscated/VPN-over-TLS traffic by design |
-| `dpi_doh_dot_detector.c` | No | No | DoT structural detection unverified against real captures; DoH detection is inherently limited to SNI-list matching (no structural fallback exists) |
+| `dpi_vpn_detector.c` | No | No | OpenVPN and IKE (both port-500 and port-4500 NAT-T paths) verified against real traffic; WireGuard remains logic-reviewed only — a real-traffic check found zero genuine WireGuard traffic anywhere available (an initial positive was a false ephemeral-port coincidence, corrected); largely blind to obfuscated/VPN-over-TLS traffic by design |
+| `dpi_doh_dot_detector.c` | No | No | DoT structural detection verified against 80 real payloads; DoH detection is inherently limited to SNI-list matching (no structural fallback exists) |
 | `dpi_dissector_registry.c` | No | No | O(n) dispatch noted as a possible future bottleneck at very high dissector counts. The new `SIGUSR1` reload path (`reload_protocol_config()`) has an untested edge case worth flagging: if `protocols.ini` is reloaded WHILE a burst is being processed on another lcore, that lcore sees the new `enabled` values mid-burst rather than all-or-nothing per burst — harmless in practice (each packet's dispatch decision is independently consistent, just not synchronized to a single "before/after" instant), but worth stating rather than silently assuming perfect atomicity across the whole reload |
 | `dpi_dpdk_worker.c` (signal handling) | No | No | `SIGUSR1` reload is checked only by the queue-0 lcore, every 4096 poll iterations — chosen to keep the check's overhead negligible on the hot path; means a reload can take a moment to actually apply under light traffic (few polls happening), not instant |
 | `dpi_secure_bootstrap.c` (signal handling) | No | No | Checked every loop iteration (single-threaded, much lower packet rate expected, so no throttling needed the way the DPDK version needs it) |
@@ -699,6 +705,62 @@ without it, only 1 would have.
 Added a synthetic seed to the existing `fuzz_tcp_reassembly.c`
 harness's corpus specifically encoding this gap-then-fill scenario, so
 this exact path stays exercised going forward.
+
+## VPN and DoT/DoH detectors, verified against real traffic — including a false positive caught in the process
+
+`dpi_vpn_detector.c` and `dpi_doh_dot_detector.c` were flagged in this
+project's own suggested-next-steps list as unvalidated against real
+captures. Checked properly rather than left on that list indefinitely.
+
+**A genuine port survey correction, caught before it became a false
+claim.** An initial broad scan for traffic on WireGuard's default port
+(51820) found 1,067 packets and, taken at face value, would have been
+reported as "1,067 real WireGuard packets verified." Checking the
+actual bytes instead of trusting the port count caught this: it's a
+single DNS query/response pair using 51820 as an ephemeral *source*
+port, coincidentally, in a 2009 capture — nearly a decade before
+WireGuard existed. The broad scan hadn't distinguished source-port
+matches from destination-port matches, the same "ephemeral client
+ports inflate the count" pattern this project's port surveys have
+caught before, here specifically almost leading to a fabricated
+verification claim rather than just an inflated count. Redone
+properly (filtering out matches where the other side is an unrelated
+well-known port): **zero genuine WireGuard traffic exists in any
+capture available to this project** — `score_wireguard()` remains
+logic-reviewed only, stated honestly as such rather than backed by a
+verification that didn't actually happen.
+
+**What did check out, thoroughly:**
+- **`score_dot()`**: verified against all 80 real port-853 payloads
+  with data. Every single score was individually explained, not just
+  tallied: 8 real TLS ClientHello/handshake records correctly scored
+  0.85; 20 real TLS Application Data records correctly scored 0 (not
+  ClientHello-shaped, exactly as designed); 2 real ChangeCipherSpec
+  records correctly scored 0 for the same reason; 44 instances of the
+  familiar 6-byte capture artifact (now confirmed across seven
+  different contexts in this project); and 6 packets that don't start
+  with any valid TLS content-type byte at all, confirmed to be
+  TCP-continuation-fragment artifacts of raw per-packet testing — the
+  same class of finding already extensively documented for SMB1,
+  Kerberos, and LDP, and handled correctly by real TCP reassembly in
+  the actual capture path. Zero unexplained results.
+- **`score_openvpn()`**: verified against all 1,778 real port-1194
+  payloads in `set3.pcap` — 1,778/1,778 correctly scored 0.3, with a
+  genuinely plausible real opcode distribution (1,743 P_DATA_V2 data-
+  channel packets, the rest a smaller mix of control-channel opcodes)
+  rather than a suspicious uniform pattern.
+- **`score_ike()`**: verified against all 232 real port-500 payloads
+  (232/232 correctly scored 0.7) AND, more importantly, all 640 real
+  port-4500 (NAT-T) payloads across 3 captures — a code path distinct
+  from port 500's, exercising the non-ESP-marker check specifically.
+  Found the real traffic splits cleanly into 68 genuine IKE control
+  messages (marker present, correctly scored 0.7) and 572 genuine ESP
+  data-channel packets sharing the same port (marker absent, correctly
+  scored 0, not IKE) — confirmed the 572 really are ESP and not
+  malformed IKE by checking their sequence-number field increments
+  cleanly (2, 3, 4, 5, 6, 7, 8...) exactly as real ESP traffic would.
+  Zero false rejections among the 68 genuine IKE messages, zero false
+  acceptances among the 572 genuine ESP messages.
 
 ## A gap closed rather than just disclosed: HTTP/2 CONTINUATION mid-frame splits
 
@@ -1476,7 +1538,10 @@ earlier fix was complete.
 **DNP3 added as this project's second ICS/SCADA protocol**, rounding
 out the "SMB, Modbus/DNP3, or POP3/IMAP" set of next-protocol options
 from an earlier pass (Modbus was added first; DNP3 completes that
-pairing, narrowing the remaining list to just SMB and POP3/IMAP). Its
+pairing, narrowing the remaining list to just SMB and POP3/IMAP).
+*(Since updated: SMB1 and POP3 were both later built too — see the
+"Not supported yet" section for the current, accurate remaining list,
+which is now SMB2/3 and IMAP specifically.)* Its
 verification methodology is genuinely different from most of this
 project: IEEE 1815 (DNP3's governing spec) is a paid standard not
 available to search or fetch here, so instead of checking against the
@@ -1517,10 +1582,10 @@ QUIC. **24 fuzz harnesses total now.**
    surface something a read-through can't.
 4. **Load-test the async output ring buffer** under realistic burst
    conditions — unchanged from before.
-5. **Validate `dpi_vpn_detector.c` and `dpi_doh_dot_detector.c`**
-   against real captures — unchanged from before.
 
-*(Four items previously listed here — reassembling HTTP/2's mid-frame
+*(Five items previously listed here — reassembling HTTP/2's mid-frame
 CONTINUATION split, extending Bearer QoS beyond QCI, walking SNMP's
-Opaque type plus GTPv2-C's remaining common IEs, and adding SMB — are
-now done; see the relevant sections earlier in this document for each.)*
+Opaque type plus GTPv2-C's remaining common IEs, adding SMB, and
+validating `dpi_vpn_detector.c`/`dpi_doh_dot_detector.c` against real
+captures — are now done; see the relevant sections earlier in this
+document for each.)*

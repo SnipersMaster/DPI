@@ -8,6 +8,10 @@
  * more complex binary structure) and POP3/IMAP (lower distinct value
  * given SMTP already covers similar mail-protocol ground) as the next
  * protocol addition — see the README's protocol recommendation table.
+ * (Since updated: SMB1 and POP3 were both later built —
+ * `dpi_smb1_parser.c`, `dpi_pop3_parser.c` — once they became the
+ * clear next candidates; SMB2/3 and IMAP remain the genuinely open
+ * items from this original comparison.)
  *
  * NOT COMPILED/TESTED in this environment.
  *
