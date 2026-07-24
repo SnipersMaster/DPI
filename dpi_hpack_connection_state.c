@@ -62,12 +62,16 @@
 
 /* MEMORY FOOTPRINT of the pending-CONTINUATION addition specifically:
  * HPACK_PENDING_BLOCK_MAX (16384) + stream_id (4) + length (8) + flag (1)
- * ≈ 16.4 KB added per connection entry. At HPACK_CONN_PER_PARTITION=32
- * across TCP_REASSEMBLY_NUM_PARTITIONS=16 partitions, that's ~8 MB
- * additional static memory for this feature alone, on top of whatever
- * the dynamic table itself already costs. Worth knowing before treating
- * this as a "small" addition — it isn't free, even though it's bounded
- * and predictable. */
+ * ≈ 16.4 KB added per connection entry for the frame-boundary case,
+ * PLUS another ~16.4 KB for the mid-frame-payload partial-CONTINUATION
+ * state added alongside it (partial_cont_payload is the same
+ * HPACK_PENDING_BLOCK_MAX size) — roughly 33 KB total per connection
+ * entry for CONTINUATION reassembly state now. At
+ * HPACK_CONN_PER_PARTITION=32 across TCP_REASSEMBLY_NUM_PARTITIONS=16
+ * partitions, that's ~17 MB additional static memory for this feature
+ * alone, on top of whatever the dynamic table itself already costs.
+ * Worth knowing before treating this as a "small" addition — it isn't
+ * free, even though it's bounded and predictable. */
 
 struct hpack_connection_entry {
     bool     in_use;
@@ -84,17 +88,40 @@ struct hpack_connection_entry {
      * dpi_http2_parser.c's http2_dissect_core() for where this is
      * populated and consumed.
      *
-     * SCOPE: this only covers the case where the split happens
-     * cleanly AT a frame boundary (not enough buffer for the next
-     * frame's header at all) — not a split in the middle of a
-     * CONTINUATION frame's own header or payload, which would need
-     * additional partial-frame state this doesn't track. Flagged via
-     * http2_continuation_split_mid_frame_not_reassembled when that
-     * happens, same as before this change. */
+     * SCOPE: this covers a split that lands cleanly AT a frame
+     * boundary (not enough buffer for the next frame's header at
+     * all) AND — now — a split in the MIDDLE of a CONTINUATION
+     * frame's own payload (header fully present, payload isn't), via
+     * the partial_cont_* fields below. A split in the middle of the
+     * frame's own 9-byte HEADER (as opposed to its payload) is still
+     * not tracked here — RFC 9113's fixed, tiny 9-byte frame header
+     * essentially never gets split by itself in practice (a TCP
+     * delivery boundary landing inside a 9-byte span while somehow
+     * not also being able to include a few more bytes of payload
+     * would require an almost pathologically small delivery), and
+     * this project's existing bounded-state discipline doesn't add
+     * tracking for a case with no real-traffic evidence it occurs —
+     * still correctly falls through to
+     * http2_continuation_split_mid_frame_not_reassembled in that
+     * narrower remaining case, stated honestly rather than silently
+     * assumed covered by the fix below. */
     bool     has_pending_headers;
     uint32_t pending_stream_id;
     uint8_t  pending_block[HPACK_PENDING_BLOCK_MAX];
     size_t   pending_block_len;
+
+    /* Partial-CONTINUATION-frame state: the frame's 9-byte header has
+     * been fully read (so its declared length and flags are known),
+     * but the delivery ended before its payload was complete. Kept
+     * separate from pending_block above, which only ever holds
+     * COMPLETE frames' worth of already-extracted header-block bytes
+     * — this holds the raw, still-incomplete payload of the ONE frame
+     * currently in flight, if any. */
+    bool     has_partial_continuation_frame;
+    uint32_t partial_cont_full_len;      /* this frame's declared total payload length */
+    uint8_t  partial_cont_flags;         /* this frame's flags (for END_HEADERS, once complete) */
+    uint8_t  partial_cont_payload[HPACK_PENDING_BLOCK_MAX];
+    size_t   partial_cont_payload_len;   /* how much of this frame's payload has arrived so far */
 };
 
 /* Reuses TCP_REASSEMBLY_NUM_PARTITIONS from dpi_tcp_flow_reassembly.c —

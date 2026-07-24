@@ -704,24 +704,93 @@ static void gtpv2_dissect(const uint8_t *payload, uint16_t len,
                 }
                 break;
             }
-            case 80: {  /* Bearer QoS, TS 29.274 S8.15 — DELIBERATELY
-                         * PARTIAL. Octet 5 packs PCI/PL/PVI as bit
-                         * fields whose EXACT bit positions this project
-                         * doesn't have the source spec text in front of
-                         * it to verify with the same confidence as
-                         * everything else here (unlike F-TEID/PAA,
-                         * which were verified against constructed test
-                         * vectors) — rather than assert a bit-field
-                         * layout that might be subtly wrong, only QCI
-                         * (octet 6, an unambiguous single byte
-                         * immediately following the flags octet) is
-                         * extracted. The four 5-byte bit-rate fields
-                         * that follow (Uplink/Downlink Maximum and
-                         * Guaranteed Bit Rate) are present but not
-                         * decoded in this pass for the same reason. */
+            case 80: {  /* Bearer QoS, TS 29.274 S8.15 — NOW FULLY
+                         * DECODED. Previously deliberately partial
+                         * (QCI only), pending access to the actual
+                         * spec text for octet 5's bit-field layout.
+                         * Since resolved by checking the authoritative
+                         * text directly (a 3GPP CT4 change-request
+                         * document — 3GPP TS 29.274 S8.15's own Figure
+                         * 8.15-1 and bit list — cross-confirmed against
+                         * an independent secondary source, a Cisco
+                         * SGSN admin guide that separately cites the
+                         * same clause), rather than guessed at or left
+                         * unverified indefinitely:
+                         *   Octet 5 (ie_val[0]) = ARP: bit 7 = PCI,
+                         *     bits 6-3 = PL (4-bit priority level),
+                         *     bit 1 = PVI, bits 8 and 2 spare (3GPP's
+                         *     own bit-numbering convention: bit 8 is
+                         *     the octet's MSB, bit 1 its LSB).
+                         *   Octet 6 (ie_val[1]) = QCI, as before.
+                         *   Octets 7-11/12-16/17-21/22-26 (ie_val[2..]
+                         *     in four 5-byte groups) = Maximum bit
+                         *     rate for uplink/downlink, then
+                         *     Guaranteed bit rate for uplink/downlink
+                         *     — each confirmed to be a plain 40-bit
+                         *     big-endian unsigned integer, directly in
+                         *     kbps (not a packed or exponential
+                         *     encoding), per the spec text's own
+                         *     "encoded as kilobits per second... in
+                         *     binary value" description. uint64_t used
+                         *     for these specifically because a 40-bit
+                         *     field doesn't fit uint32_t without risking
+                         *     silent truncation, even though real
+                         *     bearer bitrates never come close to
+                         *     needing the full range. */
                 if (ie_len >= 2) {
+                    uint8_t arp_octet = ie_val[0];
+                    uint8_t pci = (arp_octet >> 6) & 0x01;
+                    uint8_t pl = (arp_octet >> 2) & 0x0F;
+                    uint8_t pvi = arp_octet & 0x01;
+                    snprintf(val, sizeof(val), "%u", pci);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_arp_pci", ie_count);
+                    dissect_result_add(out, key, val);
+                    snprintf(val, sizeof(val), "%u", pl);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_arp_priority_level", ie_count);
+                    dissect_result_add(out, key, val);
+                    snprintf(val, sizeof(val), "%u", pvi);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_arp_pvi", ie_count);
+                    dissect_result_add(out, key, val);
+
                     snprintf(val, sizeof(val), "%u", ie_val[1]);
                     snprintf(key, sizeof(key), "gtpv2_ie_%d_qci", ie_count);
+                    dissect_result_add(out, key, val);
+                }
+                if (ie_len >= 22) {
+                    /* Four 5-byte rate fields in fixed order: MBR
+                     * uplink, MBR downlink, GBR uplink, GBR downlink.
+                     * Written out explicitly (not looped with a
+                     * runtime-selected format string) to keep every
+                     * snprintf format string a literal, matching this
+                     * file's existing style throughout. */
+                    const uint8_t *mbr_ul = ie_val + 2;
+                    const uint8_t *mbr_dl = ie_val + 7;
+                    const uint8_t *gbr_ul = ie_val + 12;
+                    const uint8_t *gbr_dl = ie_val + 17;
+
+                    uint64_t v;
+                    v = ((uint64_t)mbr_ul[0]<<32)|((uint64_t)mbr_ul[1]<<24)|
+                        ((uint64_t)mbr_ul[2]<<16)|((uint64_t)mbr_ul[3]<<8)|mbr_ul[4];
+                    snprintf(val, sizeof(val), "%llu", (unsigned long long)v);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_mbr_uplink_kbps", ie_count);
+                    dissect_result_add(out, key, val);
+
+                    v = ((uint64_t)mbr_dl[0]<<32)|((uint64_t)mbr_dl[1]<<24)|
+                        ((uint64_t)mbr_dl[2]<<16)|((uint64_t)mbr_dl[3]<<8)|mbr_dl[4];
+                    snprintf(val, sizeof(val), "%llu", (unsigned long long)v);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_mbr_downlink_kbps", ie_count);
+                    dissect_result_add(out, key, val);
+
+                    v = ((uint64_t)gbr_ul[0]<<32)|((uint64_t)gbr_ul[1]<<24)|
+                        ((uint64_t)gbr_ul[2]<<16)|((uint64_t)gbr_ul[3]<<8)|gbr_ul[4];
+                    snprintf(val, sizeof(val), "%llu", (unsigned long long)v);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_gbr_uplink_kbps", ie_count);
+                    dissect_result_add(out, key, val);
+
+                    v = ((uint64_t)gbr_dl[0]<<32)|((uint64_t)gbr_dl[1]<<24)|
+                        ((uint64_t)gbr_dl[2]<<16)|((uint64_t)gbr_dl[3]<<8)|gbr_dl[4];
+                    snprintf(val, sizeof(val), "%llu", (unsigned long long)v);
+                    snprintf(key, sizeof(key), "gtpv2_ie_%d_gbr_downlink_kbps", ie_count);
                     dissect_result_add(out, key, val);
                 }
                 break;

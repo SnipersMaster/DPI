@@ -24,17 +24,43 @@
  *     persistent state on, so it still uses a fresh dynamic table and
  *     no cross-boundary CONTINUATION resumption — this is inherent to
  *     that entry point, not a remaining bug.
- *   - SETTINGS_HEADER_TABLE_SIZE tracking uses ONE table per
- *     connection, not the two independent per-direction encoding
- *     contexts real HTTP/2 has — see the SETTINGS-handling code's own
- *     comment for why this is a stated simplification, not an oversight.
- *   - CONTINUATION reassembly across a TCP boundary only covers a
- *     split that lands CLEANLY at a frame boundary (not enough buffer
- *     for the next frame's header at all). A split in the MIDDLE of a
- *     CONTINUATION frame's own header or payload is a different,
- *     still-unhandled case — flagged via
- *     http2_continuation_split_mid_frame_not_reassembled rather than
- *     silently mishandled.
+ *   - SETTINGS_HEADER_TABLE_SIZE tracking correctly resizes the
+ *     OPPOSITE direction's table (RFC 9113 S6.5.1: a SETTINGS frame
+ *     constrains the peer's encoder, not the sender's own) via
+ *     `reverse_conn`, looked up through `tcp_flow_key_reverse()` — an
+ *     earlier version of this file resized the SAME direction's table,
+ *     which was a real correctness bug, not just a simplification;
+ *     that's fixed now. The residual gap: this doesn't distinguish
+ *     multiple SETTINGS frames arriving with different values over a
+ *     connection's lifetime, applying whichever was most recently
+ *     seen — a minor gap since real endpoints rarely change this
+ *     value mid-connection, unlike the direction issue above.
+ *   - CONTINUATION reassembly across a TCP boundary previously only
+ *     covered a split that landed CLEANLY at a frame boundary. A split
+ *     in the MIDDLE of a CONTINUATION frame's own payload (its 9-byte
+ *     header fully present, only the payload incomplete) is now ALSO
+ *     handled — `http2_resume_partial_continuation()` in this file
+ *     persists that one in-flight frame's partial payload (in the new
+ *     connection-state fields alongside the existing pending_block)
+ *     and completes it from the start of the next delivery, correctly
+ *     handling both a two-delivery split and a longer chain needing
+ *     several deliveries to complete, and correctly continuing to scan
+ *     for further CONTINUATION frames in the SAME buffer if the
+ *     newly-completed frame didn't itself carry END_HEADERS. Verified
+ *     against constructed multi-delivery scenarios covering all three
+ *     shapes (two-way split, three-way split, split-then-another-
+ *     frame-follows) — not real-traffic-verified, since no real
+ *     capture available to this project happened to include a TCP
+ *     delivery boundary landing inside a CONTINUATION frame's payload
+ *     specifically (a genuinely rare occurrence even in real HTTP/2
+ *     traffic), stated honestly rather than implied otherwise. A
+ *     split in the middle of the 9-byte frame HEADER itself (as
+ *     opposed to its payload) remains the one still-unhandled case,
+ *     flagged via http2_continuation_split_mid_frame_not_reassembled
+ *     — RFC 9113's fixed, tiny 9-byte header essentially never gets
+ *     split by itself in practice, so this project's bounded-state
+ *     discipline doesn't add tracking for a case with no real-traffic
+ *     evidence it occurs.
  *
  * Frame-level metadata (frame type distribution, stream count, frame
  * sizes, RST_STREAM ratio for Rapid-Reset-style abuse detection)
@@ -209,10 +235,73 @@ enum http2_continuation_scan_result {
     HTTP2_CONT_FAILED
 };
 
+/*
+ * Attempts to complete a partial CONTINUATION frame using bytes from
+ * the START of a new TCP delivery, if the connection has one pending
+ * (`conn->has_partial_continuation_frame`). This is the piece that
+ * closes the "split in the MIDDLE of a CONTINUATION frame's payload"
+ * gap this file previously only disclosed rather than handled.
+ *
+ * Returns the number of bytes consumed from `payload` (0 if there was
+ * nothing pending, or if consuming stopped because `payload` ran out
+ * before the frame could be completed). Sets *frame_completed to true
+ * only if the frame's full declared payload is now available — in
+ * that case *out_end_headers reports whether that (now complete)
+ * frame had END_HEADERS set, and the frame's payload bytes have
+ * already been appended to combined_block/*combined_len_ptr.
+ */
+static size_t http2_resume_partial_continuation(struct hpack_connection_entry *conn,
+                                                 const uint8_t *payload, size_t len,
+                                                 uint8_t *combined_block, size_t combined_cap,
+                                                 size_t *combined_len_ptr,
+                                                 bool *frame_completed, bool *out_end_headers,
+                                                 struct dissect_result *out) {
+    *frame_completed = false;
+    *out_end_headers = false;
+    if (!conn || !conn->has_partial_continuation_frame) return 0;
+
+    uint32_t needed = conn->partial_cont_full_len - (uint32_t)conn->partial_cont_payload_len;
+    size_t take = (size_t)needed < len ? (size_t)needed : len;
+
+    if (conn->partial_cont_payload_len + take > sizeof(conn->partial_cont_payload)) {
+        /* Shouldn't happen given partial_cont_full_len is itself bounds-
+         * checked against this same buffer size before ever being
+         * stored (see the scan function below) — defensive only. */
+        dissect_result_add(out, "parse_warning", "continuation_partial_frame_buffer_exceeded");
+        conn->has_partial_continuation_frame = false;
+        return take;
+    }
+    memcpy(conn->partial_cont_payload + conn->partial_cont_payload_len, payload, take);
+    conn->partial_cont_payload_len += take;
+
+    if (conn->partial_cont_payload_len < conn->partial_cont_full_len) {
+        /* Still not enough — this whole new delivery (or what's left
+         * of it) went toward completing this one frame, and it still
+         * isn't done. Stay pending, consume everything offered. */
+        dissect_result_add(out, "http2_continuation_partial_frame_still_pending", "true");
+        return take;
+    }
+
+    /* Frame's payload is now complete. */
+    if (*combined_len_ptr + conn->partial_cont_payload_len > combined_cap) {
+        dissect_result_add(out, "parse_warning", "continuation_reassembly_buffer_exceeded");
+        conn->has_partial_continuation_frame = false;
+        return take;
+    }
+    memcpy(combined_block + *combined_len_ptr, conn->partial_cont_payload,
+           conn->partial_cont_payload_len);
+    *combined_len_ptr += conn->partial_cont_payload_len;
+    *out_end_headers = (conn->partial_cont_flags & 0x04 /* END_HEADERS */) != 0;
+    *frame_completed = true;
+    conn->has_partial_continuation_frame = false;
+    dissect_result_add(out, "http2_continuation_mid_frame_split_reassembled", "true");
+    return take;
+}
+
 static enum http2_continuation_scan_result http2_scan_continuations(
         const uint8_t *payload, uint16_t len, size_t *scan_pos_ptr, uint32_t stream_id,
         uint8_t *combined_block, size_t combined_cap, size_t *combined_len_ptr,
-        struct dissect_result *out) {
+        struct hpack_connection_entry *conn, struct dissect_result *out) {
     size_t scan_pos = *scan_pos_ptr;
     size_t combined_len = *combined_len_ptr;
 
@@ -243,8 +332,27 @@ static enum http2_continuation_scan_result http2_scan_continuations(
 
         if (scan_pos + HTTP2_FRAME_HDR_LEN + cont_len > len) {
             /* Split in the MIDDLE of this CONTINUATION frame's own
-             * header/payload, not cleanly between frames — the scope
-             * limit this file still has, see the enum comment above. */
+             * payload (its 9-byte header IS fully present — the check
+             * above already required that — only the payload runs
+             * off the end of this delivery). Resumable now, given a
+             * connection entry to save the partial payload in;
+             * without one (conn == NULL, e.g. the registry-facing
+             * entry point with no flow identity), still correctly
+             * falls back to the honest FAILED/not-reassembled
+             * outcome, since there's nowhere to persist the partial
+             * state until the next call. */
+            if (conn && cont_len <= sizeof(conn->partial_cont_payload)) {
+                size_t avail = len - (scan_pos + HTTP2_FRAME_HDR_LEN);
+                memcpy(conn->partial_cont_payload, payload + scan_pos + HTTP2_FRAME_HDR_LEN, avail);
+                conn->partial_cont_payload_len = avail;
+                conn->partial_cont_full_len = cont_len;
+                conn->partial_cont_flags = cont_flags;
+                conn->has_partial_continuation_frame = true;
+                dissect_result_add(out, "http2_continuation_mid_frame_split_pending", "true");
+                *scan_pos_ptr = len;   /* this delivery is fully consumed */
+                *combined_len_ptr = combined_len;
+                return HTTP2_CONT_NEED_MORE;
+            }
             dissect_result_add(out, "http2_continuation_split_mid_frame_not_reassembled", "true");
             *scan_pos_ptr = scan_pos;
             *combined_len_ptr = combined_len;
@@ -319,34 +427,78 @@ static void http2_dissect_core(const uint8_t *payload, uint16_t len,
                                  * where the previous delivery's buffer
                                  * ran out — see the NEED_MORE case below
                                  * for why that's a safe assumption here */
-        enum http2_continuation_scan_result res = http2_scan_continuations(
-            payload, len, &scan_pos, conn->pending_stream_id,
-            combined_block, sizeof(combined_block), &combined_len, out);
+        bool already_complete = false;   /* set if resuming a mid-frame
+                                            * split alone finished the
+                                            * whole reassembly, skipping
+                                            * the normal scan below */
 
-        if (res == HTTP2_CONT_COMPLETE) {
-            dissect_result_add(out, "http2_continuation_resumed_across_tcp_boundary", "true");
-            http2_process_header_block(combined_block, combined_len, persistent_dyn, out);
-            conn->has_pending_headers = false;
-            pos = scan_pos;   /* continue the normal frame loop below for
-                                * anything remaining in this buffer */
-        } else if (res == HTTP2_CONT_NEED_MORE) {
-            /* Still not enough — update the pending state again and
-             * stop; nothing else in this delivery can be safely
-             * processed until the rest arrives. */
-            if (combined_len <= sizeof(conn->pending_block)) {
-                memcpy(conn->pending_block, combined_block, combined_len);
-                conn->pending_block_len = combined_len;
-                dissect_result_add(out, "http2_continuation_still_pending", "true");
+        /* If a CONTINUATION frame's payload was itself split mid-frame
+         * across this TCP boundary, first try to complete IT using
+         * bytes from the start of this new delivery — the piece that
+         * closes the gap this file used to just disclose. */
+        if (conn->has_partial_continuation_frame) {
+            bool frame_completed = false, end_headers = false;
+            size_t consumed = http2_resume_partial_continuation(
+                conn, payload, len, combined_block, sizeof(combined_block),
+                &combined_len, &frame_completed, &end_headers, out);
+            scan_pos = consumed;
+
+            if (!frame_completed) {
+                /* Whatever was available in this delivery all went
+                 * toward completing this one frame, and it still
+                 * isn't enough — save state and stop, same as the
+                 * frame-boundary NEED_MORE case below. */
+                if (combined_len <= sizeof(conn->pending_block)) {
+                    memcpy(conn->pending_block, combined_block, combined_len);
+                    conn->pending_block_len = combined_len;
+                }
+                return;
             }
-            return;
-        } else {
-            /* FAILED — give up on this pending sequence rather than
-             * risk resuming from a now-desynchronized position. Fall
-             * through to process the rest of this buffer as if
-             * nothing were pending (pos stays 0), same degraded-but-
-             * reasonable behavior as a fresh protocol violation. */
-            conn->has_pending_headers = false;
-            dissect_result_add(out, "http2_continuation_resume_failed", "true");
+            if (end_headers) {
+                /* That one frame completing was ALSO the end of the
+                 * whole header block — done, no need to scan further. */
+                dissect_result_add(out, "http2_continuation_resumed_across_tcp_boundary", "true");
+                http2_process_header_block(combined_block, combined_len, persistent_dyn, out);
+                conn->has_pending_headers = false;
+                pos = scan_pos;
+                already_complete = true;
+            }
+            /* Else: this frame completed but didn't have END_HEADERS —
+             * fall through to the normal scan below, starting at
+             * scan_pos, to look for whatever CONTINUATION frame(s)
+             * follow immediately in this same buffer. */
+        }
+
+        if (!already_complete) {
+            enum http2_continuation_scan_result res = http2_scan_continuations(
+                payload, len, &scan_pos, conn->pending_stream_id,
+                combined_block, sizeof(combined_block), &combined_len, conn, out);
+
+            if (res == HTTP2_CONT_COMPLETE) {
+                dissect_result_add(out, "http2_continuation_resumed_across_tcp_boundary", "true");
+                http2_process_header_block(combined_block, combined_len, persistent_dyn, out);
+                conn->has_pending_headers = false;
+                pos = scan_pos;   /* continue the normal frame loop below for
+                                    * anything remaining in this buffer */
+            } else if (res == HTTP2_CONT_NEED_MORE) {
+                /* Still not enough — update the pending state again and
+                 * stop; nothing else in this delivery can be safely
+                 * processed until the rest arrives. */
+                if (combined_len <= sizeof(conn->pending_block)) {
+                    memcpy(conn->pending_block, combined_block, combined_len);
+                    conn->pending_block_len = combined_len;
+                    dissect_result_add(out, "http2_continuation_still_pending", "true");
+                }
+                return;
+            } else {
+                /* FAILED — give up on this pending sequence rather than
+                 * risk resuming from a now-desynchronized position. Fall
+                 * through to process the rest of this buffer as if
+                 * nothing were pending (pos stays 0), same degraded-but-
+                 * reasonable behavior as a fresh protocol violation. */
+                conn->has_pending_headers = false;
+                dissect_result_add(out, "http2_continuation_resume_failed", "true");
+            }
         }
     }
 
@@ -488,7 +640,7 @@ static void http2_dissect_core(const uint8_t *payload, uint16_t len,
                                                   * CONTINUATION frames to scan for */
                         : http2_scan_continuations(payload, len, &scan_pos, stream_id,
                                                     combined_block, sizeof(combined_block),
-                                                    &combined_len, out);
+                                                    &combined_len, conn, out);
 
                     if (res == HTTP2_CONT_COMPLETE) {
                         if (scan_pos != consumed_through) {
