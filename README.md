@@ -388,6 +388,14 @@ fully-parsed table above. What remains:
 
 ## Sample JSON output, one per fully-parsed protocol
 
+**This section predates roughly 30 of the protocols this project has
+since added and was never fully caught up — see
+[`PROTOCOL_SAMPLES.md`](./PROTOCOL_SAMPLES.md) for the current,
+complete set (54 samples, one per registered protocol plus the
+baseline flow record, verified field-name-by-field-name against each
+dissector's actual source). The samples below are kept for now since
+they're still accurate, just incomplete.**
+
 Every sample below is a plausible flow/dissection record for that
 specific protocol — not from a live run (nothing here has actually
 been executed), but each field matches what that dissector's code
@@ -1412,6 +1420,47 @@ validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
 those bounded/adversarial cases).
+
+## Roadmap: protocols found in newly-uploaded captures, cross-matched against the arsenal
+
+13 additional pcaps were checked byte-level against every currently
+registered protocol (see `protocols.ini`'s 51 entries). Same
+discipline as everywhere else in this document: real bytes decoded
+before any claim, not inferred from filenames or port numbers alone.
+
+**Already fully covered, no action needed**: ARP (`arp.pcap`),
+DHCP/BOOTP base fields (`bootp-both.pcap`, `bootpbot.pcap`,
+`dhcp-auth.pcap`, `dhcp-auth1.pcap`, `DHCP.pcap`, `packet.pcap`), DNS
+(port-53 traffic inside `amqp_gssapi.pcap`), and TCP/UDP/TLS via the
+existing baseline path (`packet.pcap`'s port-443 traffic).
+
+**A gap in an already-covered protocol** (breadth extension, not a new
+file): `dhcp-auth.pcap`/`dhcp-auth1.pcap` carry real DHCP option 90
+(Authentication, RFC 3118 — a genuine 31-byte auth blob: protocol/
+algorithm/RDM/replay-detection/auth-info fields, fully decoded by
+hand) and option 82 (Relay Agent Information), neither of which
+`dpi_dhcp_parser.c` currently extracts (it decodes only options 53,
+50, 12, 60 today). Same pattern as the SNMP/GTPv2-C breadth work
+already done elsewhere in this project.
+
+**Genuinely new protocols, all confirmed against real decoded bytes**
+(not just port numbers):
+
+| Protocol | Evidence | Priority |
+|---|---|---|
+| **SCTP** (IP proto 132) | 501 real packets across `bssmap_bsc_invoke_trace.pcap` + `raaw-call.pcap` — common header, HEARTBEAT/HEARTBEAT_ACK/SACK/DATA chunks all decoded | **Foundational, first** — a transport layer, peer to TCP/UDP; nothing below is reachable without it |
+| **M3UA** (SCTP PPID 3, port 2905) | 500 real packets in `raaw-call.pcap` — a real DATA message decoded end to end, including Network Appearance/Routing Context/Protocol Data parameters | High, once SCTP exists — "raaw-call" is a real captured call-signaling trace |
+| **M2UA** (SCTP PPID 2, port 2904) | 1 real packet in `bssmap_bsc_invoke_trace.pcap` — a real MAUP-class Data message decoded | Medium — same SCTP prerequisite; only one sample packet available, thin for full verification |
+| **AMQP 0-9-1** | 464 real packets across `amqp_gssapi.pcap`/`AMQP_Sample.pcap`/`pkts.pcap`, port 5672 — real frame type/channel/size framing decoded, a genuine Connection.Start method identified | High — substantial traffic, self-contained, no prerequisite |
+| **STP** (802.1D, LLC DSAP/SSAP 0x42) | Real BPDU-shaped frames in `Paging_Request.pcap` | Medium |
+| **LLMNR** (UDP 5355) | Real "wpad" query in `Paging_Request.pcap`, wire-format-identical to DNS | **Very low effort** — could likely be folded into the existing DNS dissector the same way RARP was folded into ARP, rather than a new file |
+| **PIM** (IP proto 103) | Real Hello message in `Paging_Request.pcap` | Low-medium |
+| **AppleTalk** (SNAP, Apple OUI) | Real frames in `Paging_Request.pcap` | Low — legacy, minimal current relevance |
+| Cisco SNAP protocol (OUI Cisco, PID 0x010b) | Real frames in `Paging_Request.pcap` | Low, and uncertain — OUI identifiable, exact sub-protocol not confidently named from what's available; same discipline as not guessing at Bearer QoS's bit layout without the spec text |
+
+**Recommended build order**: SCTP → M3UA → the DHCP option breadth
+extension (cheap, can go anytime) → LLMNR (cheap) → AMQP → STP →
+M2UA/PIM/AppleTalk as time allows.
 
 ## Suggested next steps, roughly in priority order
 
