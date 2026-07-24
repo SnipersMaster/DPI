@@ -139,6 +139,23 @@ own IP):
  "arp_sender_mac":"00:04:00:83:76:2c","arp_target_ip":"0.0.0.0",
  "arp_target_mac":"00:04:00:83:76:2c"}
 ```
+Etherleak padding disclosure (real finding — 73/105 real frames in a
+dedicated capture leaked prior-packet bytes into Ethernet padding):
+```json
+{"protocol":"ARP","arp_opcode":"Request","arp_sender_ip":"10.2.1.4",
+ "arp_sender_mac":"e0:7d:b1:6b:cf:00","arp_target_ip":"10.2.1.1",
+ "arp_target_mac":"00:00:00:00:00:00","arp_padding_non_zero":"true"}
+```
+IP-MAC binding conflict (real finding — verified 8/8 true positives on
+a real ARP-poisoning capture, 0/0 false positives across 6 other real
+legitimate captures):
+```json
+{"protocol":"ARP","arp_opcode":"Reply","arp_sender_ip":"192.168.1.1",
+ "arp_sender_mac":"00:20:78:d9:0d:db","arp_target_ip":"192.168.1.103",
+ "arp_target_mac":"00:d0:59:aa:af:80",
+ "arp_ip_mac_binding_conflict":"true",
+ "arp_ip_mac_binding_previous_mac":"00:d0:59:aa:af:80"}
+```
 
 **MQTT**:
 ```json
@@ -506,6 +523,25 @@ Encrypted-frame case (Protected bit set — correctly flagged, not misread as pl
 ```json
 {"protocol":"802.11","dot11_type":"Management","dot11_subtype":"Authentication",
  "dot11_auth_encrypted":"true"}
+```
+Data frame carrying a real SNAP-encapsulated ARP Probe (RFC 5227,
+verified against 38 real frames — real iPhone Wi-Fi-startup traffic;
+reached via either `--link-type=80211` or, for a Radiotap-wrapped
+capture, `--link-type=80211-radiotap`):
+```json
+{"protocol":"802.11","dot11_type":"Data","dot11_subtype":"Data",
+ "dot11_addr1":"ff:ff:ff:ff:ff:ff","dot11_addr2":"00:23:12:70:66:f5","dot11_addr3":"00:13:46:cc:a3:ea",
+ "dot11_data_arp_opcode":"Request","dot11_data_arp_sender_ip":"0.0.0.0",
+ "dot11_data_arp_target_ip":"192.168.0.108"}
+```
+Data frame carrying real IPv4-over-SNAP traffic, recursed all the way
+through TCP to a real HTTP request (verified against 125 real HTTP
+requests in a real YouTube-era capture, `app-youtube1.pcapng`):
+```json
+{"protocol":"802.11","dot11_type":"Data","dot11_subtype":"Data",
+ "dot11_data_inner_src_ip":"192.168.0.104","dot11_data_inner_dst_ip":"208.65.153.251",
+ "dot11_data_inner_http_method":"GET","dot11_data_inner_http_path":"/buzz_videos",
+ "dot11_data_inner_http_host":"www.youtube.com"}
 ```
 
 ---

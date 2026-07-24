@@ -208,9 +208,9 @@ everything else is not touched by this engine at all yet.
 | MQTT | MQTT v3.1.1/v5 | `dpi_mqtt_parser.c` | CONNECT/CONNACK/PUBLISH/SUBSCRIBE message types, client ID, topic names. TCP-based (or TLS-over-TCP); reachable via the TCP capture path's generic dispatch fallback. |
 | NTP | RFC 5905 | `dpi_ntp_parser.c` | Fixed 48-byte header: LI/VN/Mode, stratum, poll, precision. Straightforward, no variable-length fields to bounds-check beyond the fixed size itself. |
 | SNMP | RFC 1157 (v1), RFC 3416 (v2c/v3 common PDU) | `dpi_snmp_parser.c` | BER/ASN.1 decoding — a genuinely different parsing paradigm from the fixed-field/TLV approach used everywhere else in this project. Community string, PDU type, request-id, **and now the full variable-bindings list**: OID decoding (BER's base-40/base-128 encoding, verified against constructed OIDs including a multi-byte sub-identifier) plus value decoding for INTEGER/Counter32/Gauge32/TimeTicks/Counter64/OCTET STRING/IpAddress/NULL/OID — verified end-to-end against a constructed GetResponse with real varbind data (OID decode + OCTET STRING + Counter32 all confirmed). |
-| ARP (+ RARP) | RFC 826 (+ RFC 903) | `dpi_arp_parser.c` | Opcode, sender/target MAC+IP for the common Ethernet+IPv4 case. Runs directly over its own EtherType (0x0806) — never has an IP header at all, so it needs its own capture-path branch parallel to IPv4/IPv6, not routed through TCP/UDP dispatch. Gratuitous-ARP and zero-target-MAC-in-reply are flagged (useful ARP-spoofing signals) without being judged as malicious, since both patterns have legitimate uses too. **RARP folded in rather than built as a separate dissector** (only 4 real packets — not enough to justify a whole new file, and RARP shares ARP's exact wire format byte-for-byte, just a different EtherType and opcodes 3/4 instead of 1/2). The opcode-name table had already anticipated both values; the only missing piece was routing EtherType 0x8035 to the same handler, done in both capture paths. Verified against all 4 real RARP Request frames — sender/target IP both correctly 0.0.0.0, the genuine RARP semantics for a host that doesn't yet know its own IP, not malformed data. |
+| ARP (+ RARP) | RFC 826 (+ RFC 903) | `dpi_arp_parser.c` | Opcode, sender/target MAC+IP for the common Ethernet+IPv4 case. Runs directly over its own EtherType (0x0806) — never has an IP header at all, so it needs its own capture-path branch parallel to IPv4/IPv6, not routed through TCP/UDP dispatch. Gratuitous-ARP and zero-target-MAC-in-reply are flagged (useful ARP-spoofing signals) without being judged as malicious, since both patterns have legitimate uses too. **RARP folded in rather than built as a separate dissector** (only 4 real packets — not enough to justify a whole new file, and RARP shares ARP's exact wire format byte-for-byte, just a different EtherType and opcodes 3/4 instead of 1/2). The opcode-name table had already anticipated both values; the only missing piece was routing EtherType 0x8035 to the same handler, done in both capture paths. Verified against all 4 real RARP Request frames — sender/target IP both correctly 0.0.0.0, the genuine RARP semantics for a host that doesn't yet know its own IP, not malformed data. **Two further real security signals added from later captures**: "Etherleak"-style padding disclosure (73 of 105 real frames in a dedicated capture showed non-zero Ethernet padding — several containing a recognizable leaked SNMP community string from an unrelated prior packet, a real 2003-documented information-disclosure class), and IP-MAC binding-conflict detection (the classic arpwatch-style spoofing signal, since neither of the two existing heuristics fired at all on a real poisoning capture — verified 8/8 true positives on that capture and 0/0 false positives across 6 other real legitimate captures, including scan/recon traffic). The binding table is global and spinlock-protected rather than per-partition, a deliberate departure from this project's usual pattern justified by ARP's fundamentally lower traffic volume compared to TCP/UDP. |
 | STUN | RFC 5389 | `dpi_stun_parser.c` | Message type, magic cookie validation, transaction ID, basic attribute walking. Works over UDP or TCP. TURN relay semantics not implemented — this is STUN message parsing only. |
-| 802.11 (WiFi) | IEEE 802.11 | `dpi_80211_parser.c` | **Architecturally distinct from every row above** — not `protocols.ini`-gated or reached via `dispatch_dissection()`, since it operates at the link layer itself (no IP header, no fixed Ethernet-style framing). Full Frame Control decode, Beacon SSID, Authentication algorithm/status (correctly deferring to an "encrypted" flag under WEP rather than misreading ciphertext), and — now — Data frame payload recursion (SNAP-encapsulated ARP/IPv4) plus Radiotap-header support for monitor-mode captures that wrap frames in radio metadata. See the dedicated "802.11 (WiFi) support" section below for the full verification history (64 real frames total across 4 genuine captures, several real gaps found and closed along the way). |
+| 802.11 (WiFi) | IEEE 802.11 | `dpi_80211_parser.c` | **Architecturally distinct from every row above** — not `protocols.ini`-gated or reached via `dispatch_dissection()` from the capture path, since it operates at the link layer itself (no IP header, no fixed Ethernet-style framing) — though it now calls `dispatch_dissection()` internally for Data-frame recursion. Full Frame Control decode, Beacon SSID, Authentication algorithm/status (correctly deferring to an "encrypted" flag under WEP rather than misreading ciphertext), Data frame payload recursion (SNAP-encapsulated ARP, and IPv4→TCP→HTTP), and Radiotap-header support for monitor-mode captures that wrap frames in radio metadata. See the dedicated "802.11 (WiFi) support" section below for the full verification history (2,172 real frames total across 5 genuine captures, 5 real gaps found and closed along the way). |
 
 ### Detected / scored, not fully dissected
 
@@ -388,7 +388,7 @@ stated plainly too, not left ambiguous.
 | `dpi_hpack_connection_state.c` | No | No | ~33 KB per connection entry (both frame-boundary and mid-frame-split CONTINUATION state) — ~17 MB total at default sizing, computed explicitly in-file |
 | `dpi_hpack_decoder.c` | No | **Yes, the Huffman table** | Verified against 3 real RFC 7541 Appendix C test vectors — the most novel, least-precedented code in this project, worth prioritizing for fuzzing |
 | `dpi_gtp_parser.c` | No | No | GTP-in-GTP recursion depth verified in Python (not real traffic); F-TEID/PDN Address Allocation/Bearer QoS byte offsets verified against constructed test vectors following authoritative spec research; no real GTP traffic exists in any capture checked for this project |
-| `dpi_arp_parser.c` | No | **Yes, extensively, 3 real findings** | Only decodes the Ethernet+IPv4 case (HLEN=6/PLEN=4). RARP folded in and verified against 4 real RARP frames. A real, historically documented information-disclosure class ("Etherleak") found and flagged: 73 of 105 real frames in a dedicated capture showed non-zero Ethernet padding, several containing a recognizable leaked SNMP community string from an unrelated prior packet. A cleaner real ARP-poisoning signal (IP-MAC binding conflict, 8/14 real packets in a poisoning capture) was verified but not yet implemented — needs a partitioned table design first. |
+| `dpi_arp_parser.c` | No | **Yes, extensively, 4 real findings** | Only decodes the Ethernet+IPv4 case (HLEN=6/PLEN=4). RARP folded in and verified against 4 real RARP frames. A real, historically documented information-disclosure class ("Etherleak") found and flagged: 73 of 105 real frames in a dedicated capture showed non-zero Ethernet padding, several containing a recognizable leaked SNMP community string from an unrelated prior packet. A real IP-MAC binding-conflict detector (the classic arpwatch-style signal) built and verified: 8/8 true positives on a real ARP-poisoning capture, 0/0 false positives across 6 other real legitimate captures including scan/recon traffic — uses a global, spinlock-protected table (a deliberate, explained departure from this project's usual per-partition pattern, since ARP's traffic volume is fundamentally lower than TCP/UDP). |
 | `dpi_mqtt_parser.c` | No | No | Only CONNECT and PUBLISH parsed; other message types named but not parsed further; verified byte-for-byte against a constructed CONNECT, not real traffic |
 | `dpi_ntp_parser.c` | No | No | Extension fields/MAC detected as present but not parsed; verified against constructed bit-packing, not real traffic |
 | `dpi_snmp_parser.c` | No | **Yes, base types; Opaque/exceptions no** | SNMPv3 detected but not parsed. Community string/PDU type/request-id/varbind walking verified end-to-end against a constructed GetResponse. Opaque and the SNMPv2 exception values were added later but real traffic checked only ever exercised INTEGER/OCTET STRING/NULL — stated honestly. |
@@ -426,7 +426,7 @@ stated plainly too, not left ambiguous.
 | `dpi_wol_parser.c` | No | **Yes — 1 real packet, but a complete one** | Only 1 real packet exists, but WoL's entire protocol IS one fixed-shape packet with no session or variation — the sync stream and all 16 MAC repeats were confirmed programmatically to match, a real Raspberry Pi Foundation OUI target |
 | `dpi_dnp3_parser.c` | No | **Yes, unusually verified** | IEEE 1815 is a paid standard, not searchable here — field layout instead verified against two independently-captured, CRC-confirmed-good real DNP3 frames that agreed with each other (a genuine discrepancy in a third blog source was found and discarded) |
 | `dpi_dns_parser.c` | No | No | Query name decoding (cycle-safe compression pointers) verified against a constructed adversarial cyclic-pointer case, not real traffic directly — though `dpi_mdns_parser.c` reuses this same logic and IS real-traffic-verified (339 real packets) |
-| `dpi_80211_parser.c` | No | **Yes, extensively, 3 real gaps found and closed** | 64 real frames across 4 genuine captures. A complete real WEP handshake (26 frames) — caught a WEP-encrypted body being misread as plaintext until the Protected bit was checked. A real "failed auth" capture's anomalous body correctly reported rather than misparsed. Radiotap encapsulation (link-type 127) found unsupported and added, verified against 38 real frames with a consistent 20-byte header. Data-frame payload recursion found entirely missing and added — all 38 real frames were genuine SNAP-encapsulated ARP Probes (real iPhone Wi-Fi-startup traffic), 38/38 correctly decoded. |
+| `dpi_80211_parser.c` | No | **Yes, extensively, 5 real gaps found and closed** | 2,172 real frames across 5 genuine captures. A complete real WEP handshake (26 frames) — caught a WEP-encrypted body being misread as plaintext until the Protected bit was checked. A real "failed auth" capture's anomalous body correctly reported rather than misparsed. Radiotap encapsulation (link-type 127) found unsupported and added, verified against 38 + 2,108 real frames across two captures with two genuinely different real header lengths (20 and 24 bytes), confirming the length is read per-packet, not assumed fixed. Data-frame payload recursion found entirely missing and added — all 38 real frames in the first capture were genuine SNAP-encapsulated ARP Probes (real iPhone Wi-Fi-startup traffic); the recursion was then extended one level further (IP→TCP→HTTP, not just IP addresses) after a second real capture showed 2,108 real Data frames, 125 of them genuine HTTP requests to real YouTube-era hostnames — verified end to end against all 125. A related gap was also found and fixed in `fuzz_80211_parser.c` itself: it had never actually registered anything for `dispatch_dissection()` to match against, silently only exercising the "no match" path for every ARP/HTTP-shaped seed in its own corpus. |
 
 ## Sample JSON output, one per fully-parsed protocol
 
@@ -917,10 +917,10 @@ except the body — not a parsing bug), and this dissector reports
 whatever value is actually present rather than crashing or guessing,
 confirmed against that real anomalous case specifically.
 
-Has its own fuzz harness (`fuzz_80211_parser.c`) and 10 real seeds
+Has its own fuzz harness (`fuzz_80211_parser.c`) and 12 real seeds
 covering every frame type found (Beacon, clean Authentication,
 WEP-encrypted Authentication, the anomalous-body Authentication, ACK,
-Association Request, Data, plus the three added below) — built and
+Association Request, Data, plus the ones added below) — built and
 seeded to the same standard as everything else here, and genuinely
 wired into the bootstrap capture path (see above), not just sitting
 unreachable.
@@ -951,6 +951,36 @@ first two captures' link-types exercised:
   already do for their own inner packets; IPv6 is named but not
   recursed into, no real example to verify against, same honest limit
   those files' own IPv6 paths already have.
+
+**Two more real gaps found and closed**, from a second later capture
+(`app-youtube1.pcapng`, also pcap linktype 127, but with a genuinely
+different 24-byte Radiotap header length — good additional
+confirmation the length is read per-packet, not assumed from the
+first capture):
+
+- **The IPv4 recursion stopped at addresses.** All 2,108 real Data
+  frames in this capture carried real IPv4-over-SNAP traffic, and 125
+  of them were genuine HTTP requests — including a real
+  `GET /buzz_videos` request to `www.youtube.com`, and several real
+  `i.ytimg.com` thumbnail requests, all from a real, dated (MSIE 7.0 /
+  Windows Vista-era) User-Agent string. Extended `dot11_dissect_data()`
+  one level further than GRE/MPLS/L2TPv3's inner-packet handling: the
+  inner TCP payload is now handed to `dispatch_dissection()` itself
+  (not just a single SNI-style field extraction), verified end to end
+  against all 125 real HTTP requests.
+- **The fuzz harness had never actually exercised any of this.** Found
+  while verifying the above: `fuzz_80211_parser.c` defined
+  `DPI_SKIP_REGISTER_ALL` without registering anything at all, so
+  `dispatch_dissection()` inside `dot11_dissect_data()` always found
+  zero candidates and returned false — every real ARP- and HTTP-shaped
+  seed in that corpus had only ever exercised the "no match" fallback,
+  never the actual extraction code. Fixed by explicitly registering
+  ARP and HTTP/1.1 in that harness specifically (not the full
+  registry, keeping it focused on what this file actually recurses
+  into) — and by raising the harness's `max_len` from 512 to 2,312
+  (802.11's real maximum MSDU size), since the previous cap silently
+  rejected real, legitimately-sized Data frames (a new real seed from
+  this capture is 1,540 bytes).
 
 ## Breadth extensions to two existing dissectors (SNMP, GTPv2-C)
 
@@ -1070,8 +1100,9 @@ on scapy/dpkt.
 | RARP (folded into ARP) | 4 packets | 100% |
 | TFTP | 1 packet | Complete real WRQ, verified to the exact last byte |
 | WoL | 1 packet | Complete Magic Packet, all 16 MAC repeats verified to match |
-| 802.11 (WiFi) | 64 frames, 4 captures | 3 real gaps found & closed (WEP-body misread, missing Radiotap support, missing Data-frame recursion) |
+| 802.11 (WiFi) | 2,172 frames, 5 captures | 5 real gaps found & closed (WEP-body misread, missing Radiotap support, missing Data-frame recursion, missing HTTP recursion, a fuzz-harness registration gap) |
 | ARP (Etherleak padding) | 105 frames | 73/105 real frames leaked prior-packet data — flagged |
+| ARP (IP-MAC binding conflict) | 14 (poisoning) + 6 clean captures | 8/8 true positives, 0/0 false positives |
 | IPv4 fragmentation | 8 fragment sets | **Severe real bug found & fixed** (0/8 → 8/8 reassembling correctly) |
 | IPv6 fragmentation | 65 fragment sets (130 fragments) | **Not reassembled at all → fixed**, 65/65 |
 | TCP flow reassembly | 1 real messy flow | **Real gap found & fixed** (mid-hole split silently dropping real bytes) |
@@ -1545,7 +1576,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **245 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **250 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
