@@ -15,7 +15,7 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 68 samples, covering all 52 `protocols.ini` entries plus
+complete one. 69 samples, covering all 53 `protocols.ini` entries plus
 the baseline flow record, 802.11 (standalone, not `protocols.ini`-
 gated), and RARP (folded into ARP, same dissector).
 
@@ -192,6 +192,16 @@ gap in this dissector):
 ```json
 {"protocol":"WoW","wow_opcode":"CMSG_AUTH_SESSION","wow_client_build":"7799",
  "wow_account_name":"SCOTTBOT"}
+```
+
+**BitTorrent Mainline DHT** (a real `get_peers` query — verified against
+126,321 real payloads, 100% with zero parse failures, the largest, cleanest
+real-traffic sample in this project):
+```json
+{"protocol":"BitTorrent-DHT","bt_dht_msg_type":"query",
+ "bt_dht_transaction_id":"90","bt_dht_query":"get_peers",
+ "bt_dht_node_id":"dc054f56ad545065f583e7a39cde863f9c0b0581",
+ "bt_dht_info_hash":"020376cca233350e4d2f6225f90abbd4958cd281"}
 ```
 
 **RADIUS**:

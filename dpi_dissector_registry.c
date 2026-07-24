@@ -286,6 +286,7 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "tftp",   "TFTP" },
     { "wol",    "WoL" },
     { "wow",    "WoW" },
+    { "bt_dht", "BitTorrent-DHT" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -441,6 +442,7 @@ static void register_all_dissectors(void) {
     extern void register_tftp_dissector(void);
     extern void register_wol_dissector(void);
     extern void register_wow_dissector(void);
+    extern void register_bt_dht_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -502,6 +504,7 @@ static void register_all_dissectors(void) {
     register_tftp_dissector();
     register_wol_dissector();
     register_wow_dissector();
+    register_bt_dht_dissector();
 
     apply_protocol_config_to_registry();
 
