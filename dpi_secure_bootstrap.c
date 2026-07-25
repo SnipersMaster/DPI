@@ -623,12 +623,39 @@ static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
         }
     }
 
-    printf("{\"src_port\":%u,\"dst_port\":%u,\"protocol\":\"%s\",\"sni\":\"%s\","
-           "\"confidence\":\"%s\",\"dga_score\":%.2f,\"vpn_score\":%.2f,"
-           "\"vpn_protocol\":\"%s\"}\n",
-           udp_result.src_port, udp_result.dst_port,
-           matched ? dissect_out.protocol_name : "unknown",
-           sni_out, confidence_out, dga_score_out, vpn.score, vpn.detected_protocol);
+    /* Real gap found and fixed while extending flow-record coverage
+     * to UDP: this function's own output previously never included
+     * src_ip/dst_ip at all, even in the old flat format — only ports.
+     * Not something the flow-record work introduced; found by
+     * checking what this function actually emits while wiring it in. */
+    uint8_t src_addr_bytes[4] = {
+        (uint8_t)(ip_result->src_addr >> 24), (uint8_t)(ip_result->src_addr >> 16),
+        (uint8_t)(ip_result->src_addr >> 8),  (uint8_t)(ip_result->src_addr)
+    };
+    uint8_t dst_addr_bytes[4] = {
+        (uint8_t)(ip_result->dst_addr >> 24), (uint8_t)(ip_result->dst_addr >> 16),
+        (uint8_t)(ip_result->dst_addr >> 8),  (uint8_t)(ip_result->dst_addr)
+    };
+    struct flow_record *fr = flow_record_find_or_create(
+        4, src_addr_bytes, udp_result.src_port, dst_addr_bytes, udp_result.dst_port, 17);
+    if (fr) {
+        flow_record_touch(fr, udp_result.payload_len);
+        /* confidence_out (from classify_hostname()'s domain-rules
+         * match, when an SNI-bearing UDP protocol like QUIC/DTLS was
+         * involved) is a more informative signal than a plain
+         * matched-or-not boolean when it's actually available —
+         * falls back to the simpler signal otherwise, rather than
+         * leaving confidence_out computed and unused (a real
+         * oversight caught while wiring this up, not shipped as-is). */
+        const char *l7_confidence = sni_out[0] ? confidence_out : (matched ? "high" : "low");
+        flow_record_set_l7(fr, matched ? dissect_out.protocol_name : "unknown",
+                            l7_confidence, matched ? &dissect_out : NULL);
+        /* UDP has no TCP-style reassembly — all four stats stay at
+         * their zero-initialized default (set at flow creation),
+         * kept in the emitted schema anyway for consistency across
+         * every flow record regardless of L4 protocol. */
+        flow_record_set_scores(fr, dga_score_out, vpn.score, vpn.detected_protocol, 0.0, 0.0);
+    }
 }
 
 /* -----------------------------------------------------------------
@@ -812,12 +839,16 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
             }
         }
 
-        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
-               "\"protocol\":\"%s\",\"sni\":\"%s\",\"confidence\":\"%s\","
-               "\"dga_score\":%.2f,\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\"}\n",
-               src_str, dst_str, udp_result.src_port, udp_result.dst_port,
-               matched ? dissect_out.protocol_name : "unknown",
-               sni_out, confidence_out, dga_score_out, vpn.score, vpn.detected_protocol);
+        struct flow_record *fr = flow_record_find_or_create(
+            6, ip6_result.src_addr, udp_result.src_port,
+            ip6_result.dst_addr, udp_result.dst_port, 17);
+        if (fr) {
+            flow_record_touch(fr, udp_result.payload_len);
+            const char *l7_confidence = sni_out[0] ? confidence_out : (matched ? "high" : "low");
+            flow_record_set_l7(fr, matched ? dissect_out.protocol_name : "unknown",
+                                l7_confidence, matched ? &dissect_out : NULL);
+            flow_record_set_scores(fr, dga_score_out, vpn.score, vpn.detected_protocol, 0.0, 0.0);
+        }
         return;
     }
 
