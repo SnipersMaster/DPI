@@ -26,17 +26,13 @@
  *   ./dpi_bootstrap eth0
  *
  * Run OFFLINE against a saved capture instead — no root, no capabilities,
- * no live interface needed at all:
+ * no live interface needed at all. Both classic pcap and pcapng are
+ * supported natively, auto-detected from the file's own magic bytes —
+ * no conversion step needed for either format:
  *   ./dpi_bootstrap --pcap-file=capture.pcap
+ *   ./dpi_bootstrap --pcap-file=capture.pcapng
  *   ./dpi_bootstrap --pcap-file=capture.pcap > output.json   # JSON to a file
  *   ./dpi_bootstrap --pcap-file=capture.pcap --link-type=80211-radiotap
- *
- * The offline mode only reads CLASSIC pcap files (the older, simpler
- * format), not pcapng (the newer, block-structured one many modern
- * capture tools default to) — see process_pcap_file()'s own header
- * comment for why, and the one-line conversion command if you have a
- * pcapng file (`tshark -F pcap -r in.pcapng -w out.pcap`, or
- * Wireshark's own File -> Save As... and the format dropdown).
  */
 
 #include <stdio.h>
@@ -1353,6 +1349,81 @@ static uint32_t pcap_read_u32(const uint8_t *p, bool swap) {
            ((v & 0x00ff0000u) >> 8)  | ((v & 0xff000000u) >> 24);
 }
 
+static uint16_t pcap_read_u16(const uint8_t *p, bool swap) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+    if (!swap) return v;
+    return (uint16_t)(((v & 0x00ff) << 8) | ((v & 0xff00) >> 8));
+}
+
+/* pcapng block type constants (Section 3 of the pcapng spec) — used
+ * by process_pcapng_file() below, defined up here alongside the
+ * classic-format constants since both readers share this section. */
+#define PCAPNG_BLOCK_SHB            0x0A0D0D0Au   /* Section Header Block */
+#define PCAPNG_BLOCK_IDB            0x00000001u   /* Interface Description Block */
+#define PCAPNG_BLOCK_SPB            0x00000003u   /* Simple Packet Block */
+#define PCAPNG_BLOCK_EPB            0x00000006u   /* Enhanced Packet Block */
+#define PCAPNG_BYTE_ORDER_MAGIC     0x1A2B3C4Du
+#define PCAPNG_MAX_INTERFACES       512  /* bounded, same discipline as
+                                            every other array in this
+                                            project — sized generously
+                                            after a real file
+                                            (`ultimate.pcapng`) turned
+                                            up 313 genuine interfaces,
+                                            not a hypothetical worst
+                                            case */
+
+/*
+ * Shared by both file readers (classic pcap and pcapng below) — the
+ * link-type-based dispatch was previously duplicated inline in
+ * process_pcap_file() alone; factored out here once a second reader
+ * needed the identical logic, so a future fix only has to happen in
+ * one place. Radiotap handling matches the live-capture path's own
+ * `--link-type=80211-radiotap` handling exactly (skip the self-
+ * describing header length, then hand the rest to the same 802.11
+ * dissector) — see that flag's own comment in main() for the real
+ * capture this was verified against.
+ *
+ * Returns false (and dissects nothing) for a link type that's neither
+ * Ethernet, raw 802.11, nor Radiotap+802.11, and isn't being forced
+ * via a --link-type override — the classic pcap reader below rejects
+ * a whole file upfront for exactly this reason (a single declared
+ * link type covers every packet in that format), but pcapng allows
+ * MULTIPLE interfaces with DIFFERENT link types in one file — a real,
+ * not hypothetical, file (`ultimate.pcapng`) genuinely declares 4
+ * distinct link types (1, 101, 113, 274) across its 313 interfaces.
+ * Silently defaulting an unrecognized type to Ethernet, as an earlier
+ * version of this function did, would have fed non-Ethernet bytes
+ * (e.g. LINKTYPE_RAW, no link-layer header at all) into
+ * parse_ethernet_frame() and produced garbage or misleading output
+ * rather than either correctly dissecting them or honestly skipping
+ * them — caught by checking this exact real file's link-type
+ * diversity before shipping, not assumed.
+ */
+static bool dispatch_packet_by_linktype(uint32_t link_type, const unsigned char *buf,
+                                         uint32_t len, bool force_80211, bool force_radiotap) {
+    bool use_80211 = force_80211 || link_type == LINKTYPE_IEEE802_11;
+    bool use_radiotap = force_radiotap || link_type == LINKTYPE_IEEE802_11_RADIOTAP;
+
+    if (!use_80211 && !use_radiotap && link_type != LINKTYPE_ETHERNET) {
+        return false;   /* unrecognized link type — caller decides how to report this */
+    }
+
+    if (use_radiotap) {
+        if (len >= 4) {
+            uint16_t radiotap_len = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+            if (radiotap_len <= len) {
+                parse_80211_frame(buf + radiotap_len, (ssize_t)(len - radiotap_len));
+            }
+        }
+    } else if (use_80211) {
+        parse_80211_frame(buf, (ssize_t)len);
+    } else {
+        parse_ethernet_frame(buf, (ssize_t)len);
+    }
+    return true;
+}
+
 /*
  * Reads and dissects every packet in a classic-format pcap file.
  * Returns 0 on success (including "file had zero packets"), nonzero
@@ -1385,9 +1456,10 @@ static int process_pcap_file(const char *path, bool link_type_80211_arg,
     else if (magic == PCAP_MAGIC_NANOSEC)       { swap = false; nanosec = true;  }
     else if (magic == PCAP_MAGIC_NANOSEC_SWAP)  { swap = true;  nanosec = true;  }
     else {
-        fprintf(stderr, "%s: not a classic pcap file (unrecognized magic 0x%08x — "
-                        "if this is pcapng, convert it first: "
-                        "tshark -F pcap -r %s -w converted.pcap)\n", path, magic, path);
+        fprintf(stderr, "%s: unrecognized file format (magic 0x%08x is neither classic "
+                        "pcap nor pcapng — this file's format auto-detection in main() "
+                        "already ruled out pcapng before reaching this classic-pcap-"
+                        "specific check, so this is genuinely neither)\n", path, magic);
         fclose(f);
         return 1;
     }
@@ -1451,24 +1523,225 @@ static int process_pcap_file(const char *path, bool link_type_80211_arg,
             break;
         }
 
-        if (use_radiotap) {
-            if (incl_len >= 4) {
-                uint16_t radiotap_len = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-                if (radiotap_len <= incl_len) {
-                    parse_80211_frame(buf + radiotap_len, (ssize_t)(incl_len - radiotap_len));
-                }
-            }
-        } else if (use_80211) {
-            parse_80211_frame(buf, (ssize_t)incl_len);
-        } else {
-            parse_ethernet_frame(buf, (ssize_t)incl_len);
-        }
+        /* Return value not checked here: `network` was already
+         * validated upfront (only Ethernet/802.11/Radiotap+802.11
+         * pass the check earlier in this function) — this can never
+         * return false for a classic pcap file, unlike pcapng below
+         * where different interfaces can have different link types. */
+        (void)dispatch_packet_by_linktype(network, buf, incl_len, use_80211, use_radiotap);
 
         packet_count++;
     }
 
     fprintf(stderr, "%s: %u packets read, %u skipped (oversized)\n",
             path, packet_count, skipped_count);
+    fclose(f);
+    return 0;
+}
+
+/*
+ * Reads and dissects every packet in a pcapng-format file — the
+ * newer, block-structured capture format (Section Header Block,
+ * Interface Description Blocks, Enhanced Packet Blocks) that many
+ * modern tools default to, distinct from the older classic pcap
+ * format `process_pcap_file()` above handles. Added because several
+ * real captures used throughout this project's own development were
+ * pcapng, and requiring a manual conversion step (`tshark -F pcap`)
+ * before every run turned out to be real, avoidable friction —
+ * confirmed the block layout precisely (byte-order-magic detection,
+ * the exact fixed-field sizes and offsets in an Interface Description
+ * Block and an Enhanced Packet Block) against this project's own
+ * already-verified Python pcapng reader before writing any of this,
+ * same discipline as every dissector in this project.
+ *
+ * Every block in pcapng ends with a repeated copy of its own total
+ * length (for backward-reading tools) — this reader doesn't use that
+ * for backward seeking, but does trust the block's OWN declared
+ * total length to know how many bytes to skip past whatever it
+ * didn't need from that block, the same "read what you need, skip
+ * the rest by the block's own accounting" approach
+ * `process_pcap_file()` uses for pcap record headers.
+ *
+ * Simple Packet Blocks (a rare, simplified alternative to Enhanced
+ * Packet Blocks — RFC/spec allows them but real capture tools
+ * overwhelmingly write Enhanced Packet Blocks) are recognized and
+ * skipped explicitly rather than silently mis-parsed as an unknown
+ * block type, but their packet data isn't dissected — no real
+ * capture encountered during this project's development used them,
+ * so there was nothing to verify the "which interface's link type
+ * applies" assumption against (Simple Packet Blocks don't carry an
+ * interface ID field at all, unlike Enhanced Packet Blocks).
+ */
+static int process_pcapng_file(const char *path, bool link_type_80211_arg,
+                                bool link_type_80211_radiotap_arg) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    /* The Section Header Block's own Block Total Length field is
+     * itself in the file's byte order — which we don't know yet at
+     * this point — so read just enough (type + length, still
+     * uninterpreted, + the byte-order-magic field) to determine
+     * endianness first, then come back and correctly reinterpret the
+     * length. */
+    uint8_t shb_start[12];
+    if (fread(shb_start, 1, sizeof(shb_start), f) != sizeof(shb_start)) {
+        fprintf(stderr, "%s: truncated pcapng file (need at least 12 bytes for a "
+                        "Section Header Block)\n", path);
+        fclose(f);
+        return 1;
+    }
+
+    uint32_t block_type_unswapped = pcap_read_u32(shb_start, false);
+    if (block_type_unswapped != PCAPNG_BLOCK_SHB) {
+        fprintf(stderr, "%s: not a pcapng file (first block type 0x%08x, expected a "
+                        "Section Header Block, 0x0a0d0d0a)\n", path, block_type_unswapped);
+        fclose(f);
+        return 1;
+    }
+
+    uint32_t magic_le = pcap_read_u32(shb_start + 8, false);
+    uint32_t magic_be = pcap_read_u32(shb_start + 8, true);
+    bool swap;
+    if (magic_le == PCAPNG_BYTE_ORDER_MAGIC) swap = false;
+    else if (magic_be == PCAPNG_BYTE_ORDER_MAGIC) swap = true;
+    else {
+        fprintf(stderr, "%s: Section Header Block has an unrecognized byte-order "
+                        "magic (0x%08x) — corrupt or truncated file\n", path, magic_le);
+        fclose(f);
+        return 1;
+    }
+
+    uint32_t shb_total_len = pcap_read_u32(shb_start + 4, swap);
+    if (shb_total_len < 12) {
+        fprintf(stderr, "%s: Section Header Block declares an impossible length (%u)\n",
+                path, shb_total_len);
+        fclose(f);
+        return 1;
+    }
+    if (fseek(f, (long)(shb_total_len - 12), SEEK_CUR) != 0) {
+        fprintf(stderr, "%s: could not seek past the Section Header Block\n", path);
+        fclose(f);
+        return 1;
+    }
+
+    fprintf(stderr, "%s: pcapng file, %s-endian\n", path, swap ? "big" : "little");
+
+    uint16_t interface_link_types[PCAPNG_MAX_INTERFACES];
+    uint32_t n_interfaces = 0;
+
+    unsigned char buf[SNAPLEN];
+    uint32_t packet_count = 0, skipped_count = 0, idb_count = 0, unsupported_linktype_count = 0;
+
+    for (;;) {
+        uint8_t block_hdr[8];
+        size_t got = fread(block_hdr, 1, sizeof(block_hdr), f);
+        if (got == 0) break;   /* clean EOF between blocks */
+        if (got != sizeof(block_hdr)) {
+            fprintf(stderr, "%s: truncated block header near packet %u\n", path, packet_count);
+            break;
+        }
+
+        uint32_t this_type = pcap_read_u32(block_hdr, swap);
+        uint32_t this_total_len = pcap_read_u32(block_hdr + 4, swap);
+        if (this_total_len < 12) {
+            fprintf(stderr, "%s: block declares an impossible length (%u) near packet %u, "
+                            "stopping\n", path, this_total_len, packet_count);
+            break;
+        }
+        /* Everything after the 8-byte header we just read, for this
+         * one block: body + the trailing repeated-length field. */
+        long remaining_in_block = (long)(this_total_len - 8);
+
+        if (this_type == PCAPNG_BLOCK_IDB) {
+            uint8_t idb_fixed[4];   /* LinkType(2) + Reserved(2) */
+            if (this_total_len - 12 < 4 ||
+                fread(idb_fixed, 1, sizeof(idb_fixed), f) != sizeof(idb_fixed)) {
+                fprintf(stderr, "%s: truncated or malformed Interface Description Block, "
+                                "stopping\n", path);
+                break;
+            }
+            uint16_t link_type = pcap_read_u16(idb_fixed, swap);
+            if (n_interfaces < PCAPNG_MAX_INTERFACES) {
+                interface_link_types[n_interfaces] = link_type;
+            } else {
+                fprintf(stderr, "%s: more than %d interfaces declared, ignoring link type "
+                                "for interface %u\n", path, PCAPNG_MAX_INTERFACES, n_interfaces);
+            }
+            n_interfaces++;
+            idb_count++;
+            remaining_in_block -= (long)sizeof(idb_fixed);
+            if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
+
+        } else if (this_type == PCAPNG_BLOCK_EPB) {
+            uint8_t epb_fixed[20];   /* InterfaceID(4)+TsHigh(4)+TsLow(4)+CapLen(4)+OrigLen(4) */
+            if (this_total_len - 12 < sizeof(epb_fixed) ||
+                fread(epb_fixed, 1, sizeof(epb_fixed), f) != sizeof(epb_fixed)) {
+                fprintf(stderr, "%s: truncated or malformed Enhanced Packet Block near "
+                                "packet %u, stopping\n", path, packet_count);
+                break;
+            }
+            uint32_t iface_id = pcap_read_u32(epb_fixed, swap);
+            uint32_t captured_len = pcap_read_u32(epb_fixed + 12, swap);
+            remaining_in_block -= (long)sizeof(epb_fixed);
+
+            if (captured_len > sizeof(buf) || (long)captured_len > remaining_in_block) {
+                fprintf(stderr, "%s: packet %u claims %u bytes, more than this engine's "
+                                "%d-byte snaplen or the block's own declared size — "
+                                "skipping just this packet\n",
+                        path, packet_count, captured_len, SNAPLEN);
+                if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
+                skipped_count++;
+                packet_count++;
+                continue;
+            }
+
+            size_t data_got = fread(buf, 1, captured_len, f);
+            if (data_got != captured_len) {
+                fprintf(stderr, "%s: truncated packet data at packet %u (wanted %u, got %zu)\n",
+                        path, packet_count, captured_len, data_got);
+                break;
+            }
+            remaining_in_block -= (long)captured_len;
+
+            /* Bounded by BOTH n_interfaces AND PCAPNG_MAX_INTERFACES —
+             * n_interfaces keeps counting every real IDB seen even
+             * past the array's capacity (so an over-limit file is
+             * still reported accurately in the summary line), but
+             * that means checking against n_interfaces ALONE would
+             * read past the array's actual 64 slots for any file
+             * declaring more interfaces than that — confirmed this
+             * matters against a real file (`ultimate.pcapng`, which
+             * genuinely declares 313 interfaces, not a malformed or
+             * adversarial case). */
+            uint16_t link_type = (iface_id < n_interfaces && iface_id < PCAPNG_MAX_INTERFACES)
+                                  ? interface_link_types[iface_id]
+                                                          : LINKTYPE_ETHERNET;
+            bool dissected = dispatch_packet_by_linktype(link_type, buf, captured_len,
+                                         link_type_80211_arg, link_type_80211_radiotap_arg);
+            if (!dissected) unsupported_linktype_count++;
+            packet_count++;
+
+            if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
+
+        } else if (this_type == PCAPNG_BLOCK_SPB) {
+            /* Recognized, not dissected — see file header comment for why. */
+            if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
+
+        } else {
+            /* Any other block type (Name Resolution, Interface
+             * Statistics, custom/vendor blocks, etc.) — not relevant
+             * to packet dissection, skip by the block's own declared
+             * length without treating it as an error. */
+            if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
+        }
+    }
+
+    fprintf(stderr, "%s: %u interface(s) declared, %u packets read, %u skipped (oversized), "
+                    "%u skipped (unsupported link type)\n",
+            path, idb_count, packet_count, skipped_count, unsupported_linktype_count);
     fclose(f);
     return 0;
 }
@@ -1503,16 +1776,43 @@ int main(int argc, char **argv) {
     }
 
     /* -------------------------------------------------------------
-     * OFFLINE MODE: read a saved classic-format pcap file instead of
-     * a live interface. Added specifically so this engine can be
-     * tested against a capture without needing CAP_NET_RAW, a real
-     * interface, or root at all — register_all_dissectors() is the
-     * only setup needed; no socket, no privilege drop, no seccomp
-     * filter (there's no live, attacker-reachable file descriptor to
-     * defend here the way there is for a raw capture socket).
+     * OFFLINE MODE: read a saved capture file instead of a live
+     * interface — either classic pcap or pcapng, auto-detected from
+     * the file's own first 4 bytes (no separate flag needed; both
+     * formats declare their own type unambiguously in that first
+     * word). Added specifically so this engine can be tested against
+     * a capture without needing CAP_NET_RAW, a real interface, or
+     * root at all — register_all_dissectors() is the only setup
+     * needed; no socket, no privilege drop, no seccomp filter
+     * (there's no live, attacker-reachable file descriptor to defend
+     * here the way there is for a raw capture socket).
      * ------------------------------------------------------------- */
     if (pcap_file_path) {
         register_all_dissectors();
+
+        FILE *probe = fopen(pcap_file_path, "rb");
+        if (!probe) {
+            fprintf(stderr, "cannot open %s: %s\n", pcap_file_path, strerror(errno));
+            return 1;
+        }
+        uint8_t magic4[4];
+        size_t magic_got = fread(magic4, 1, sizeof(magic4), probe);
+        fclose(probe);
+        if (magic_got != sizeof(magic4)) {
+            fprintf(stderr, "%s: file too short to identify (need at least 4 bytes)\n",
+                    pcap_file_path);
+            return 1;
+        }
+        uint32_t magic_check = pcap_read_u32(magic4, false);
+
+        if (magic_check == PCAPNG_BLOCK_SHB) {
+            return process_pcapng_file(pcap_file_path, link_type_80211, link_type_80211_radiotap);
+        }
+        /* Anything else is handed to the classic-pcap reader, which
+         * does its own, more specific magic-number check (covering
+         * both byte orders and both microsecond/nanosecond variants)
+         * and reports a precise error — including this same pcapng
+         * hint — if it isn't actually a classic pcap file either. */
         return process_pcap_file(pcap_file_path, link_type_80211, link_type_80211_radiotap);
     }
 

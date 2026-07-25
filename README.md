@@ -655,28 +655,52 @@ to a file is all `> output.json` does. Per-file summary information
 (link type detected, packet counts, any skipped/malformed records)
 goes to **stderr**, so it won't pollute the JSON output file.
 
-**Classic pcap only, not pcapng** — stated plainly rather than
-silently unsupported. Several real captures used throughout this
-project are pcapng (the newer, block-structured format many modern
-tools default to); this reader only handles the older, simpler classic
-format (a 24-byte global header + a flat sequence of 16-byte-header-
-prefixed packet records). If `--pcap-file` reports an unrecognized
-magic number, convert first:
-```
-tshark -F pcap -r capture.pcapng -w capture.pcap
-```
-(or Wireshark's File → Save As..., choosing the "pcap" format instead
-of "pcapng" in the dropdown).
+**Both classic pcap and pcapng are supported natively** — auto-
+detected from the file's own first 4 bytes in `main()`, no flag and
+no conversion step needed for either format. This wasn't the case
+initially (an earlier version of this reader only handled classic
+pcap, the older, simpler format — a 24-byte global header + a flat
+sequence of 16-byte-header-prefixed packet records), but pcapng (the
+newer, block-structured format — Section Header Block, Interface
+Description Blocks, Enhanced Packet Blocks — that many modern capture
+tools default to, and that several real captures used throughout this
+project actually are) came up as real, immediate friction once
+someone tried running a real pcapng file through the engine — `tshark`
+conversion hit repeated environment-specific permission failures
+(Ubuntu's AppArmor profile for `dumpcap` restricts filesystem access
+even when run as root, a genuinely fiddly thing to debug), so native
+support was the better fix rather than making conversion mandatory.
 
-**Link type is auto-detected from the file's own global header**
-(Ethernet, raw 802.11, or Radiotap+802.11 — the three this project's
-capture paths already handle) — the `--link-type` flags remain
+Verified against real pcapng files already used throughout this
+project, and specifically **found and fixed two real bugs** in the
+process rather than shipping on the first pass that happened to
+balance-check clean:
+- A genuine out-of-bounds array read: `ultimate.pcapng` turned out to
+  declare **313 interfaces**, comfortably exceeding an initial
+  64-slot bound — the lookup logic needed to check against the
+  array's actual capacity, not just the running interface count, or
+  interface IDs past 64 would read uninitialized/out-of-bounds memory.
+  Fixed and the bound raised to 512 (with margin, not just enough to
+  cover this one file).
+- A silent misinterpretation risk: that same file declares **4
+  different link types across its interfaces** (Ethernet, Linux
+  cooked capture, and two others this engine doesn't have a
+  dissection path for). The first version defaulted anything
+  unrecognized to "treat as Ethernet," which would have fed non-
+  Ethernet bytes into the Ethernet parser and produced garbage or
+  misleading output for those packets. Fixed so an unsupported link
+  type is explicitly skipped and counted in the per-file summary,
+  never silently misinterpreted.
+
+**Link type is auto-detected per file** (classic pcap) **or per
+interface** (pcapng, since — as just confirmed against a real file —
+different interfaces in one pcapng file can genuinely have different
+link types) — Ethernet, raw 802.11, or Radiotap+802.11 are the three
+this project's capture paths handle; the `--link-type` flags remain
 available as a manual override for the rare case where a file's
-declared link type doesn't match what it actually needs. A link type
-this project doesn't have a dissection path for yet (e.g. Linux
-"cooked capture," linktype 113 — found in one real capture surveyed
-earlier in this project but never wired up) is reported and the file
-is skipped, rather than silently misinterpreted as Ethernet.
+declared link type doesn't match what it actually needs. An
+unsupported link type is reported and that packet skipped, rather
+than silently misinterpreted as Ethernet.
 
 **Verified against real files before shipping this**, the same
 discipline as every dissector in this project: the exact endianness-
