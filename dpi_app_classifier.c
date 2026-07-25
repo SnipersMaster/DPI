@@ -282,7 +282,7 @@ static void classify_flow(const uint8_t *l4_payload, size_t payload_len,
     bool have_sni = extract_sni(l4_payload, payload_len, &sni) && sni.found;
 
     if (have_sni) {
-        strncpy(result->sni, sni.hostname, MAX_SNI_LEN - 1);
+        DPI_SAFE_STRNCPY(result->sni, sni.hostname, MAX_SNI_LEN);
 
         /* DGA scoring runs on every extracted SNI regardless of whether
          * it matches a known app — a malware C2 domain won't be in the
@@ -298,12 +298,12 @@ static void classify_flow(const uint8_t *l4_payload, size_t payload_len,
         classify_hostname(sni.hostname, &cls);   /* reads the live, reloadable table */
         if (cls.matched) {
             result->method = CLASSIFY_SNI;
-            strncpy(result->category, cls.category, MAX_SECTION_LEN - 1);
-            strncpy(result->app_name, cls.app_name, MAX_APPNAME_LEN - 1);
+            DPI_SAFE_STRNCPY(result->category, cls.category, MAX_SECTION_LEN);
+            DPI_SAFE_STRNCPY(result->app_name, cls.app_name, MAX_APPNAME_LEN);
             result->confidence = "high";
         } else {
             result->method = CLASSIFY_SNI;
-            strncpy(result->category, "unclassified", MAX_SECTION_LEN - 1);
+            DPI_SAFE_STRNCPY(result->category, "unclassified", MAX_SECTION_LEN);
             result->confidence = "low";  /* SNI seen, but not in our table yet */
         }
     } else {
@@ -312,7 +312,7 @@ static void classify_flow(const uint8_t *l4_payload, size_t payload_len,
          * real implementation would compute JA3 here as a fallback for
          * the TCP/TLS case. */
         result->method = CLASSIFY_NONE;
-        strncpy(result->category, "unknown", MAX_SECTION_LEN - 1);
+        DPI_SAFE_STRNCPY(result->category, "unknown", MAX_SECTION_LEN);
         result->confidence = "none";
         result->dga_score = 0.0;
         result->dga_verdict = "low";   /* no SNI to score — not itself suspicious, just opaque */

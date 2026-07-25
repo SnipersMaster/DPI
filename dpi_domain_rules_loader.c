@@ -129,11 +129,11 @@ static bool table_add(struct domain_rule_table *t, const char *suffix,
         t->capacity = new_cap;
     }
     struct domain_rule *r = &t->rules[t->count];
-    strncpy(r->suffix, suffix, MAX_SUFFIX_LEN - 1);
+    DPI_SAFE_STRNCPY(r->suffix, suffix, MAX_SUFFIX_LEN);
     r->suffix[MAX_SUFFIX_LEN - 1] = '\0';
-    strncpy(r->category, category, MAX_SECTION_LEN - 1);
+    DPI_SAFE_STRNCPY(r->category, category, MAX_SECTION_LEN);
     r->category[MAX_SECTION_LEN - 1] = '\0';
-    strncpy(r->app_name, app_name, MAX_APPNAME_LEN - 1);
+    DPI_SAFE_STRNCPY(r->app_name, app_name, MAX_APPNAME_LEN);
     r->app_name[MAX_APPNAME_LEN - 1] = '\0';
     t->count++;
     return true;
@@ -210,7 +210,7 @@ static struct domain_rule_table *parse_domain_rules_file(const char *path) {
 
     struct domain_rule_table *t = table_create();
     if (!t) { fclose(f); return NULL; }
-    strncpy(t->path, path, sizeof(t->path) - 1);
+    DPI_SAFE_STRNCPY(t->path, path, sizeof(t->path));
 
     char line[MAX_LINE_LEN];
     char current_section[MAX_SECTION_LEN] = "uncategorized";
@@ -379,8 +379,8 @@ static void classify_hostname(const char *hostname, struct classification_result
             if (rule_len > best_len) {
                 best_len = rule_len;
                 out->matched = true;
-                strncpy(out->category, r->category, MAX_SECTION_LEN - 1);
-                strncpy(out->app_name, r->app_name, MAX_APPNAME_LEN - 1);
+                DPI_SAFE_STRNCPY(out->category, r->category, MAX_SECTION_LEN);
+                DPI_SAFE_STRNCPY(out->app_name, r->app_name, MAX_APPNAME_LEN);
             }
         }
     }

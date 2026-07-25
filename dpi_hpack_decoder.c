@@ -373,8 +373,8 @@ static void hpack_dynamic_table_insert(struct hpack_dynamic_table *t,
 
     /* Insert at the front (index 0 = newest, per RFC 7541 S2.3.2). */
     memmove(&t->entries[1], &t->entries[0], sizeof(struct hpack_dynamic_entry) * t->count);
-    strncpy(t->entries[0].name, name, HPACK_MAX_NAME_LEN - 1);
-    strncpy(t->entries[0].value, value, HPACK_MAX_VALUE_LEN - 1);
+    DPI_SAFE_STRNCPY(t->entries[0].name, name, HPACK_MAX_NAME_LEN);
+    DPI_SAFE_STRNCPY(t->entries[0].value, value, HPACK_MAX_VALUE_LEN);
     t->count++;
     t->total_size += entry_size;
 }
