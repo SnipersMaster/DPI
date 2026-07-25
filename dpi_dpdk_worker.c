@@ -60,7 +60,7 @@
 #define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
     size_t _dss = (dest_size); \
     if (_dss > 0) { \
-        DPI_SAFE_STRNCPY((dest), (src), _dss); \
+        strncpy((dest), (src), _dss - 1); \
         (dest)[_dss - 1] = '\0'; \
     } \
 } while (0)
