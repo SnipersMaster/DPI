@@ -179,6 +179,7 @@
 #include "dpi_bt_dht_parser.c"
 #include "dpi_sctp_parser.c"
 #include "dpi_m3ua_parser.c"
+#include "dpi_amqp_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
