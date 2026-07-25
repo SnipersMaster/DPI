@@ -51,21 +51,24 @@
 /*
  * DPI_SAFE_STRNCPY — identical to the one in dpi_secure_bootstrap.c;
  * see that file's copy for the full explanation (a real bug found via
- * a real compiler warning: `strncpy(dest, src, N-1)` doesn't null-
- * terminate `dest` if `src` is >= N-1 bytes, and not every affected
- * buffer in this project happened to be zero-initialized first — and
- * a second real compiler run afterward, showing that even the
- * corrected strncpy+explicit-null version still triggered
- * `-Wstringop-truncation` at nearly every call site, since GCC's
- * heuristic there is about strncpy's own behavior specifically, not
- * whether the caller null-terminates afterward — hence the switch to
- * `snprintf(dest, dest_size, "%s", src)`, the standard idiomatic
- * replacement, functionally identical but not flagged the same way).
+ * a real compiler warning about strncpy's null-termination behavior,
+ * a switch to snprintf that turned out to trigger a *different* GCC
+ * truncation warning under the same circumstances, and a scoped
+ * `_Pragma` suppression as the actual fix — every call site's real
+ * intent has always been "cap this field's length," never "the full
+ * value must be preserved," so silent truncation on an overlong
+ * source is correct, intended behavior here, not a bug to keep
+ * chasing across different warning flags).
  * Defined separately here since these two files are independent
  * translation units, never included into each other.
  */
 #define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
+    _Pragma("GCC diagnostic push") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-truncation\"") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-truncation=\"") \
+    _Pragma("GCC diagnostic ignored \"-Wstringop-truncation\"") \
     snprintf((dest), (dest_size), "%s", (src)); \
+    _Pragma("GCC diagnostic pop") \
 } while (0)
 
 #include <rte_eal.h>

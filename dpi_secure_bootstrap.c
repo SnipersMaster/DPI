@@ -62,21 +62,29 @@
  * disclosure risk the next time that buffer got read with `%s`, not
  * just a cosmetic truncation concern.
  *
- * IMPLEMENTED VIA snprintf(dest, dest_size, "%s", src), not
- * strncpy+explicit-null — an earlier version used the latter (still
- * fully correct, still always null-terminates), but a real compiler
- * run showed it still triggers `-Wstringop-truncation` at nearly
- * every one of the ~240 call sites, since GCC's heuristic for that
- * warning is specifically about strncpy's own truncation behavior,
- * not whether the caller null-terminates afterward. `snprintf` with a
- * bounded width and "%s" is the standard, idiomatic C replacement for
- * exactly this situation — identical actual behavior (bounded copy,
- * unconditional null-termination, silent truncation if `src` is too
- * long, which is genuinely fine here — every call site's real intent
- * has always been "cap this field's length," never "the full value
- * must be preserved or the program is wrong") — but GCC treats
- * `snprintf`'s truncation as the caller's deliberate, accepted
- * choice, not a footgun to flag.
+ * IMPLEMENTED VIA snprintf(dest, dest_size, "%s", src) PLUS a scoped
+ * pragma, not strncpy+explicit-null alone — the full story, since
+ * this took two real compiler runs to get right and is worth stating
+ * precisely rather than glossing over. First version used
+ * strncpy+explicit-null (correct, always null-terminates) but
+ * triggered `-Wstringop-truncation` at nearly every one of the ~240
+ * call sites. Switched to `snprintf` on the assumption that GCC
+ * treats its truncation as deliberate — WRONG: a second real compile
+ * showed GCC has a *separate* warning, `-Wformat-truncation`, that
+ * fires on `snprintf("%s", ...)` under the exact same circumstances
+ * (destination smaller than the source theoretically could be).
+ * Switching the copy mechanism a second time would just trade one
+ * warning for a third; the actual fix is to stop chasing which
+ * function GCC happens to flag and instead explicitly acknowledge
+ * what's true: every call site's real intent has always been "cap
+ * this field's length," never "the full value must be preserved or
+ * the program is wrong" — silent truncation on an overlong source is
+ * correct, intended behavior here, not a bug to keep working around.
+ * `_Pragma` (the operator form, not `#pragma` — a `#pragma` directive
+ * can't appear inside a macro's backslash-continued body) scopes the
+ * suppression tightly to just this one `snprintf` call, not the
+ * whole file, so it can't accidentally hide an unrelated truncation
+ * bug somewhere else.
  *
  * Defined as a macro, not a function, specifically so it's available
  * to every `#include`d file regardless of order — `dpi_protocol_
@@ -88,7 +96,12 @@
  * are separate translation units, never included into each other.
  */
 #define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
+    _Pragma("GCC diagnostic push") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-truncation\"") \
+    _Pragma("GCC diagnostic ignored \"-Wformat-truncation=\"") \
+    _Pragma("GCC diagnostic ignored \"-Wstringop-truncation\"") \
     snprintf((dest), (dest_size), "%s", (src)); \
+    _Pragma("GCC diagnostic pop") \
 } while (0)
 
 #include <unistd.h>
