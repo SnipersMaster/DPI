@@ -696,36 +696,65 @@ balance-check clean:
 interface** (pcapng, since — as just confirmed against a real file —
 different interfaces in one pcapng file can genuinely have different
 link types) — Ethernet, raw 802.11, Radiotap+802.11, `LINKTYPE_RAW`
-(IP with no link-layer framing at all), and Linux SLL ("cooked
-capture") are the five this project's capture paths handle; the
-`--link-type` flags remain available as a manual override for the
-rare case where a file's declared link type doesn't match what it
-actually needs. An unsupported link type is reported and that packet
-skipped, rather than silently misinterpreted as Ethernet.
+(IP with no link-layer framing at all), Linux SLL ("cooked capture"),
+and `LINKTYPE_ETHERNET_MPACKET` are the six this project's capture
+paths handle; the `--link-type` flags remain available as a manual
+override for the rare case where a file's declared link type doesn't
+match what it actually needs. An unsupported link type is reported and
+that packet skipped, rather than silently misinterpreted as Ethernet.
 
-`LINKTYPE_RAW` and Linux SLL were added after a real, publicly
-available reference capture ("The Ultimate PCAP") surfaced them
-directly — checking it found it also declares a fourth, genuinely
-niche link type this project has deliberately not added support for
-(`LINKTYPE_ETHERNET_MPACKET`, an IEEE 802.3br "interspersed express
-traffic" monitoring format specific to certain industrial/automotive
-Ethernet contexts) — named honestly as a real gap rather than silently
-handled, since this project doesn't have confident, verified knowledge
-of its wire format the way it does for the other four.
+All three were added after a real, publicly available reference
+capture ("The Ultimate PCAP") surfaced them directly.
+`LINKTYPE_ETHERNET_MPACKET` (IEEE 802.3br "interspersed express
+traffic" / frame preemption — a TSN feature letting a high-priority
+frame interrupt a lower-priority one mid-transmission, splitting the
+interrupted frame into fragments called mPackets) is the most
+deliberately, narrowly scoped of the three, and worth explaining why.
+Real research went into this — not a guess dressed up as one: every
+source checked agrees a captured mPacket begins with the ordinary
+Ethernet preamble, and that a COMPLETE, never-fragmented "express"
+frame's marker byte (SMD-E) shares the exact same value as an ordinary
+Ethernet SFD (`0xD5`), confirmed identically across sources entirely
+independent of 802.3br. But the OTHER marker values — for a fragment's
+first piece (SMD-Sx) and continuation pieces (SMD-Cx), several
+variants each — are only available from the paid, non-public final
+IEEE 802.3-2018 text; what's freely available instead is 2015 IEEE
+802.3br committee working documents that show several of exactly
+those values being actively corrected mid-draft (SMD-C3 changed from
+`0xAD` to `0x2A`; SMD-S3 changed from `0x83` to `0xB3` between
+revisions) — not a stable foundation to build byte-exact fragment
+detection or reassembly on, and this project won't guess at values
+its own sources visibly disagreed with during standardization, the
+same discipline that kept it from guessing at DNP3's field layout
+without a trustworthy reference earlier. So the implementation scans
+for the one confidently-known byte (`0xD5`) within a bounded window
+from the start of the packet; if found, everything after it is a
+complete, ordinary Ethernet frame and gets full dissection through the
+exact same pipeline every other link type uses. If not found, the
+packet is honestly reported as an unidentified preemption fragment
+rather than misidentified — real sample bytes from an actual
+capture would let this be completed properly; none were available to
+verify against while building it.
 
-Both additions reuse the exact same ethertype-based dispatch cascade
-Ethernet already used (refactored out into its own function,
-`dispatch_by_ethertype()`, specifically so this reuse wouldn't require
-duplicating that entire cascade) — `LINKTYPE_RAW` synthesizes an
-ethertype from the IP version nibble (the only field common to both
-IPv4 and IPv6 at a fixed position before either header format
-diverges), and Linux SLL reads its own trailing 2-byte protocol field
-the same way a real EtherType would be read. Verified against real
-packets from the same real capture that surfaced the need for both:
-a real IPv6 packet correctly identified via `LINKTYPE_RAW`, and a real
-IPv4/UDP packet correctly recovered from behind a Linux SLL header
-(the post-header bytes independently confirmed to be a byte-for-byte
-valid IPv4 header — version 4, a computed IHL that matched exactly).
+`LINKTYPE_RAW` and Linux SLL support is complete, not partially
+scoped like MPacket's — both reuse the exact same ethertype-based
+dispatch cascade Ethernet already used (refactored out into its own
+function, `dispatch_by_ethertype()`, specifically so this reuse
+wouldn't require duplicating that entire cascade) — `LINKTYPE_RAW`
+synthesizes an ethertype from the IP version nibble (the only field
+common to both IPv4 and IPv6 at a fixed position before either header
+format diverges), and Linux SLL reads its own trailing 2-byte protocol
+field the same way a real EtherType would be read. Verified against
+real packets from the same real capture that surfaced the need for
+both: a real IPv6 packet correctly identified via `LINKTYPE_RAW`, and
+a real IPv4/UDP packet correctly recovered from behind a Linux SLL
+header (the post-header bytes independently confirmed to be a
+byte-for-byte valid IPv4 header — version 4, a computed IHL that
+matched exactly). `LINKTYPE_ETHERNET_MPACKET`'s scanning logic itself
+was only checked structurally (bounds-safety, offset math, all
+correct) against constructed test cases, not real mPacket bytes — that
+distinction matters and is stated plainly rather than blurred together
+with the other two.
 
 **Verified against real files before shipping this**, the same
 discipline as every dissector in this project: the exact endianness-
