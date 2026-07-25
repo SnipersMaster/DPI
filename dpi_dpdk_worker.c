@@ -48,6 +48,23 @@
 #include <string.h>
 #include <signal.h>
 
+/*
+ * DPI_SAFE_STRNCPY — identical to the one in dpi_secure_bootstrap.c;
+ * see that file's copy for the full explanation (a real bug found via
+ * a real compiler warning: `strncpy(dest, src, N-1)` doesn't null-
+ * terminate `dest` if `src` is >= N-1 bytes, and not every affected
+ * buffer in this project happened to be zero-initialized first).
+ * Defined separately here since these two files are independent
+ * translation units, never included into each other.
+ */
+#define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
+    size_t _dss = (dest_size); \
+    if (_dss > 0) { \
+        DPI_SAFE_STRNCPY((dest), (src), _dss); \
+        (dest)[_dss - 1] = '\0'; \
+    } \
+} while (0)
+
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -135,6 +152,10 @@
 #include "dpi_whois_parser.c"
 #include "dpi_tftp_parser.c"
 #include "dpi_wol_parser.c"
+#include "dpi_wow_parser.c"
+#include "dpi_bt_dht_parser.c"
+#include "dpi_sctp_parser.c"
+#include "dpi_m3ua_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
 #include "dpi_ftp_parser.c"
@@ -241,6 +262,7 @@ static inline void dissect_sixin4_datagram(const struct ipv4_result *ip_result, 
 static inline void dissect_eigrp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ah_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_sctp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -312,12 +334,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
             struct flow_log_record rec = {0};
             const char *sender_ip = dissect_result_get(&arp_out, "arp_sender_ip");
             const char *target_ip = dissect_result_get(&arp_out, "arp_target_ip");
-            if (sender_ip) strncpy(rec.src_ip, sender_ip, sizeof(rec.src_ip) - 1);
-            if (target_ip) strncpy(rec.dst_ip, target_ip, sizeof(rec.dst_ip) - 1);
-            strncpy(rec.category, "ARP", sizeof(rec.category) - 1);
+            if (sender_ip) DPI_SAFE_STRNCPY(rec.src_ip, sender_ip, sizeof(rec.src_ip));
+            if (target_ip) DPI_SAFE_STRNCPY(rec.dst_ip, target_ip, sizeof(rec.dst_ip));
+            DPI_SAFE_STRNCPY(rec.category, "ARP", sizeof(rec.category));
             const char *opcode = dissect_result_get(&arp_out, "arp_opcode");
-            if (opcode) strncpy(rec.app_name, opcode, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            if (opcode) DPI_SAFE_STRNCPY(rec.app_name, opcode, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             log_ring_try_push(queue_id, &rec);
         }
         rte_pktmbuf_free(m);
@@ -341,17 +363,17 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
             const char *inner_src = dissect_result_get(&mpls_out, "mpls_inner_src_ip");
             const char *inner_dst = dissect_result_get(&mpls_out, "mpls_inner_dst_ip");
             const char *inner_sni = dissect_result_get(&mpls_out, "mpls_inner_sni");
-            if (inner_src) strncpy(rec.src_ip, inner_src, sizeof(rec.src_ip) - 1);
-            if (inner_dst) strncpy(rec.dst_ip, inner_dst, sizeof(rec.dst_ip) - 1);
-            strncpy(rec.category, "MPLS", sizeof(rec.category) - 1);
+            if (inner_src) DPI_SAFE_STRNCPY(rec.src_ip, inner_src, sizeof(rec.src_ip));
+            if (inner_dst) DPI_SAFE_STRNCPY(rec.dst_ip, inner_dst, sizeof(rec.dst_ip));
+            DPI_SAFE_STRNCPY(rec.category, "MPLS", sizeof(rec.category));
             if (inner_sni) {
-                strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, inner_sni, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else if (inner_dst) {
-                strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, inner_dst, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else {
-                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
             }
             log_ring_try_push(queue_id, &rec);
         }
@@ -370,16 +392,16 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
             const char *mac = dissect_result_get(&lldp_out, "lldp_chassis_id_mac");
             const char *mgmt_ip = dissect_result_get(&lldp_out, "lldp_management_address");
             const char *sys_name = dissect_result_get(&lldp_out, "lldp_system_name");
-            if (mac) strncpy(rec.src_ip, mac, sizeof(rec.src_ip) - 1);   /* MAC, not an IP, but this
+            if (mac) DPI_SAFE_STRNCPY(rec.src_ip, mac, sizeof(rec.src_ip));   /* MAC, not an IP, but this
                                                                            * is the only stable
                                                                            * identifier LLDP provides */
-            if (mgmt_ip) strncpy(rec.dst_ip, mgmt_ip, sizeof(rec.dst_ip) - 1);
-            strncpy(rec.category, "LLDP", sizeof(rec.category) - 1);
+            if (mgmt_ip) DPI_SAFE_STRNCPY(rec.dst_ip, mgmt_ip, sizeof(rec.dst_ip));
+            DPI_SAFE_STRNCPY(rec.category, "LLDP", sizeof(rec.category));
             if (sys_name) {
-                strncpy(rec.app_name, sys_name, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, sys_name, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else {
-                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
             }
             log_ring_try_push(queue_id, &rec);
         }
@@ -395,10 +417,10 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         if (matched) {
             struct flow_log_record rec = {0};
             const char *target_mac = dissect_result_get(&wol_out, "wol_target_mac");
-            if (target_mac) strncpy(rec.dst_ip, target_mac, sizeof(rec.dst_ip) - 1);
-            strncpy(rec.category, "WoL", sizeof(rec.category) - 1);
-            strncpy(rec.app_name, "Magic Packet", sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, target_mac ? "high" : "low", sizeof(rec.confidence) - 1);
+            if (target_mac) DPI_SAFE_STRNCPY(rec.dst_ip, target_mac, sizeof(rec.dst_ip));
+            DPI_SAFE_STRNCPY(rec.category, "WoL", sizeof(rec.category));
+            DPI_SAFE_STRNCPY(rec.app_name, "Magic Packet", sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, target_mac ? "high" : "low", sizeof(rec.confidence));
             log_ring_try_push(queue_id, &rec);
         }
         rte_pktmbuf_free(m);
@@ -470,6 +492,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 132 /* SCTP */) {
+        dissect_sctp_datagram(&ip_result, queue_id);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -477,7 +505,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, nor L2TPv3: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, nor SCTP: not handled */
         return;
     }
 
@@ -568,17 +596,17 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
                      (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
 
             struct flow_log_record rec = {0};
-            strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-            strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
+            DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+            DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
             rec.src_port = tcp_result.src_port;
             rec.dst_port = tcp_result.dst_port;
-            strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+            DPI_SAFE_STRNCPY(rec.category, "HTTP/2", sizeof(rec.category));
             const char *authority = dissect_result_get(&h2_out, "http2_authority");
             if (authority) {
-                strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, authority, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else {
-                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
             }
             rec.out_of_order_segments = stats.out_of_order_segments;
             rec.retransmit_count = stats.retransmit_count;
@@ -621,13 +649,13 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
              (ip_result.dst_addr >> 8) & 0xFF, ip_result.dst_addr & 0xFF);
     rec.src_port = tcp_result.src_port;
     rec.dst_port = tcp_result.dst_port;
-    strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
-    strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
-    strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
-    strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
+    DPI_SAFE_STRNCPY(rec.sni, classification.sni, sizeof(rec.sni));
+    DPI_SAFE_STRNCPY(rec.category, classification.category, sizeof(rec.category));
+    DPI_SAFE_STRNCPY(rec.app_name, classification.app_name, sizeof(rec.app_name));
+    DPI_SAFE_STRNCPY(rec.confidence, classification.confidence, sizeof(rec.confidence));
     rec.dga_score = classification.dga_score;
     rec.vpn_score = classification.vpn_score;
-    strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
+    DPI_SAFE_STRNCPY(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol));
     rec.dot_score = classification.dot_score;
     rec.doh_score = classification.doh_score;
 
@@ -648,26 +676,26 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
             http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
                                            conn, reverse_conn, &h2_out);
 
-            strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+            DPI_SAFE_STRNCPY(rec.category, "HTTP/2", sizeof(rec.category));
             const char *authority = dissect_result_get(&h2_out, "http2_authority");
             if (authority) {
-                strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, authority, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else {
-                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
             }
         } else {
             struct dissect_result tcp_out;
             bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
                                                     tcp_result.dst_port, "TCP", &tcp_out);
             if (tcp_matched) {
-                strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
+                DPI_SAFE_STRNCPY(rec.category, tcp_out.protocol_name, sizeof(rec.category));
                 const char *identity = dissect_result_get(&tcp_out, "http_host");
                 if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
                 if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
                 if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
-                if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                if (identity) DPI_SAFE_STRNCPY(rec.app_name, identity, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             }
         }
     }
@@ -707,9 +735,9 @@ static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, ui
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "ICMP", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "ICMP", sizeof(rec.category));
     /* flow_log_record's fixed fields don't have a dedicated slot for
      * every ICMP-specific field (type/code/echo id-seq/etc) — same
      * limitation every dissector with more fields than the fixed
@@ -717,8 +745,8 @@ static inline void dissect_icmp_datagram(const struct ipv4_result *ip_result, ui
      * type name specifically, since that's the single most useful
      * summary field for this protocol. */
     const char *icmp_type = dissect_result_get(&dissect_out, "icmp_type");
-    if (icmp_type) strncpy(rec.app_name, icmp_type, sizeof(rec.app_name) - 1);
-    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+    if (icmp_type) DPI_SAFE_STRNCPY(rec.app_name, icmp_type, sizeof(rec.app_name));
+    DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
 
     log_ring_try_push(queue_id, &rec);
 }
@@ -740,9 +768,9 @@ static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uin
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "GRE", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "GRE", sizeof(rec.category));
     /* Same fixed-field limitation as ICMP — app_name is repurposed to
      * carry the single most useful summary field. For a decapsulated
      * tunnel, that's the inner destination IP if one was found (the
@@ -753,13 +781,13 @@ static inline void dissect_gre_datagram(const struct ipv4_result *ip_result, uin
     const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
     const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
     if (inner_sni) {
-        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_sni, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else if (inner_dst) {
-        strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_dst, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -782,15 +810,15 @@ static inline void dissect_ospf_datagram(const struct ipv4_result *ip_result, ui
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "OSPF", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "OSPF", sizeof(rec.category));
     const char *type = dissect_result_get(&dissect_out, "ospf_type");
     if (type) {
-        strncpy(rec.app_name, type, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, type, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -813,15 +841,15 @@ static inline void dissect_igmp_datagram(const struct ipv4_result *ip_result, ui
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "IGMP", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "IGMP", sizeof(rec.category));
     const char *igmp_type = dissect_result_get(&dissect_out, "igmp_type");
     if (igmp_type) {
-        strncpy(rec.app_name, igmp_type, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, igmp_type, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -844,15 +872,15 @@ static inline void dissect_ah_datagram(const struct ipv4_result *ip_result, uint
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "AH", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "AH", sizeof(rec.category));
     const char *inner_proto = dissect_result_get(&dissect_out, "ah_inner_protocol");
     if (inner_proto) {
-        strncpy(rec.app_name, inner_proto, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_proto, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -879,23 +907,61 @@ static inline void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result, 
     const char *inner_sni = dissect_result_get(&dissect_out, "l2tpv3_inner_sni");
     const char *inner_proto = dissect_result_get(&dissect_out, "l2tpv3_inner_protocol");
 
-    if (inner_src_ip) strncpy(rec.src_ip, inner_src_ip, sizeof(rec.src_ip) - 1);
-    else if (inner_src_mac) strncpy(rec.src_ip, inner_src_mac, sizeof(rec.src_ip) - 1);
-    if (inner_dst_ip) strncpy(rec.dst_ip, inner_dst_ip, sizeof(rec.dst_ip) - 1);
-    else if (inner_dst_mac) strncpy(rec.dst_ip, inner_dst_mac, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "L2TPv3", sizeof(rec.category) - 1);
+    if (inner_src_ip) DPI_SAFE_STRNCPY(rec.src_ip, inner_src_ip, sizeof(rec.src_ip));
+    else if (inner_src_mac) DPI_SAFE_STRNCPY(rec.src_ip, inner_src_mac, sizeof(rec.src_ip));
+    if (inner_dst_ip) DPI_SAFE_STRNCPY(rec.dst_ip, inner_dst_ip, sizeof(rec.dst_ip));
+    else if (inner_dst_mac) DPI_SAFE_STRNCPY(rec.dst_ip, inner_dst_mac, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "L2TPv3", sizeof(rec.category));
 
     if (inner_sni) {
-        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_sni, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else if (inner_proto) {
-        strncpy(rec.app_name, inner_proto, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_proto, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else if (inner_dst_ip) {
-        strncpy(rec.app_name, inner_dst_ip, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_dst_ip, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
+    }
+
+    log_ring_try_push(queue_id, &rec);
+}
+
+static inline void dissect_sctp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "SCTP", &dissect_out);
+    if (!matched) return;
+
+    struct flow_log_record rec = {0};
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr>>24)&0xFF, (ip_result->src_addr>>16)&0xFF,
+             (ip_result->src_addr>>8)&0xFF, ip_result->src_addr&0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr>>24)&0xFF, (ip_result->dst_addr>>16)&0xFF,
+             (ip_result->dst_addr>>8)&0xFF, ip_result->dst_addr&0xFF);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "SCTP", sizeof(rec.category));
+
+    /* Prefer naming whatever real upper-layer protocol a DATA chunk's
+     * PPID resolved to (M3UA, M2UA, once those dissectors exist) over
+     * just "SCTP" generically — same "name the most specific thing
+     * actually found" preference as every other tunnel/transport
+     * dissector in this project. */
+    const char *inner_proto = dissect_result_get(&dissect_out, "sctp_chunk_0_inner_protocol");
+    if (inner_proto) {
+        DPI_SAFE_STRNCPY(rec.app_name, inner_proto, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
+    } else {
+        const char *chunk0_type = dissect_result_get(&dissect_out, "sctp_chunk_0_type");
+        if (chunk0_type) DPI_SAFE_STRNCPY(rec.app_name, chunk0_type, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -918,15 +984,15 @@ static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uin
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "ESP", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "ESP", sizeof(rec.category));
     const char *spi = dissect_result_get(&dissect_out, "esp_spi");
     if (spi) {
-        strncpy(rec.app_name, spi, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, spi, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -949,17 +1015,17 @@ static inline void dissect_sixin4_datagram(const struct ipv4_result *ip_result, 
     const char *inner_src = dissect_result_get(&dissect_out, "sixin4_inner_src_ip");
     const char *inner_dst = dissect_result_get(&dissect_out, "sixin4_inner_dst_ip");
     const char *inner_sni = dissect_result_get(&dissect_out, "sixin4_inner_sni");
-    if (inner_src) strncpy(rec.src_ip, inner_src, sizeof(rec.src_ip) - 1);
-    if (inner_dst) strncpy(rec.dst_ip, inner_dst, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "6in4", sizeof(rec.category) - 1);
+    if (inner_src) DPI_SAFE_STRNCPY(rec.src_ip, inner_src, sizeof(rec.src_ip));
+    if (inner_dst) DPI_SAFE_STRNCPY(rec.dst_ip, inner_dst, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "6in4", sizeof(rec.category));
     if (inner_sni) {
-        strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_sni, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else if (inner_dst) {
-        strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, inner_dst, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -982,15 +1048,15 @@ static inline void dissect_eigrp_datagram(const struct ipv4_result *ip_result, u
              (ip_result->dst_addr >> 8) & 0xFF, ip_result->dst_addr & 0xFF);
 
     struct flow_log_record rec = {0};
-    strncpy(rec.src_ip, src_ip_str, sizeof(rec.src_ip) - 1);
-    strncpy(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip) - 1);
-    strncpy(rec.category, "EIGRP", sizeof(rec.category) - 1);
+    DPI_SAFE_STRNCPY(rec.src_ip, src_ip_str, sizeof(rec.src_ip));
+    DPI_SAFE_STRNCPY(rec.dst_ip, dst_ip_str, sizeof(rec.dst_ip));
+    DPI_SAFE_STRNCPY(rec.category, "EIGRP", sizeof(rec.category));
     const char *opcode = dissect_result_get(&dissect_out, "eigrp_opcode");
     if (opcode) {
-        strncpy(rec.app_name, opcode, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.app_name, opcode, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
     } else {
-        strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -1027,33 +1093,33 @@ static inline void dissect_udp_datagram(const struct ipv4_result *ip_result, uin
     rec.src_port = udp_result.src_port;
     rec.dst_port = udp_result.dst_port;
     rec.vpn_score = vpn.score;
-    strncpy(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol) - 1);
+    DPI_SAFE_STRNCPY(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol));
 
     if (matched) {
-        strncpy(rec.category, dissect_out.protocol_name, sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.category, dissect_out.protocol_name, sizeof(rec.category));
 
         const char *sni = dissect_result_get(&dissect_out, "sni");
         if (sni) {
-            strncpy(rec.sni, sni, sizeof(rec.sni) - 1);
+            DPI_SAFE_STRNCPY(rec.sni, sni, sizeof(rec.sni));
 
             struct classification_result cls;
             classify_hostname(sni, &cls);
             if (cls.matched) {
-                strncpy(rec.app_name, cls.app_name, sizeof(rec.app_name) - 1);
-                strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.app_name, cls.app_name, sizeof(rec.app_name));
+                DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
             } else {
-                strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
             }
 
             struct dga_result dga;
             score_dga(sni, &dga);
             rec.dga_score = dga.score;
         } else {
-            strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "none", sizeof(rec.confidence));
         }
     } else {
-        strncpy(rec.category, "unknown", sizeof(rec.category) - 1);
-        strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.category, "unknown", sizeof(rec.category));
+        DPI_SAFE_STRNCPY(rec.confidence, "none", sizeof(rec.confidence));
     }
 
     log_ring_try_push(queue_id, &rec);
@@ -1115,12 +1181,12 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                             icmpv6_checksum_valid ? "true" : "false");
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "ICMPv6", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "ICMPv6", sizeof(rec.category));
         const char *icmpv6_type = dissect_result_get(&dissect_out, "icmpv6_type");
-        if (icmpv6_type) strncpy(rec.app_name, icmpv6_type, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, icmpv6_checksum_valid ? "high" : "low", sizeof(rec.confidence) - 1);
+        if (icmpv6_type) DPI_SAFE_STRNCPY(rec.app_name, icmpv6_type, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, icmpv6_checksum_valid ? "high" : "low", sizeof(rec.confidence));
 
         log_ring_try_push(queue_id, &rec);
         return;
@@ -1135,19 +1201,19 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         if (!matched) return;
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "GRE", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "GRE", sizeof(rec.category));
         const char *inner_sni = dissect_result_get(&dissect_out, "gre_inner_sni");
         const char *inner_dst = dissect_result_get(&dissect_out, "gre_inner_dst_ip");
         if (inner_sni) {
-            strncpy(rec.app_name, inner_sni, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, inner_sni, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else if (inner_dst) {
-            strncpy(rec.app_name, inner_dst, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, inner_dst, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else {
-            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1163,15 +1229,15 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         if (!matched) return;
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "OSPF", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "OSPF", sizeof(rec.category));
         const char *type = dissect_result_get(&dissect_out, "ospf_type");
         if (type) {
-            strncpy(rec.app_name, type, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, type, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else {
-            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1187,15 +1253,15 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         if (!matched) return;
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "ESP", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "ESP", sizeof(rec.category));
         const char *spi = dissect_result_get(&dissect_out, "esp_spi");
         if (spi) {
-            strncpy(rec.app_name, spi, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, spi, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else {
-            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1211,15 +1277,15 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         if (!matched) return;
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "EIGRP", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "EIGRP", sizeof(rec.category));
         const char *opcode = dissect_result_get(&dissect_out, "eigrp_opcode");
         if (opcode) {
-            strncpy(rec.app_name, opcode, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, opcode, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else {
-            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1235,15 +1301,15 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
         if (!matched) return;
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
-        strncpy(rec.category, "AH", sizeof(rec.category) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
+        DPI_SAFE_STRNCPY(rec.category, "AH", sizeof(rec.category));
         const char *inner_proto = dissect_result_get(&dissect_out, "ah_inner_protocol");
         if (inner_proto) {
-            strncpy(rec.app_name, inner_proto, sizeof(rec.app_name) - 1);
-            strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.app_name, inner_proto, sizeof(rec.app_name));
+            DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
         } else {
-            strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1267,31 +1333,31 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                            udp_result.dst_port, "UDP", NULL, &vpn);
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
         rec.src_port = udp_result.src_port;
         rec.dst_port = udp_result.dst_port;
         rec.vpn_score = vpn.score;
-        strncpy(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol) - 1);
+        DPI_SAFE_STRNCPY(rec.vpn_protocol, vpn.detected_protocol, sizeof(rec.vpn_protocol));
 
         if (matched) {
-            strncpy(rec.category, dissect_out.protocol_name, sizeof(rec.category) - 1);
+            DPI_SAFE_STRNCPY(rec.category, dissect_out.protocol_name, sizeof(rec.category));
             const char *sni = dissect_result_get(&dissect_out, "sni");
             if (sni) {
-                strncpy(rec.sni, sni, sizeof(rec.sni) - 1);
+                DPI_SAFE_STRNCPY(rec.sni, sni, sizeof(rec.sni));
                 struct classification_result cls;
                 classify_hostname(sni, &cls);
-                strncpy(rec.confidence, cls.matched ? "high" : "low", sizeof(rec.confidence) - 1);
-                if (cls.matched) strncpy(rec.app_name, cls.app_name, sizeof(rec.app_name) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, cls.matched ? "high" : "low", sizeof(rec.confidence));
+                if (cls.matched) DPI_SAFE_STRNCPY(rec.app_name, cls.app_name, sizeof(rec.app_name));
                 struct dga_result dga;
                 score_dga(sni, &dga);
                 rec.dga_score = dga.score;
             } else {
-                strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+                DPI_SAFE_STRNCPY(rec.confidence, "none", sizeof(rec.confidence));
             }
         } else {
-            strncpy(rec.category, "unknown", sizeof(rec.category) - 1);
-            strncpy(rec.confidence, "none", sizeof(rec.confidence) - 1);
+            DPI_SAFE_STRNCPY(rec.category, "unknown", sizeof(rec.category));
+            DPI_SAFE_STRNCPY(rec.confidence, "none", sizeof(rec.confidence));
         }
 
         log_ring_try_push(queue_id, &rec);
@@ -1353,17 +1419,17 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                 ipv6_addr_to_string(ip6_result.dst_addr, dst_str6, sizeof(dst_str6));
 
                 struct flow_log_record rec = {0};
-                strncpy(rec.src_ip, src_str6, sizeof(rec.src_ip) - 1);
-                strncpy(rec.dst_ip, dst_str6, sizeof(rec.dst_ip) - 1);
+                DPI_SAFE_STRNCPY(rec.src_ip, src_str6, sizeof(rec.src_ip));
+                DPI_SAFE_STRNCPY(rec.dst_ip, dst_str6, sizeof(rec.dst_ip));
                 rec.src_port = tcp_result.src_port;
                 rec.dst_port = tcp_result.dst_port;
-                strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+                DPI_SAFE_STRNCPY(rec.category, "HTTP/2", sizeof(rec.category));
                 const char *authority = dissect_result_get(&h2_out, "http2_authority");
                 if (authority) {
-                    strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
-                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                    DPI_SAFE_STRNCPY(rec.app_name, authority, sizeof(rec.app_name));
+                    DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
                 } else {
-                    strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                    DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
                 }
                 rec.out_of_order_segments = stats.out_of_order_segments;
                 rec.retransmit_count = stats.retransmit_count;
@@ -1379,17 +1445,17 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                       tcp_result.dst_port, "TCP", &classification);
 
         struct flow_log_record rec = {0};
-        strncpy(rec.src_ip, src_str, sizeof(rec.src_ip) - 1);
-        strncpy(rec.dst_ip, dst_str, sizeof(rec.dst_ip) - 1);
+        DPI_SAFE_STRNCPY(rec.src_ip, src_str, sizeof(rec.src_ip));
+        DPI_SAFE_STRNCPY(rec.dst_ip, dst_str, sizeof(rec.dst_ip));
         rec.src_port = tcp_result.src_port;
         rec.dst_port = tcp_result.dst_port;
-        strncpy(rec.sni, classification.sni, sizeof(rec.sni) - 1);
-        strncpy(rec.category, classification.category, sizeof(rec.category) - 1);
-        strncpy(rec.app_name, classification.app_name, sizeof(rec.app_name) - 1);
-        strncpy(rec.confidence, classification.confidence, sizeof(rec.confidence) - 1);
+        DPI_SAFE_STRNCPY(rec.sni, classification.sni, sizeof(rec.sni));
+        DPI_SAFE_STRNCPY(rec.category, classification.category, sizeof(rec.category));
+        DPI_SAFE_STRNCPY(rec.app_name, classification.app_name, sizeof(rec.app_name));
+        DPI_SAFE_STRNCPY(rec.confidence, classification.confidence, sizeof(rec.confidence));
         rec.dga_score = classification.dga_score;
         rec.vpn_score = classification.vpn_score;
-        strncpy(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol) - 1);
+        DPI_SAFE_STRNCPY(rec.vpn_protocol, classification.vpn_protocol, sizeof(rec.vpn_protocol));
         rec.dot_score = classification.dot_score;
         rec.doh_score = classification.doh_score;
 
@@ -1407,26 +1473,26 @@ static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len,
                 http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
                                                conn, reverse_conn, &h2_out);
 
-                strncpy(rec.category, "HTTP/2", sizeof(rec.category) - 1);
+                DPI_SAFE_STRNCPY(rec.category, "HTTP/2", sizeof(rec.category));
                 const char *authority = dissect_result_get(&h2_out, "http2_authority");
                 if (authority) {
-                    strncpy(rec.app_name, authority, sizeof(rec.app_name) - 1);
-                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                    DPI_SAFE_STRNCPY(rec.app_name, authority, sizeof(rec.app_name));
+                    DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
                 } else {
-                    strncpy(rec.confidence, "low", sizeof(rec.confidence) - 1);
+                    DPI_SAFE_STRNCPY(rec.confidence, "low", sizeof(rec.confidence));
                 }
             } else {
                 struct dissect_result tcp_out;
                 bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
                                                         tcp_result.dst_port, "TCP", &tcp_out);
                 if (tcp_matched) {
-                    strncpy(rec.category, tcp_out.protocol_name, sizeof(rec.category) - 1);
+                    DPI_SAFE_STRNCPY(rec.category, tcp_out.protocol_name, sizeof(rec.category));
                     const char *identity = dissect_result_get(&tcp_out, "http_host");
                     if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
                     if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
                     if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
-                    if (identity) strncpy(rec.app_name, identity, sizeof(rec.app_name) - 1);
-                    strncpy(rec.confidence, "high", sizeof(rec.confidence) - 1);
+                    if (identity) DPI_SAFE_STRNCPY(rec.app_name, identity, sizeof(rec.app_name));
+                    DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
                 }
             }
         }

@@ -67,8 +67,8 @@ struct dissect_result {
 static void dissect_result_add(struct dissect_result *r, const char *key, const char *val) {
     if (r->n_fields >= MAX_FIELDS_PER_RESULT) return;   /* silently cap, don't overflow */
     struct dissect_field *f = &r->fields[r->n_fields++];
-    strncpy(f->key, key, MAX_FIELD_KEY_LEN - 1);
-    strncpy(f->value, val, MAX_FIELD_VAL_LEN - 1);
+    DPI_SAFE_STRNCPY(f->key, key, MAX_FIELD_KEY_LEN);
+    DPI_SAFE_STRNCPY(f->value, val, MAX_FIELD_VAL_LEN);
 }
 
 /* Look up a field by key. Returns NULL if not present — e.g. QUIC's
@@ -145,7 +145,7 @@ static bool register_dissector(const char *name,
         return false;
     }
     struct dissector *d = &g_registry[g_n_dissectors++];
-    strncpy(d->name, name, MAX_PROTOCOL_NAME - 1);
+    DPI_SAFE_STRNCPY(d->name, name, MAX_PROTOCOL_NAME);
     d->detect = detect;
     d->dissect = dissect;
     d->n_hint_ports = n_hint_ports > 4 ? 4 : n_hint_ports;
@@ -215,7 +215,7 @@ static bool dispatch_dissection(const uint8_t *payload, uint16_t len,
 
     best->dissect(payload, len, dst_port, l4_proto, out);
     out->matched = true;
-    strncpy(out->protocol_name, best->name, MAX_PROTOCOL_NAME - 1);
+    DPI_SAFE_STRNCPY(out->protocol_name, best->name, MAX_PROTOCOL_NAME);
     return true;
 }
 

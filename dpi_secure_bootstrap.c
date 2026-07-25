@@ -10,8 +10,15 @@
  *   3. Restrict syscalls with seccomp-bpf before touching any packet data
  *   4. Parse packets with strict, explicit bounds checks
  *
- * Build (requires dev packages, e.g. `apt install libseccomp-dev libcap-dev`):
- *   gcc -O2 -Wall -Wextra -o dpi_bootstrap dpi_secure_bootstrap.c -lseccomp -lcap
+ * Build (requires dev packages, e.g. `apt install libseccomp-dev libcap-dev
+ * libssl-dev`):
+ *   gcc -O2 -Wall -Wextra -o dpi_bootstrap dpi_secure_bootstrap.c -lseccomp -lcap -lm -lcrypto
+ *
+ * -lm is for log2() (dpi_dga_detector.c's Shannon entropy scoring).
+ * -lcrypto is OpenSSL's libcrypto (not libssl — this project only uses
+ * OpenSSL's crypto primitives directly for QUIC's own HKDF key
+ * derivation and AES-GCM decryption, per RFC 9001; it never makes an
+ * actual TLS connection, so the higher-level libssl isn't needed).
  *
  * Run against a LIVE interface (needs CAP_NET_RAW, not full root — see
  * setcap note at bottom):
@@ -37,6 +44,41 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+
+/*
+ * DPI_SAFE_STRNCPY — a real bug found via a real compiler warning, not
+ * a cosmetic fix. `strncpy(dest, src, N-1)` does NOT null-terminate
+ * `dest` if `src` is >= N-1 bytes long — `dest[N-1]` (the byte the
+ * ordinary "reserve room for the null terminator" pattern assumes
+ * gets set) is simply never touched by strncpy at all. Across this
+ * project's ~240 strncpy call sites (found via a systematic project-
+ * wide scan after a real compiler flagged a handful of them), most
+ * happened to be safe only because the destination struct was zero-
+ * initialized elsewhere (`= {0}`) — but not all of them were: at
+ * least one local buffer (`effective_category` in this file) was
+ * declared with no initializer at all, meaning a source string at or
+ * past the buffer's capacity would leave whatever uninitialized stack
+ * garbage was already there un-terminated — a real information-
+ * disclosure risk the next time that buffer got read with `%s`, not
+ * just a cosmetic truncation concern.
+ *
+ * Defined as a macro, not a function, specifically so it's available
+ * to every `#include`d file regardless of order — `dpi_protocol_
+ * config.c` (which has this exact same pattern) gets included from
+ * within `dpi_dissector_registry.c` before any function defined
+ * there would be visible to it; a macro defined here, before every
+ * dissector file, has no such ordering constraint. Defined
+ * identically in `dpi_dpdk_worker.c` since the two capture-path files
+ * are separate translation units, never included into each other.
+ */
+#define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
+    size_t _dss = (dest_size); \
+    if (_dss > 0) { \
+        DPI_SAFE_STRNCPY((dest), (src), _dss); \
+        (dest)[_dss - 1] = '\0'; \
+    } \
+} while (0)
+
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -113,6 +155,8 @@
 #include "dpi_wol_parser.c"
 #include "dpi_wow_parser.c"
 #include "dpi_bt_dht_parser.c"
+#include "dpi_sctp_parser.c"
+#include "dpi_m3ua_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -149,7 +193,7 @@ static int open_capture_socket(const char *ifname) {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    DPI_SAFE_STRNCPY(ifr.ifr_name, ifname, IFNAMSIZ);
     if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
         perror("ioctl(SIOCGIFINDEX)");
         close(sock);
@@ -257,6 +301,7 @@ static void dissect_sixin4_datagram(const struct ipv4_result *ip_result);
 static void dissect_eigrp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ah_datagram(const struct ipv4_result *ip_result);
 static void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result);
+static void dissect_sctp_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -489,6 +534,39 @@ static void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result) {
            inner_proto ? inner_proto : "", inner_sni ? inner_sni : "");
 }
 
+static void dissect_sctp_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "SCTP", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr>>24)&0xFF, (ip_result->src_addr>>16)&0xFF,
+             (ip_result->src_addr>>8)&0xFF, ip_result->src_addr&0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr>>24)&0xFF, (ip_result->dst_addr>>16)&0xFF,
+             (ip_result->dst_addr>>8)&0xFF, ip_result->dst_addr&0xFF);
+
+    const char *sport = dissect_result_get(&dissect_out, "sctp_src_port");
+    const char *dport = dissect_result_get(&dissect_out, "sctp_dst_port");
+    const char *verif_tag = dissect_result_get(&dissect_out, "sctp_verification_tag");
+    const char *chunk0_type = dissect_result_get(&dissect_out, "sctp_chunk_0_type");
+    const char *chunk0_ppid = dissect_result_get(&dissect_out, "sctp_chunk_0_ppid");
+    const char *chunk0_inner = dissect_result_get(&dissect_out, "sctp_chunk_0_inner_protocol");
+
+    printf("{\"protocol\":\"SCTP\",\"src_ip\":\"%s\",\"dst_ip\":\"%s\","
+           "\"sctp_src_port\":\"%s\",\"sctp_dst_port\":\"%s\","
+           "\"sctp_verification_tag\":\"%s\",\"sctp_chunk_0_type\":\"%s\","
+           "\"sctp_chunk_0_ppid\":\"%s\",\"sctp_chunk_0_inner_protocol\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           sport ? sport : "", dport ? dport : "",
+           verif_tag ? verif_tag : "", chunk0_type ? chunk0_type : "",
+           chunk0_ppid ? chunk0_ppid : "", chunk0_inner ? chunk0_inner : "");
+}
+
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
     struct udp_result udp_result;
     if (!parse_udp(ip_result->src_addr, ip_result->dst_addr,
@@ -512,10 +590,10 @@ static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
     if (matched) {
         const char *sni = dissect_result_get(&dissect_out, "sni");
         if (sni) {
-            strncpy(sni_out, sni, sizeof(sni_out) - 1);
+            DPI_SAFE_STRNCPY(sni_out, sni, sizeof(sni_out));
             struct classification_result cls;
             classify_hostname(sni, &cls);
-            strncpy(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out) - 1);
+            DPI_SAFE_STRNCPY(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out));
 
             struct dga_result dga;
             score_dga(sni, &dga);
@@ -702,10 +780,10 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
         if (matched) {
             const char *sni = dissect_result_get(&dissect_out, "sni");
             if (sni) {
-                strncpy(sni_out, sni, sizeof(sni_out) - 1);
+                DPI_SAFE_STRNCPY(sni_out, sni, sizeof(sni_out));
                 struct classification_result cls;
                 classify_hostname(sni, &cls);
-                strncpy(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out) - 1);
+                DPI_SAFE_STRNCPY(confidence_out, cls.matched ? "high" : "low", sizeof(confidence_out));
                 struct dga_result dga;
                 score_dga(sni, &dga);
                 dga_score_out = dga.score;
@@ -790,9 +868,9 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
         char effective_category[MAX_PROTOCOL_NAME];
         char effective_app_name[MAX_FIELD_VAL_LEN];
         char effective_confidence[16];
-        strncpy(effective_category, classification.category, sizeof(effective_category) - 1);
-        strncpy(effective_app_name, classification.app_name, sizeof(effective_app_name) - 1);
-        strncpy(effective_confidence, classification.confidence, sizeof(effective_confidence) - 1);
+        DPI_SAFE_STRNCPY(effective_category, classification.category, sizeof(effective_category));
+        DPI_SAFE_STRNCPY(effective_app_name, classification.app_name, sizeof(effective_app_name));
+        DPI_SAFE_STRNCPY(effective_confidence, classification.confidence, sizeof(effective_confidence));
 
         if (strcmp(classification.category, "unknown") == 0) {
             double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
@@ -803,26 +881,26 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                 http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
                                                conn, reverse_conn, &h2_out);
 
-                strncpy(effective_category, "HTTP/2", sizeof(effective_category) - 1);
+                DPI_SAFE_STRNCPY(effective_category, "HTTP/2", sizeof(effective_category));
                 const char *authority = dissect_result_get(&h2_out, "http2_authority");
                 if (authority) {
-                    strncpy(effective_app_name, authority, sizeof(effective_app_name) - 1);
-                    strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                    DPI_SAFE_STRNCPY(effective_app_name, authority, sizeof(effective_app_name));
+                    DPI_SAFE_STRNCPY(effective_confidence, "high", sizeof(effective_confidence));
                 } else {
-                    strncpy(effective_confidence, "low", sizeof(effective_confidence) - 1);
+                    DPI_SAFE_STRNCPY(effective_confidence, "low", sizeof(effective_confidence));
                 }
             } else {
                 struct dissect_result tcp_out;
                 bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
                                                         tcp_result.dst_port, "TCP", &tcp_out);
                 if (tcp_matched) {
-                    strncpy(effective_category, tcp_out.protocol_name, sizeof(effective_category) - 1);
+                    DPI_SAFE_STRNCPY(effective_category, tcp_out.protocol_name, sizeof(effective_category));
                     const char *identity = dissect_result_get(&tcp_out, "http_host");
                     if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
                     if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
                     if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
-                    if (identity) strncpy(effective_app_name, identity, sizeof(effective_app_name) - 1);
-                    strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                    if (identity) DPI_SAFE_STRNCPY(effective_app_name, identity, sizeof(effective_app_name));
+                    DPI_SAFE_STRNCPY(effective_confidence, "high", sizeof(effective_confidence));
                 }
             }
         }
@@ -1047,13 +1125,18 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    if (ip_result.protocol == 132 /* SCTP */) {
+        dissect_sctp_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, nor L2TPv3: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, nor SCTP: not handled */
     }
 
     struct tcp_result tcp_result;
@@ -1135,9 +1218,9 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     char effective_category[MAX_PROTOCOL_NAME];
     char effective_app_name[MAX_FIELD_VAL_LEN];
     char effective_confidence[16];
-    strncpy(effective_category, classification.category, sizeof(effective_category) - 1);
-    strncpy(effective_app_name, classification.app_name, sizeof(effective_app_name) - 1);
-    strncpy(effective_confidence, classification.confidence, sizeof(effective_confidence) - 1);
+    DPI_SAFE_STRNCPY(effective_category, classification.category, sizeof(effective_category));
+    DPI_SAFE_STRNCPY(effective_app_name, classification.app_name, sizeof(effective_app_name));
+    DPI_SAFE_STRNCPY(effective_confidence, classification.confidence, sizeof(effective_confidence));
 
     if (strcmp(classification.category, "unknown") == 0) {
         double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
@@ -1148,26 +1231,26 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
             http2_dissect_with_flow_state(contiguous_data, (uint16_t)contiguous_len,
                                            conn, reverse_conn, &h2_out);
 
-            strncpy(effective_category, "HTTP/2", sizeof(effective_category) - 1);
+            DPI_SAFE_STRNCPY(effective_category, "HTTP/2", sizeof(effective_category));
             const char *authority = dissect_result_get(&h2_out, "http2_authority");
             if (authority) {
-                strncpy(effective_app_name, authority, sizeof(effective_app_name) - 1);
-                strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                DPI_SAFE_STRNCPY(effective_app_name, authority, sizeof(effective_app_name));
+                DPI_SAFE_STRNCPY(effective_confidence, "high", sizeof(effective_confidence));
             } else {
-                strncpy(effective_confidence, "low", sizeof(effective_confidence) - 1);
+                DPI_SAFE_STRNCPY(effective_confidence, "low", sizeof(effective_confidence));
             }
         } else {
             struct dissect_result tcp_out;
             bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
                                                     tcp_result.dst_port, "TCP", &tcp_out);
             if (tcp_matched) {
-                strncpy(effective_category, tcp_out.protocol_name, sizeof(effective_category) - 1);
+                DPI_SAFE_STRNCPY(effective_category, tcp_out.protocol_name, sizeof(effective_category));
                 const char *identity = dissect_result_get(&tcp_out, "http_host");
                 if (!identity) identity = dissect_result_get(&tcp_out, "ssh_software_version");
                 if (!identity) identity = dissect_result_get(&tcp_out, "smtp_helo_domain");
                 if (!identity) identity = dissect_result_get(&tcp_out, "smtp_ehlo_domain");
-                if (identity) strncpy(effective_app_name, identity, sizeof(effective_app_name) - 1);
-                strncpy(effective_confidence, "high", sizeof(effective_confidence) - 1);
+                if (identity) DPI_SAFE_STRNCPY(effective_app_name, identity, sizeof(effective_app_name));
+                DPI_SAFE_STRNCPY(effective_confidence, "high", sizeof(effective_confidence));
             }
         }
     }

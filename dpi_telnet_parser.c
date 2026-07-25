@@ -175,7 +175,11 @@ static void telnet_dissect(const uint8_t *payload, uint16_t len,
         }
     }
 
-    char buf[8];
+    char buf[16];   /* was char buf[8] — too small for an int's worst
+                      * case (up to 11 chars incl. sign/null), flagged
+                      * by a real compiler warning; matches the
+                      * char buf[16] pattern already used elsewhere in
+                      * this project for the same int-to-string case */
     snprintf(buf, sizeof(buf), "%d", n_negotiations);
     dissect_result_add(out, "telnet_negotiation_count", buf);
 

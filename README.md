@@ -1648,6 +1648,72 @@ keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
 those bounded/adversarial cases).
 
+## What a real compiler found: missing link libraries and a widespread strncpy bug
+
+This project finally got run through a real compiler and linker, and
+it's worth documenting what that surfaced precisely — this is the
+kind of thing static reasoning alone, however careful, genuinely
+cannot substitute for.
+
+**Missing link libraries (blocking the build).** `-lm` (for
+`log2()`, used in `dpi_dga_detector.c`'s Shannon entropy scoring) and
+`-lcrypto` (OpenSSL, used in `dpi_quic_parser.c`'s RFC 9001 HKDF key
+derivation and AES-GCM decryption) were both missing from the
+documented build command. Fixed in `dpi_secure_bootstrap.c`'s own
+header comment — the correct command is now `gcc -O2 -Wall -Wextra -o
+dpi_bootstrap dpi_secure_bootstrap.c -lseccomp -lcap -lm -lcrypto`.
+
+**A widespread, genuinely security-relevant `strncpy` bug, found via
+one compiler warning and then swept project-wide.** The compiler
+flagged a handful of `-Wstringop-truncation` warnings; checking those
+specific spots revealed the real, general problem: this project's
+`strncpy(dest, src, sizeof(dest) - 1)` pattern — used to leave room
+for a null terminator — does NOT actually guarantee one. `strncpy()`
+only writes the first `sizeof(dest) - 1` bytes; if `src` is that long
+or longer, `dest[sizeof(dest) - 1]` (the byte this pattern assumes
+gets zeroed) is simply never touched at all. A systematic scan found
+**240 call sites** using this unsafe pattern across 10 files —
+overwhelmingly in `dpi_dpdk_worker.c` (188 of them) and
+`dpi_secure_bootstrap.c` (26), the two files responsible for
+serializing every dissector's output into a flow record.
+
+Checking severity precisely rather than assuming: most of the
+affected destination buffers happened to be safe anyway, because they
+lived inside a `struct flow_log_record rec = {0};` that zero-
+initializes the whole struct before any `strncpy()` touches it — the
+buffer's last byte was already `'\0'` regardless. But not all of
+them: `effective_category` in `dpi_secure_bootstrap.c` was declared
+with **no initializer at all** (`char effective_category[MAX_PROTOCOL_NAME];`),
+meaning a source string at or past the buffer's capacity would leave
+whatever uninitialized stack garbage was already sitting there
+un-terminated — a real information-disclosure risk the next time that
+buffer was read with `%s`, not just a truncation inconvenience.
+
+Fixed with a single macro, `DPI_SAFE_STRNCPY(dest, src, dest_size)`
+(always explicitly null-terminates `dest[dest_size - 1]`), defined
+identically near the top of both `dpi_secure_bootstrap.c` and
+`dpi_dpdk_worker.c` — as a macro rather than a function specifically
+because `dpi_protocol_config.c` (which has this exact same pattern)
+gets `#include`d before any function defined later in the chain would
+be visible to it, and a macro has no such ordering constraint. All 240
+call sites converted mechanically, then verified: every single
+resulting `DPI_SAFE_STRNCPY(...)` call checked to have exactly 3
+well-formed, non-empty arguments, and the whole project re-confirmed
+balance-clean afterward.
+
+**A smaller, related class: undersized integer-to-string buffers.**
+The compiler also flagged `dpi_telnet_parser.c`'s `char buf[8]` as
+potentially too small for `snprintf(buf, sizeof(buf), "%d",
+n_negotiations)` — an `int`'s worst case needs 11 bytes. Checked and
+fixed that one, then proactively scanned for the same pattern
+elsewhere rather than waiting for the compiler to reach those files
+too: found 10 more genuine instances (HSRP, Kerberos, LDP, MQTT,
+S7comm ×2, STUN, Syslog ×2, 802.11) and enlarged each to 16 bytes.
+One candidate the scan also flagged (`dpi_mqtt_parser.c`'s
+`qosbuf[4]`) was checked and left alone — `qos` is `uint8_t` masked to
+0-3, provably fits in 4 bytes even at the type's full range, so
+enlarging it would have been unnecessary rather than defensive.
+
 ## A false positive found via genuinely unrelated real traffic
 
 Worth its own section, since every other "real bug found" story in
