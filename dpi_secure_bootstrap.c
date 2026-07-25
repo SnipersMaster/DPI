@@ -180,6 +180,7 @@
 #include "dpi_sctp_parser.c"
 #include "dpi_m3ua_parser.c"
 #include "dpi_amqp_parser.c"
+#include "dpi_stp_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -1072,6 +1073,22 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
  */
 static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *payload,
                                    ssize_t payload_len) {
+    /* IEEE 802.3's own length/EtherType ambiguity rule: values below
+     * 0x0600 (1536) are a LENGTH field (802.3 LLC framing), values at
+     * or above are a real EtherType (Ethernet II framing) — not
+     * guessed at, this is how the wire format itself distinguishes
+     * the two. Checked first, before any real EtherType comparison
+     * below, since none of those are ever < 0x0600 anyway. See
+     * dpi_stp_parser.c's own header comment for the full verification
+     * story — this is currently the only LLC-framed protocol this
+     * project recognizes, but the check is general (any DSAP/SSAP
+     * pair could be added here later without restructuring this
+     * function again). */
+    if (ethertype < 0x0600 && payload_len >= 0) {
+        stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
+        return;
+    }
+
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86DD
 #endif

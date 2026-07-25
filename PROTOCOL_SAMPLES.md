@@ -15,9 +15,11 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 74 samples, covering all 56 `protocols.ini` entries plus
+complete one. 75 samples, covering all 56 `protocols.ini` entries plus
 the baseline flow record, 802.11 (standalone, not `protocols.ini`-
-gated), and RARP (folded into ARP, same dissector).
+gated), RARP (folded into ARP, same dissector), LLMNR (folded into
+DNS, same dissector), and STP/RSTP (standalone, detected via 802.3 LLC
+framing rather than `protocols.ini`-gated port/content matching).
 
 ---
 
@@ -253,6 +255,19 @@ queue):
 ```json
 {"protocol":"AMQP","amqp_frame_type":"METHOD","amqp_channel":"1",
  "amqp_method":"Queue.Declare","amqp_queue":"(server-generated)"}
+```
+
+**STP/RSTP** (a real RSTP BPDU — verified against 7 real, identical
+frames from a genuine capture, every field decoding to a textbook-
+standard, converged-topology configuration; detected via 802.3 LLC
+framing, not a real EtherType, inside `dispatch_by_ethertype()`):
+```json
+{"protocol":"STP","stp_version":"2","stp_bpdu_type":"RST (Rapid/Multiple Spanning Tree)",
+ "stp_flags":"0x6c","stp_root_priority":"32768","stp_root_mac":"00:08:83:f2:e2:00",
+ "stp_root_path_cost":"40000","stp_bridge_priority":"32768",
+ "stp_bridge_mac":"00:1d:b3:28:d7:00","stp_port_id":"0x801b",
+ "stp_message_age_sec":"2.00","stp_max_age_sec":"20.00",
+ "stp_hello_time_sec":"2.00","stp_forward_delay_sec":"15.00"}
 ```
 
 **RADIUS**:
