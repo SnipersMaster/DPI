@@ -133,7 +133,12 @@ static void flow_record_set_current_timestamp(double ts) {
 static void format_iso8601_micros(double epoch_seconds, char *out, size_t out_cap) {
     time_t whole_secs = (time_t)epoch_seconds;
     double frac = epoch_seconds - (double)whole_secs;
-    long micros = (long)(frac * 1000000.0 + 0.5);
+    /* int, not long — always clamped to [0, 999999] by the check
+     * below, but `long`'s full 64-bit range was enough to trigger a
+     * real compiler warning here (same class as the telnet/HSRP/
+     * Kerberos/etc. cases fixed earlier this project), since GCC
+     * can't see through the clamp to the actual bounded range. */
+    int micros = (int)(frac * 1000000.0 + 0.5);
     if (micros >= 1000000) { micros -= 1000000; whole_secs += 1; }
 
     struct tm tm_utc;
@@ -141,7 +146,7 @@ static void format_iso8601_micros(double epoch_seconds, char *out, size_t out_ca
 
     char base[32];
     strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &tm_utc);
-    snprintf(out, out_cap, "%s.%06ldZ", base, micros);
+    snprintf(out, out_cap, "%s.%06dZ", base, micros);
 }
 
 static bool addr_equal(const uint8_t *a, const uint8_t *b, uint8_t ip_version) {
@@ -374,7 +379,7 @@ static void ip_to_string(const uint8_t *addr, uint8_t ip_version, char *out, siz
 void flow_record_emit_one(const struct flow_record *f) {
     if (!f->in_use) return;
 
-    char ts_start_str[40], ts_last_str[40];
+    char ts_start_str[48], ts_last_str[48];
     format_iso8601_micros(f->ts_start, ts_start_str, sizeof(ts_start_str));
     format_iso8601_micros(f->ts_last, ts_last_str, sizeof(ts_last_str));
 
