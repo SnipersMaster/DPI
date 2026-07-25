@@ -53,16 +53,19 @@
  * see that file's copy for the full explanation (a real bug found via
  * a real compiler warning: `strncpy(dest, src, N-1)` doesn't null-
  * terminate `dest` if `src` is >= N-1 bytes, and not every affected
- * buffer in this project happened to be zero-initialized first).
+ * buffer in this project happened to be zero-initialized first — and
+ * a second real compiler run afterward, showing that even the
+ * corrected strncpy+explicit-null version still triggered
+ * `-Wstringop-truncation` at nearly every call site, since GCC's
+ * heuristic there is about strncpy's own behavior specifically, not
+ * whether the caller null-terminates afterward — hence the switch to
+ * `snprintf(dest, dest_size, "%s", src)`, the standard idiomatic
+ * replacement, functionally identical but not flagged the same way).
  * Defined separately here since these two files are independent
  * translation units, never included into each other.
  */
 #define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
-    size_t _dss = (dest_size); \
-    if (_dss > 0) { \
-        strncpy((dest), (src), _dss - 1); \
-        (dest)[_dss - 1] = '\0'; \
-    } \
+    snprintf((dest), (dest_size), "%s", (src)); \
 } while (0)
 
 #include <rte_eal.h>

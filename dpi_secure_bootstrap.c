@@ -62,6 +62,22 @@
  * disclosure risk the next time that buffer got read with `%s`, not
  * just a cosmetic truncation concern.
  *
+ * IMPLEMENTED VIA snprintf(dest, dest_size, "%s", src), not
+ * strncpy+explicit-null — an earlier version used the latter (still
+ * fully correct, still always null-terminates), but a real compiler
+ * run showed it still triggers `-Wstringop-truncation` at nearly
+ * every one of the ~240 call sites, since GCC's heuristic for that
+ * warning is specifically about strncpy's own truncation behavior,
+ * not whether the caller null-terminates afterward. `snprintf` with a
+ * bounded width and "%s" is the standard, idiomatic C replacement for
+ * exactly this situation — identical actual behavior (bounded copy,
+ * unconditional null-termination, silent truncation if `src` is too
+ * long, which is genuinely fine here — every call site's real intent
+ * has always been "cap this field's length," never "the full value
+ * must be preserved or the program is wrong") — but GCC treats
+ * `snprintf`'s truncation as the caller's deliberate, accepted
+ * choice, not a footgun to flag.
+ *
  * Defined as a macro, not a function, specifically so it's available
  * to every `#include`d file regardless of order — `dpi_protocol_
  * config.c` (which has this exact same pattern) gets included from
@@ -72,11 +88,7 @@
  * are separate translation units, never included into each other.
  */
 #define DPI_SAFE_STRNCPY(dest, src, dest_size) do { \
-    size_t _dss = (dest_size); \
-    if (_dss > 0) { \
-        strncpy((dest), (src), _dss - 1); \
-        (dest)[_dss - 1] = '\0'; \
-    } \
+    snprintf((dest), (dest_size), "%s", (src)); \
 } while (0)
 
 #include <unistd.h>
