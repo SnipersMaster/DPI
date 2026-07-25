@@ -1120,24 +1120,6 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
 static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *payload,
                                    ssize_t payload_len) {
     /* IEEE 802.3's own length/EtherType ambiguity rule: values below
-     * 0x0600 (1536) are a LENGTH field (802.3 LLC framing), values at
-     * or above are a real EtherType (Ethernet II framing) — not
-     * guessed at, this is how the wire format itself distinguishes
-     * the two. Checked first, before any real EtherType comparison
-     * below, since none of those are ever < 0x0600 anyway.
-     *
-     * Two distinct LLC-framed protocols are recognized here, told
-     * apart by their own DSAP/SSAP bytes — STP (DSAP=SSAP=0x42, see
-     * dpi_stp_parser.c) and AppleTalk (DSAP=SSAP=0xAA, SNAP
-     * encapsulation, see dpi_appletalk_parser.c, which does its own
-     * further OUI+embedded-EtherType check to confirm it's actually
-     * AppleTalk and not some other SNAP-encapsulated protocol this
-     * project doesn't recognize). Earlier versions of this function
-     * routed every length-field frame to the STP check alone, which
-     * would have silently meant AppleTalk's own dissector was never
-     * actually reachable — caught and fixed before AppleTalk support
-     * was ever real-traffic-verified, not after. */
-    /* IEEE 802.3's own length/EtherType ambiguity rule: values below
      * 0x0600 (1536) are a LENGTH field (802.3 framing), values at or
      * above are a real EtherType (Ethernet II framing) — not guessed
      * at, this is how the wire format itself distinguishes the two.
@@ -1161,7 +1143,17 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
      * IEEE 802.3br's mPacket SMD values; extending this to a real
      * raw-802.3/IPX dissector once real sample bytes are available is
      * a well-scoped, bounded piece of future work, not a guess made
-     * now to fill the gap. */
+     * now to fill the gap.
+     *
+     * Two distinct LLC-framed protocols are recognized here, told
+     * apart by their own DSAP/SSAP bytes — STP and AppleTalk/CDP
+     * (both SNAP, DSAP=SSAP=0xAA, further told apart from each other
+     * by their own OUI+embedded-type check inside the SNAP header).
+     * Earlier versions of this function routed every length-field
+     * frame to the STP check alone, which would have silently meant
+     * AppleTalk's own dissector was never actually reachable — caught
+     * and fixed before AppleTalk support was ever real-traffic-
+     * verified, not after. */
     if (ethertype < 0x0600 && payload_len >= 0) {
         if (payload_len >= 2 && payload[0] == 0x42 && payload[1] == 0x42) {
             stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
