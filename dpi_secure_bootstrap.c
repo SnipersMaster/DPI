@@ -180,7 +180,10 @@
 #include "dpi_sctp_parser.c"
 #include "dpi_m3ua_parser.c"
 #include "dpi_amqp_parser.c"
+#include "dpi_m2ua_parser.c"
+#include "dpi_pim_parser.c"
 #include "dpi_stp_parser.c"
+#include "dpi_appletalk_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -327,6 +330,7 @@ static void dissect_eigrp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ah_datagram(const struct ipv4_result *ip_result);
 static void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result);
 static void dissect_sctp_datagram(const struct ipv4_result *ip_result);
+static void dissect_pim_datagram(const struct ipv4_result *ip_result);
 
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result) {
     if (ip_result->payload_len == 0) return;
@@ -590,6 +594,38 @@ static void dissect_sctp_datagram(const struct ipv4_result *ip_result) {
            sport ? sport : "", dport ? dport : "",
            verif_tag ? verif_tag : "", chunk0_type ? chunk0_type : "",
            chunk0_ppid ? chunk0_ppid : "", chunk0_inner ? chunk0_inner : "");
+}
+
+static void dissect_pim_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "PIM", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr>>24)&0xFF, (ip_result->src_addr>>16)&0xFF,
+             (ip_result->src_addr>>8)&0xFF, ip_result->src_addr&0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr>>24)&0xFF, (ip_result->dst_addr>>16)&0xFF,
+             (ip_result->dst_addr>>8)&0xFF, ip_result->dst_addr&0xFF);
+
+    const char *version = dissect_result_get(&dissect_out, "pim_version");
+    const char *type = dissect_result_get(&dissect_out, "pim_type");
+    const char *holdtime = dissect_result_get(&dissect_out, "pim_hello_holdtime_sec");
+    const char *prop_delay = dissect_result_get(&dissect_out, "pim_hello_propagation_delay_ms");
+    const char *override_interval = dissect_result_get(&dissect_out, "pim_hello_override_interval_ms");
+
+    printf("{\"protocol\":\"PIM\",\"src_ip\":\"%s\",\"dst_ip\":\"%s\","
+           "\"pim_version\":\"%s\",\"pim_type\":\"%s\","
+           "\"pim_hello_holdtime_sec\":\"%s\",\"pim_hello_propagation_delay_ms\":\"%s\","
+           "\"pim_hello_override_interval_ms\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           version ? version : "", type ? type : "",
+           holdtime ? holdtime : "", prop_delay ? prop_delay : "",
+           override_interval ? override_interval : "");
 }
 
 static void dissect_udp_datagram(const struct ipv4_result *ip_result) {
@@ -1078,14 +1114,25 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
      * or above are a real EtherType (Ethernet II framing) — not
      * guessed at, this is how the wire format itself distinguishes
      * the two. Checked first, before any real EtherType comparison
-     * below, since none of those are ever < 0x0600 anyway. See
-     * dpi_stp_parser.c's own header comment for the full verification
-     * story — this is currently the only LLC-framed protocol this
-     * project recognizes, but the check is general (any DSAP/SSAP
-     * pair could be added here later without restructuring this
-     * function again). */
+     * below, since none of those are ever < 0x0600 anyway.
+     *
+     * Two distinct LLC-framed protocols are recognized here, told
+     * apart by their own DSAP/SSAP bytes — STP (DSAP=SSAP=0x42, see
+     * dpi_stp_parser.c) and AppleTalk (DSAP=SSAP=0xAA, SNAP
+     * encapsulation, see dpi_appletalk_parser.c, which does its own
+     * further OUI+embedded-EtherType check to confirm it's actually
+     * AppleTalk and not some other SNAP-encapsulated protocol this
+     * project doesn't recognize). Earlier versions of this function
+     * routed every length-field frame to the STP check alone, which
+     * would have silently meant AppleTalk's own dissector was never
+     * actually reachable — caught and fixed before AppleTalk support
+     * was ever real-traffic-verified, not after. */
     if (ethertype < 0x0600 && payload_len >= 0) {
-        stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
+        if (payload_len >= 2 && payload[0] == 0x42 && payload[1] == 0x42) {
+            stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
+        } else if (payload_len >= 2 && payload[0] == 0xAA && payload[1] == 0xAA) {
+            appletalk_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        }
         return;
     }
 
@@ -1239,13 +1286,18 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
         return;
     }
 
+    if (ip_result.protocol == 103 /* PIM */) {
+        dissect_pim_datagram(&ip_result);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result);
         return;
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, nor SCTP: not handled */
+        return;   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, SCTP, nor PIM: not handled */
     }
 
     struct tcp_result tcp_result;

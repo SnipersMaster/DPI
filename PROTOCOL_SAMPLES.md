@@ -15,11 +15,13 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 75 samples, covering all 56 `protocols.ini` entries plus
-the baseline flow record, 802.11 (standalone, not `protocols.ini`-
-gated), RARP (folded into ARP, same dissector), LLMNR (folded into
-DNS, same dissector), and STP/RSTP (standalone, detected via 802.3 LLC
-framing rather than `protocols.ini`-gated port/content matching).
+complete one. 78 samples, covering all 58 `protocols.ini` entries
+(including M2UA and PIM, both added in this pass) plus the baseline
+flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
+(folded into ARP, same dissector), LLMNR (folded into DNS, same
+dissector), and STP/RSTP and AppleTalk (both standalone, detected via
+802.3 LLC framing rather than `protocols.ini`-gated port/content
+matching).
 
 ---
 
@@ -268,6 +270,33 @@ framing, not a real EtherType, inside `dispatch_by_ethertype()`):
  "stp_bridge_mac":"00:1d:b3:28:d7:00","stp_port_id":"0x801b",
  "stp_message_age_sec":"2.00","stp_max_age_sec":"20.00",
  "stp_hello_time_sec":"2.00","stp_forward_delay_sec":"15.00"}
+```
+
+**M2UA** (reached via SCTP's PPID-keyed recursion, PPID 2 — the one
+real MAUP/Data message available, MTP2 User Peer-to-Peer Message Data
+extracted as raw hex, not decoded further, the same scope boundary
+M3UA draws around its own Protocol Data parameter):
+```json
+{"protocol":"M2UA","m2ua_message":"MAUP/Data","m2ua_interface_id":"0",
+ "m2ua_mtp2_data_hex":"83715e40940600003100011200103725002b002700012a06193233000040"}
+```
+
+**PIM** (a real Hello message — verified against the one real message
+available, Holdtime and LAN Prune Delay options both decoding cleanly):
+```json
+{"protocol":"PIM","pim_version":"2","pim_type":"Hello",
+ "pim_hello_holdtime_sec":"105","pim_hello_lan_prune_delay_tbit":"false",
+ "pim_hello_propagation_delay_ms":"0","pim_hello_override_interval_ms":"6641"}
+```
+
+**AppleTalk** (a real RTMP broadcast — verified against 2 real,
+identical frames, internally coherent: hop count 0, destination node
+255/broadcast, both socket numbers matching RTMP's well-known socket):
+```json
+{"protocol":"AppleTalk","ddp_hop_count":"0","ddp_length":"77",
+ "ddp_checksum":"0x3764","ddp_dst_network":"0","ddp_src_network":"4415",
+ "ddp_dst_node":"255","ddp_src_node":"175","ddp_dst_socket":"1",
+ "ddp_src_socket":"1","ddp_type":"RTMP Response/Data"}
 ```
 
 **RADIUS**:

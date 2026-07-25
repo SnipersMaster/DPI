@@ -290,6 +290,8 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "sctp", "SCTP" },
     { "m3ua", "M3UA" },
     { "amqp", "AMQP" },
+    { "m2ua", "M2UA" },
+    { "pim", "PIM" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -449,6 +451,8 @@ static void register_all_dissectors(void) {
     extern void register_sctp_dissector(void);
     extern void register_m3ua_dissector(void);
     extern void register_amqp_dissector(void);
+    extern void register_m2ua_dissector(void);
+    extern void register_pim_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -514,6 +518,8 @@ static void register_all_dissectors(void) {
     register_sctp_dissector();
     register_m3ua_dissector();
     register_amqp_dissector();
+    register_m2ua_dissector();
+    register_pim_dissector();
 
     apply_protocol_config_to_registry();
 
