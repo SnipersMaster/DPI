@@ -695,12 +695,37 @@ balance-check clean:
 **Link type is auto-detected per file** (classic pcap) **or per
 interface** (pcapng, since — as just confirmed against a real file —
 different interfaces in one pcapng file can genuinely have different
-link types) — Ethernet, raw 802.11, or Radiotap+802.11 are the three
-this project's capture paths handle; the `--link-type` flags remain
-available as a manual override for the rare case where a file's
-declared link type doesn't match what it actually needs. An
-unsupported link type is reported and that packet skipped, rather
-than silently misinterpreted as Ethernet.
+link types) — Ethernet, raw 802.11, Radiotap+802.11, `LINKTYPE_RAW`
+(IP with no link-layer framing at all), and Linux SLL ("cooked
+capture") are the five this project's capture paths handle; the
+`--link-type` flags remain available as a manual override for the
+rare case where a file's declared link type doesn't match what it
+actually needs. An unsupported link type is reported and that packet
+skipped, rather than silently misinterpreted as Ethernet.
+
+`LINKTYPE_RAW` and Linux SLL were added after a real, publicly
+available reference capture ("The Ultimate PCAP") surfaced them
+directly — checking it found it also declares a fourth, genuinely
+niche link type this project has deliberately not added support for
+(`LINKTYPE_ETHERNET_MPACKET`, an IEEE 802.3br "interspersed express
+traffic" monitoring format specific to certain industrial/automotive
+Ethernet contexts) — named honestly as a real gap rather than silently
+handled, since this project doesn't have confident, verified knowledge
+of its wire format the way it does for the other four.
+
+Both additions reuse the exact same ethertype-based dispatch cascade
+Ethernet already used (refactored out into its own function,
+`dispatch_by_ethertype()`, specifically so this reuse wouldn't require
+duplicating that entire cascade) — `LINKTYPE_RAW` synthesizes an
+ethertype from the IP version nibble (the only field common to both
+IPv4 and IPv6 at a fixed position before either header format
+diverges), and Linux SLL reads its own trailing 2-byte protocol field
+the same way a real EtherType would be read. Verified against real
+packets from the same real capture that surfaced the need for both:
+a real IPv6 packet correctly identified via `LINKTYPE_RAW`, and a real
+IPv4/UDP packet correctly recovered from behind a Linux SLL header
+(the post-header bytes independently confirmed to be a byte-for-byte
+valid IPv4 header — version 4, a computed IHL that matched exactly).
 
 **Verified against real files before shipping this**, the same
 discipline as every dissector in this project: the exact endianness-

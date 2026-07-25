@@ -314,6 +314,7 @@ static int install_seccomp_filter(void) {
  * --------------------------------------------------------------------- */
 static void dissect_udp_datagram(const struct ipv4_result *ip_result);
 static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len);
+static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *payload, ssize_t payload_len);
 static void dissect_icmp_datagram(const struct ipv4_result *ip_result);
 static void dissect_gre_datagram(const struct ipv4_result *ip_result);
 static void dissect_ospf_datagram(const struct ipv4_result *ip_result);
@@ -1045,6 +1046,31 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         (void)vlan.vlan_id_inner;
     }
 
+    dispatch_by_ethertype(ethertype, payload, payload_len);
+}
+
+/*
+ * Everything that used to be the back half of parse_ethernet_frame()
+ * (every ethertype-based dispatch branch: IPv6, ARP/RARP, MPLS, LLDP,
+ * WoL, and the whole IPv4 IP-protocol-number cascade below) — pulled
+ * out into its own function specifically so it can be reused by link
+ * types OTHER than Ethernet that still ultimately carry an ethertype-
+ * equivalent value or a determinable IP version, without duplicating
+ * this entire, substantial dispatch cascade for each one. Added when
+ * two such link types turned up in a real, if deliberately
+ * comprehensive, capture (`--pcap-file=`'s own real-world testing):
+ * LINKTYPE_RAW (packet begins directly with an IP header, no link-
+ * layer framing at all — the "ethertype" is synthesized from the IP
+ * version nibble instead of read from a real field) and Linux SLL
+ * "cooked capture" (a 16-byte pseudo-header whose own trailing
+ * protocol field plays the exact same role a real EtherType does).
+ * Both call this same function with whatever ethertype value applies
+ * to their framing, exactly as if it had come from a real Ethernet
+ * header — this function has no way to tell the difference, by
+ * design.
+ */
+static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *payload,
+                                   ssize_t payload_len) {
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86DD
 #endif
@@ -1367,6 +1393,65 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     }
 }
 
+/*
+ * LINKTYPE_RAW (101) — the packet begins directly with an IP header,
+ * no link-layer framing of any kind, not even a synthetic one like
+ * Linux SLL's. Verified against real packets in a real capture
+ * (`--pcap-file=`'s own testing surfaced this as a real, if
+ * infrequent, link type — 37 real packets in one file) — both IPv4
+ * and IPv6 share the same trick for determining which one a given
+ * buffer holds: the very first 4 bits of the first byte are the IP
+ * version field in both RFC 791 (IPv4) and RFC 8200 (IPv6), at the
+ * identical bit position, before either header format diverges into
+ * anything else. No ethertype exists to read here at all, so one is
+ * synthesized (0x0800 or 0x86DD) purely to reuse the same, already-
+ * verified dispatch_by_ethertype() rather than duplicate its entire
+ * IP-protocol-number cascade for this one link type.
+ */
+static void parse_raw_ip_frame(const unsigned char *buf, ssize_t len) {
+    if (len < 1) return;   /* not even enough for the version nibble */
+
+    uint8_t version = (buf[0] >> 4) & 0x0F;
+    if (version == 4) {
+        dispatch_by_ethertype(0x0800, buf, len);
+    } else if (version == 6) {
+        dispatch_by_ethertype(0x86DD, buf, len);
+    }
+    /* Any other value: not a real IPv4/IPv6 header — drop, don't guess. */
+}
+
+/*
+ * Linux SLL ("cooked capture", linktype 113) — the pseudo-header
+ * Linux's packet-capture layer synthesizes when a real link-layer
+ * header doesn't cleanly apply (most commonly the "any" pseudo-
+ * interface, which can span multiple real interfaces of different
+ * types at once). Verified against real packets in the same real
+ * capture that surfaced LINKTYPE_RAW above (1,067 real packets — the
+ * larger and more common of the two newly-added link types). Also
+ * independently confirmed against a genuinely different real capture
+ * earlier in this project (`bssmap_bsc_invoke_trace.pcap`, a real
+ * SCTP/SIGTRAN trace) — this project's own SCTP dissector work relied
+ * on this exact same 16-byte layout being correct, just without a
+ * dedicated offline-file entry point for it until now.
+ *
+ * Fixed 16-byte header: packet type (2 bytes — unicast/broadcast/
+ * multicast/etc., not used here), ARPHRD_ type (2 bytes — the kind of
+ * underlying hardware, not used here), link-layer address length (2
+ * bytes), a fixed 8-byte address field (only the first
+ * address-length bytes are meaningful; the rest is padding — not
+ * used here, since nothing this project dissects needs a raw L2
+ * address from this specific pseudo-header), and finally a 2-byte
+ * protocol field playing the exact same role a real EtherType does —
+ * confirmed 0x0800 (IPv4) against the real SCTP capture's own real
+ * bytes. After these 16 bytes, the payload is the L3 packet directly.
+ */
+static void parse_linux_sll_frame(const unsigned char *buf, ssize_t len) {
+    if (len < 16) return;   /* too short for even the fixed SLL header */
+
+    uint16_t protocol = ((uint16_t)buf[14] << 8) | buf[15];
+    dispatch_by_ethertype(protocol, buf + 16, len - 16);
+}
+
 /* SIGUSR1 reloads protocols.ini without a restart — see
  * reload_protocol_config() in dpi_dissector_registry.c. Usage:
  * kill -USR1 <pid> after editing protocols.ini. Single-threaded here,
@@ -1411,6 +1496,8 @@ static void bootstrap_signal_handler(int signum) {
 #define LINKTYPE_ETHERNET          1
 #define LINKTYPE_IEEE802_11        105
 #define LINKTYPE_IEEE802_11_RADIOTAP 127
+#define LINKTYPE_RAW               101
+#define LINKTYPE_LINUX_SLL         113
 
 static uint32_t pcap_read_u32(const uint8_t *p, bool swap) {
     uint32_t v;
@@ -1476,7 +1563,8 @@ static bool dispatch_packet_by_linktype(uint32_t link_type, const unsigned char 
     bool use_80211 = force_80211 || link_type == LINKTYPE_IEEE802_11;
     bool use_radiotap = force_radiotap || link_type == LINKTYPE_IEEE802_11_RADIOTAP;
 
-    if (!use_80211 && !use_radiotap && link_type != LINKTYPE_ETHERNET) {
+    if (!use_80211 && !use_radiotap && link_type != LINKTYPE_ETHERNET &&
+        link_type != LINKTYPE_RAW && link_type != LINKTYPE_LINUX_SLL) {
         return false;   /* unrecognized link type — caller decides how to report this */
     }
 
@@ -1489,6 +1577,10 @@ static bool dispatch_packet_by_linktype(uint32_t link_type, const unsigned char 
         }
     } else if (use_80211) {
         parse_80211_frame(buf, (ssize_t)len);
+    } else if (link_type == LINKTYPE_RAW) {
+        parse_raw_ip_frame(buf, (ssize_t)len);
+    } else if (link_type == LINKTYPE_LINUX_SLL) {
+        parse_linux_sll_frame(buf, (ssize_t)len);
     } else {
         parse_ethernet_frame(buf, (ssize_t)len);
     }
