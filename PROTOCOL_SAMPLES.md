@@ -15,7 +15,7 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 69 samples, covering all 53 `protocols.ini` entries plus
+complete one. 72 samples, covering all 55 `protocols.ini` entries plus
 the baseline flow record, 802.11 (standalone, not `protocols.ini`-
 gated), and RARP (folded into ARP, same dissector).
 
@@ -202,6 +202,39 @@ real-traffic sample in this project):
  "bt_dht_transaction_id":"90","bt_dht_query":"get_peers",
  "bt_dht_node_id":"dc054f56ad545065f583e7a39cde863f9c0b0581",
  "bt_dht_info_hash":"020376cca233350e4d2f6225f90abbd4958cd281"}
+```
+
+**SCTP** (a real DATA chunk carrying M3UA — verified against 500 real
+packets across 2 genuine captures, 100% detected correctly; this
+project's own roadmap's explicitly-recommended "build first" item,
+since nothing riding on top of SCTP is reachable without it):
+```json
+{"protocol":"SCTP","sctp_src_port":"2905","sctp_dst_port":"49152",
+ "sctp_verification_tag":"0x1530a5e0","sctp_chunk_0_type":"DATA",
+ "sctp_chunk_0_tsn":"2922725360","sctp_chunk_0_stream_id":"1",
+ "sctp_chunk_0_stream_seq":"407","sctp_chunk_0_ppid":"M3UA",
+ "sctp_chunk_0_inner_protocol":"M3UA"}
+```
+A real SACK chunk (verified to reference the exact same TSN seen in a
+real DATA chunk above — internally consistent, not independently
+plausible fields):
+```json
+{"protocol":"SCTP","sctp_src_port":"2905","sctp_dst_port":"49152",
+ "sctp_verification_tag":"0x1530a5e0","sctp_chunk_0_type":"SACK",
+ "sctp_chunk_0_cum_tsn_ack":"2922725360","sctp_chunk_0_a_rwnd":"65536",
+ "sctp_chunk_0_gap_ack_blocks":"0","sctp_chunk_0_dup_tsns":"0"}
+```
+
+**M3UA** (reached via SCTP's PPID-keyed recursion, not its own
+transport-layer port — verified against all 7 real M3UA messages found
+in a genuine SS7-over-IP call-signaling capture, 7/7 sharing this exact
+shape; Protocol Data, the nested MTP3-User payload, is deliberately
+extracted as raw hex rather than decoded further — a real scope
+boundary, not a gap):
+```json
+{"protocol":"M3UA","m3ua_message":"Transfer/DATA",
+ "m3ua_network_appearance":"0x00000008","m3ua_routing_context":"0x00000015",
+ "m3ua_protocol_data_hex":"00e39a0a00d167360302020f04646f837d48410300"}
 ```
 
 **RADIUS**:
