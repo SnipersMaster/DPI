@@ -137,6 +137,7 @@
 #include "dpi_tcp_flow_reassembly.c"
 #include "dpi_app_classifier.c"
 #include "dpi_dissector_registry.c"
+#include "dpi_flow_record.c"
 #include "dpi_radius_parser.c"
 #include "dpi_gtp_parser.c"
 #include "dpi_dns_parser.c"
@@ -923,22 +924,34 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                     if (identity) DPI_SAFE_STRNCPY(effective_app_name, identity, sizeof(effective_app_name));
                     DPI_SAFE_STRNCPY(effective_confidence, "high", sizeof(effective_confidence));
                 }
+
+                struct flow_record *fr = flow_record_find_or_create(
+                    6, ip6_result.src_addr, tcp_result.src_port,
+                    ip6_result.dst_addr, tcp_result.dst_port, 6);
+                if (fr) {
+                    flow_record_touch(fr, contiguous_len);
+                    flow_record_set_l7(fr, effective_category, effective_confidence,
+                                        tcp_matched ? &tcp_out : NULL);
+                    flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
+                        stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+                    flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
+                        classification.vpn_protocol, classification.dot_score, classification.doh_score);
+                }
+                return;
             }
         }
 
-        printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
-               "\"sni\":\"%s\",\"category\":\"%s\","
-               "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
-               "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
-               "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
-               "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
-               src_str, dst_str, tcp_result.src_port, tcp_result.dst_port,
-               classification.sni, effective_category, effective_app_name,
-               effective_confidence, classification.dga_score,
-               classification.vpn_score, classification.vpn_protocol,
-               classification.dot_score, classification.doh_score,
-               stats.out_of_order_segments, stats.retransmit_count,
-               stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
+        struct flow_record *fr = flow_record_find_or_create(
+            6, ip6_result.src_addr, tcp_result.src_port,
+            ip6_result.dst_addr, tcp_result.dst_port, 6);
+        if (fr) {
+            flow_record_touch(fr, contiguous_len);
+            flow_record_set_l7(fr, effective_category, effective_confidence, NULL);
+            flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
+                stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+            flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
+                classification.vpn_protocol, classification.dot_score, classification.doh_score);
+        }
         return;
     }
     /* Other next_header values: not handled. */
@@ -1243,6 +1256,10 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
     DPI_SAFE_STRNCPY(effective_app_name, classification.app_name, sizeof(effective_app_name));
     DPI_SAFE_STRNCPY(effective_confidence, classification.confidence, sizeof(effective_confidence));
 
+    bool tcp_matched = false;
+    struct dissect_result tcp_out;
+    memset(&tcp_out, 0, sizeof(tcp_out));
+
     if (strcmp(classification.category, "unknown") == 0) {
         double http2_confidence = http2_detect(contiguous_data, (uint16_t)contiguous_len,
                                                 tcp_result.dst_port, "TCP");
@@ -1260,10 +1277,29 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
             } else {
                 DPI_SAFE_STRNCPY(effective_confidence, "low", sizeof(effective_confidence));
             }
+            /* h2_out itself goes out of scope at the end of this
+             * block — its fields were already copied into
+             * effective_category/effective_app_name above, which is
+             * all the flow record needs for the HTTP/2 case; the
+             * full nested-field object (matching HTTP/1.1's) would
+             * need h2_out plumbed out to function scope the same way
+             * tcp_out just was, not done here to keep this specific
+             * fix focused on the bug just found (tcp_out silently
+             * never reaching the flow record at all) rather than
+             * expanding scope further in the same edit. */
         } else {
-            struct dissect_result tcp_out;
-            bool tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
-                                                    tcp_result.dst_port, "TCP", &tcp_out);
+            /* tcp_matched/tcp_out declared at function scope, above —
+             * a REAL bug found while wiring this up: they were
+             * previously scoped to just this `else` block, meaning
+             * execution fell through to the flow-record code below
+             * with tcp_out already out of scope, silently passing
+             * NULL instead of the real dissection result — losing
+             * every HTTP/SSH/SMTP field this branch exists to
+             * extract, for exactly the traffic this branch matches
+             * most: real TCP-based protocols classify_flow() alone
+             * doesn't have SNI visibility into. */
+            tcp_matched = dispatch_dissection(contiguous_data, contiguous_len,
+                                               tcp_result.dst_port, "TCP", &tcp_out);
             if (tcp_matched) {
                 DPI_SAFE_STRNCPY(effective_category, tcp_out.protocol_name, sizeof(effective_category));
                 const char *identity = dissect_result_get(&tcp_out, "http_host");
@@ -1276,24 +1312,28 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         }
     }
 
-    /* Unlike dpi_dpdk_worker.c, printf here is fine — this is a
-     * single-threaded, non-100G reference path meant for lab testing,
-     * not a multi-core poll-mode hot loop. Still worth eventually
-     * replacing with structured logging for anything beyond ad hoc
-     * testing. */
-    printf("{\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u,"
-           "\"sni\":\"%s\",\"category\":\"%s\","
-           "\"app_name\":\"%s\",\"confidence\":\"%s\",\"dga_score\":%.2f,"
-           "\"vpn_score\":%.2f,\"vpn_protocol\":\"%s\",\"dot_score\":%.2f,"
-           "\"doh_score\":%.2f,\"reassembly\":{\"out_of_order\":%u,"
-           "\"retransmits\":%u,\"overlap_conflicts\":%u,\"evasion_flag\":%s}}\n",
-           src_ip_str, dst_ip_str, tcp_result.src_port, tcp_result.dst_port,
-           classification.sni, effective_category, effective_app_name,
-           effective_confidence, classification.dga_score,
-           classification.vpn_score, classification.vpn_protocol,
-           classification.dot_score, classification.doh_score,
-           stats.out_of_order_segments, stats.retransmit_count,
-           stats.overlap_conflict_count, stats.evasion_flag ? "true" : "false");
+    /* Convert the uint32_t address representation used throughout
+     * this IPv4 path into the 4-byte array dpi_flow_record.c expects
+     * (uniformly sized for both IPv4 and IPv6 callers). */
+    uint8_t src_addr_bytes[4] = {
+        (uint8_t)(ip_result.src_addr >> 24), (uint8_t)(ip_result.src_addr >> 16),
+        (uint8_t)(ip_result.src_addr >> 8),  (uint8_t)(ip_result.src_addr)
+    };
+    uint8_t dst_addr_bytes[4] = {
+        (uint8_t)(ip_result.dst_addr >> 24), (uint8_t)(ip_result.dst_addr >> 16),
+        (uint8_t)(ip_result.dst_addr >> 8),  (uint8_t)(ip_result.dst_addr)
+    };
+    struct flow_record *fr = flow_record_find_or_create(
+        4, src_addr_bytes, tcp_result.src_port, dst_addr_bytes, tcp_result.dst_port, 6);
+    if (fr) {
+        flow_record_touch(fr, contiguous_len);
+        flow_record_set_l7(fr, effective_category, effective_confidence,
+                            tcp_matched ? &tcp_out : NULL);
+        flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
+            stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+        flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
+            classification.vpn_protocol, classification.dot_score, classification.doh_score);
+    }
 }
 
 /* SIGUSR1 reloads protocols.ini without a restart — see
@@ -1463,7 +1503,10 @@ static int process_pcap_file(const char *path, bool link_type_80211_arg,
         fclose(f);
         return 1;
     }
-    (void)nanosec;   /* timestamps aren't used by any dissector here — kept for clarity only */
+    /* nanosec now genuinely used below, to correctly scale each
+     * record's sub-second timestamp field for flow_id ts_start/
+     * ts_last — previously discarded entirely before flow-record
+     * support existed. */
 
     uint32_t network = pcap_read_u32(global_hdr + 20, swap);
 
@@ -1502,6 +1545,11 @@ static int process_pcap_file(const char *path, bool link_type_80211_arg,
             break;
         }
 
+        uint32_t ts_sec = pcap_read_u32(rec_hdr, swap);
+        uint32_t ts_subsec = pcap_read_u32(rec_hdr + 4, swap);
+        double ts = (double)ts_sec + (double)ts_subsec / (nanosec ? 1e9 : 1e6);
+        flow_record_set_current_timestamp(ts);
+
         uint32_t incl_len = pcap_read_u32(rec_hdr + 8, swap);
         if (incl_len > sizeof(buf)) {
             fprintf(stderr, "%s: packet %u claims %u bytes, more than this engine's "
@@ -1532,6 +1580,11 @@ static int process_pcap_file(const char *path, bool link_type_80211_arg,
 
         packet_count++;
     }
+
+    /* Emit every flow accumulated during this file's read — see
+     * dpi_flow_record.c's own header comment on scope (TCP flows
+     * only, currently). */
+    flow_record_emit_all_and_reset();
 
     fprintf(stderr, "%s: %u packets read, %u skipped (oversized)\n",
             path, packet_count, skipped_count);
@@ -1684,7 +1737,23 @@ static int process_pcapng_file(const char *path, bool link_type_80211_arg,
                 break;
             }
             uint32_t iface_id = pcap_read_u32(epb_fixed, swap);
+            uint32_t ts_high = pcap_read_u32(epb_fixed + 4, swap);
+            uint32_t ts_low = pcap_read_u32(epb_fixed + 8, swap);
             uint32_t captured_len = pcap_read_u32(epb_fixed + 12, swap);
+            /* pcapng timestamps are a 64-bit value in units the
+             * interface declares via an if_tsresol option on its own
+             * Interface Description Block — this reader doesn't parse
+             * IDB options (only the fixed LinkType field), so this
+             * assumes the overwhelmingly common default (microsecond
+             * resolution, i.e. if_tsresol absent) rather than reading
+             * a per-interface resolution that isn't extracted here.
+             * Stated honestly as a real, if narrow, limitation — a
+             * capture using a non-default (e.g. nanosecond) interface
+             * resolution would show timestamps off by a fixed
+             * multiplicative factor, not garbage, but not correct
+             * either. */
+            uint64_t ts_raw = ((uint64_t)ts_high << 32) | ts_low;
+            flow_record_set_current_timestamp((double)ts_raw / 1e6);
             remaining_in_block -= (long)sizeof(epb_fixed);
 
             if (captured_len > sizeof(buf) || (long)captured_len > remaining_in_block) {
@@ -1738,6 +1807,8 @@ static int process_pcapng_file(const char *path, bool link_type_80211_arg,
             if (remaining_in_block > 0 && fseek(f, remaining_in_block, SEEK_CUR) != 0) break;
         }
     }
+
+    flow_record_emit_all_and_reset();
 
     fprintf(stderr, "%s: %u interface(s) declared, %u packets read, %u skipped (oversized), "
                     "%u skipped (unsupported link type)\n",

@@ -136,6 +136,8 @@ static void http1_dissect(const uint8_t *payload, uint16_t len,
                 dissect_result_add(out, "http_host", val);
             } else if (strcasecmp(hdr_line, "User-Agent") == 0) {
                 dissect_result_add(out, "http_user_agent", val);
+            } else if (strcasecmp(hdr_line, "Content-Type") == 0) {
+                dissect_result_add(out, "http_content_type", val);
             }
         }
 
