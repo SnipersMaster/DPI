@@ -47,6 +47,7 @@
 #include <arpa/inet.h>
 
 #define DNS_PORT            53
+#define LLMNR_PORT          5355
 #define DNS_HDR_LEN         12
 #define MAX_DNS_NAME_LEN    255   /* RFC 1035 §3.1 */
 #define MAX_POINTER_JUMPS   32    /* generous for any legitimate packet,
@@ -85,7 +86,19 @@ static double dns_detect(const uint8_t *payload, uint16_t len,
     if (opcode > 5) return 0.2;
 
     double confidence = 0.5;
-    if (dst_port == DNS_PORT) confidence = 0.85;
+    /* LLMNR (RFC 4795, UDP port 5355) shares this exact wire format —
+     * confirmed against a real query ("wpad", QTYPE=ANY, QCLASS=IN)
+     * found in a real capture, byte-for-byte identical to a DNS
+     * query's header and question-section layout. Folded into this
+     * dissector rather than given its own file, the same way RARP
+     * was folded into ARP — real traffic on this port gets the exact
+     * same confidence boost DNS_PORT already gets, and dns_dissect()
+     * below adds a distinguishing field so LLMNR traffic remains
+     * identifiable in the output despite reporting the same top-level
+     * "DNS" protocol name (matching RARP/ARP's own precedent: RARP
+     * still reports "protocol":"ARP", distinguished by its opcode
+     * field instead of a different top-level name). */
+    if (dst_port == DNS_PORT || dst_port == LLMNR_PORT) confidence = 0.85;
     (void)rcode;
     return confidence;
 }
@@ -262,7 +275,18 @@ static int dns_walk_rr_section(const uint8_t *payload, uint16_t len, size_t *pos
 static void dns_dissect(const uint8_t *payload, uint16_t len,
                          uint16_t dst_port, const char *l4_proto,
                          struct dissect_result *out) {
-    (void)dst_port; (void)l4_proto;
+    (void)l4_proto;
+
+    /* Distinguishes LLMNR from ordinary DNS in the output despite
+     * both sharing this one dissector and reporting the same top-
+     * level "DNS" protocol name — same precedent as RARP/ARP (RARP
+     * still reports "protocol":"ARP", distinguished by its opcode
+     * field rather than a different top-level name). Verified against
+     * a real LLMNR query (port 5355, name "wpad", QTYPE=ANY) found in
+     * a real capture — see dns_detect()'s comment for the full story. */
+    if (dst_port == LLMNR_PORT) {
+        dissect_result_add(out, "dns_is_llmnr", "true");
+    }
 
     uint16_t flags = (payload[2] << 8) | payload[3];
     bool is_response = (flags & 0x8000) != 0;
@@ -334,10 +358,10 @@ static void dns_dissect(const uint8_t *payload, uint16_t len,
 }
 
 
-static const uint16_t dns_hint_ports[] = { DNS_PORT };
+static const uint16_t dns_hint_ports[] = { DNS_PORT, LLMNR_PORT };
 
 void register_dns_dissector(void) {
-    register_dissector("DNS", dns_detect, dns_dissect, dns_hint_ports, 1);
+    register_dissector("DNS", dns_detect, dns_dissect, dns_hint_ports, 2);
 }
 
 #endif /* DPI_DNS_PARSER_INCLUDED */
