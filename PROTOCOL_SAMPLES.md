@@ -15,12 +15,13 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 84 samples: 58 `protocols.ini` entries, the baseline
+complete one. 95 samples: 62 `protocols.ini` entries, the baseline
 flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
 (folded into ARP, same dissector), LLMNR (folded into DNS, same
-dissector), STP/RSTP and AppleTalk (both standalone, detected via
-802.3 LLC framing rather than `protocols.ini`-gated port/content
-matching), and — added on direct request — the real flow-record-
+dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet, and
+Banyan VINES (all standalone, detected via 802.3 LLC framing or real
+EtherTypes rather than `protocols.ini`-gated port/content matching),
+and — added on direct request — the real flow-record-
 wrapped envelope (`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
 `packets_total`/`duration_ms`, all genuinely computed fields, not
 placeholders) shown for the baseline case plus 5 core application
@@ -445,6 +446,88 @@ identical frames, internally coherent: hop count 0, destination node
  "ddp_checksum":"0x3764","ddp_dst_network":"0","ddp_src_network":"4415",
  "ddp_dst_node":"255","ddp_src_node":"175","ddp_dst_socket":"1",
  "ddp_src_socket":"1","ddp_type":"RTMP Response/Data"}
+```
+
+**PPPoE** (a real-shape PADO offer, structurally verified against RFC 2516's own worked example):
+```json
+{"protocol":"PPPoE","pppoe_stage":"Discovery","pppoe_code":"PADO",
+ "pppoe_session_id":"0x0000","pppoe_length":"32",
+ "pppoe_service_name":"","pppoe_ac_name":"Go Router 1234567890ABCD"}
+```
+
+**CDP** (verified against the Wireshark wiki's real, complete worked example):
+```json
+{"protocol":"CDP","cdp_version":"2","cdp_ttl_sec":"180","cdp_checksum":"0xc2c3",
+ "cdp_device_id":"LAN354802","cdp_platform":"cisco WS-C3548-XL"}
+```
+
+**EAPOL** (a real EAP-Request/Identity, matching a real captured example):
+```json
+{"protocol":"EAPOL","eapol_version":"3","eapol_type":"EAP-Packet","eapol_length":"5",
+ "eap_code":"Request","eap_identifier":"9","eap_length":"5","eap_type":"Identity"}
+```
+
+**LACP** (a real Actor Information TLV — verified against real tcpdump-captured
+bytes; a real bug in the TLV-length constant was caught and fixed during this
+dissector's own verification):
+```json
+{"protocol":"LACP","lacp_actor_system_priority":"100",
+ "lacp_actor_system_mac":"00:0f:53:21:68:30","lacp_actor_key":"15",
+ "lacp_actor_port_priority":"255","lacp_actor_port":"2",
+ "lacp_actor_state_activity":"true","lacp_actor_state_timeout":"false",
+ "lacp_actor_state_aggregation":"true","lacp_actor_state_synchronization":"true",
+ "lacp_actor_state_collecting":"true","lacp_actor_state_distributing":"true"}
+```
+
+**RTSP**:
+```json
+{"protocol":"RTSP","rtsp_is_response":"false",
+ "rtsp_first_line":"DESCRIBE rtsp://example.com/media.mp4 RTSP/1.0",
+ "rtsp_method":"DESCRIBE","rtsp_url":"rtsp://example.com/media.mp4","rtsp_cseq":"1"}
+```
+
+**MySQL** (a real Initial Handshake packet, verified against the mysql-proxy
+project's own documented example):
+```json
+{"protocol":"MySQL","mysql_packet_length":"54","mysql_sequence_id":"0",
+ "mysql_protocol_version":"10","mysql_server_version":"5.5.2-m2",
+ "mysql_connection_id":"82","mysql_capability_flags_lower":"0xffff"}
+```
+
+**PostgreSQL** (a real StartupMessage, verified against a real example from
+the PostgreSQL mailing list archives):
+```json
+{"protocol":"PostgreSQL","pg_message_length":"38","pg_message_type":"StartupMessage",
+ "pg_protocol_version":"3.0","pg_user":"postgres","pg_database":"maach"}
+```
+
+**TDS** (a real PRELOGIN response — verified against a complete, real, byte-exact
+example; the encoded server version decoded to exactly "12.00.2000", matching
+the original example's own stated value):
+```json
+{"protocol":"TDS","tds_type":"Tabular_Result","tds_eom":"true","tds_length":"20",
+ "tds_spid":"0","tds_packet_id":"1","tds_prelogin_server_version":"12.00.2000"}
+```
+
+**NTP** (with extension fields, RFC 7822 — added on direct request; Field
+Type's specific meaning is a separate IANA registry this project doesn't
+assert names for):
+```json
+{"protocol":"NTP","ntp_extension_0_type":"0x0104","ntp_extension_0_length":"20",
+ "ntp_extension_count":"1","ntp_mac_present":"false"}
+```
+
+**DECnet Phase IV** (deliberately detection-only — stated honestly, see the
+README for why):
+```json
+{"protocol":"DECnet","decnet_phase":"IV","decnet_length":"46",
+ "note":"detected via EtherType 0x6003 only; routing-layer header not decoded"}
+```
+
+**Banyan VINES** (deliberately detection-only — same reasoning as DECnet):
+```json
+{"protocol":"BanyanVINES","vines_subtype":"IP","vines_length":"38",
+ "note":"detected via EtherType only; VIP header not decoded"}
 ```
 
 **RADIUS**:

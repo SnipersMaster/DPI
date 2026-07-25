@@ -182,9 +182,18 @@
 #include "dpi_amqp_parser.c"
 #include "dpi_m2ua_parser.c"
 #include "dpi_pim_parser.c"
+#include "dpi_rtsp_parser.c"
+#include "dpi_mysql_parser.c"
+#include "dpi_postgresql_parser.c"
+#include "dpi_tds_parser.c"
 #include "dpi_stp_parser.c"
 #include "dpi_appletalk_parser.c"
 #include "dpi_pppoe_parser.c"
+#include "dpi_cdp_parser.c"
+#include "dpi_eapol_parser.c"
+#include "dpi_lacp_parser.c"
+#include "dpi_decnet_parser.c"
+#include "dpi_vines_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -1157,7 +1166,14 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
         if (payload_len >= 2 && payload[0] == 0x42 && payload[1] == 0x42) {
             stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
         } else if (payload_len >= 2 && payload[0] == 0xAA && payload[1] == 0xAA) {
+            /* Both AppleTalk and CDP use SNAP (DSAP=SSAP=0xAA) — told
+             * apart by their own OUI+embedded-type fields inside the
+             * SNAP header itself, each function doing its own check
+             * and simply returning without effect if it doesn't
+             * match, the same "try, don't crash if it's not yours"
+             * pattern used elsewhere in this dispatch. */
             appletalk_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
+            cdp_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
         } else {
             /* Neither known LLC signature — could be raw/non-LLC 802.3
              * framing (e.g. Novell's original IPX framing) or an LLC
@@ -1183,6 +1199,27 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
     if (ethertype == 0x8863 || ethertype == 0x8864) {
         pppoe_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len,
                                          ethertype == 0x8863);
+        return;
+    }
+
+    if (ethertype == 0x888E) {
+        eapol_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x8809) {
+        lacp_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x6003) {
+        decnet_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
+        vines_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len,
+                                         ethertype);
         return;
     }
 

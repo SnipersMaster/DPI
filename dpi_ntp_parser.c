@@ -2,11 +2,23 @@
  * dpi_ntp_parser.c
  *
  * NTP (RFC 5905) dissector — fixed 48-byte header, no TLV/variable
- * parsing needed for the base fields. Extension fields and MAC (RFC
- * 5905 §7.5, used for NTP authentication) may follow the base header
- * but aren't parsed here — flagged as present, matching this
- * project's general pattern for scoping optional trailers out when
- * the base header already carries the valuable fields.
+ * parsing needed for the base fields. Extension fields (RFC 7822,
+ * updating RFC 5905 §7.5 — used for NTP authentication mechanisms
+ * like Autokey and NTS) may follow the base header, optionally
+ * followed by a MAC.
+ *
+ * NOT COMPILED/TESTED in this environment. Extension-field walking
+ * added on direct request — RFC 7822's Field Type(2) + Length(2,
+ * includes itself and any padding) + Value + Padding-to-4-byte-
+ * boundary framing was cross-checked identical across 6 independent
+ * mirrors of the RFC (the RFC Editor's own page included), a stable,
+ * unambiguous format, not a draft under revision. RFC 7822 itself is
+ * explicit that specific Field Type *values* are defined in a
+ * separate IANA registry, not enumerated in RFC 7822's own text — so
+ * this project reports the raw Field Type number rather than
+ * guessing at a name for it, the same discipline as not asserting
+ * confidence beyond what's actually verified elsewhere in this
+ * project.
  *
  * NOT COMPILED/TESTED in this environment.
  */
@@ -18,6 +30,7 @@
 
 #define NTP_PORT     123
 #define NTP_HDR_LEN  48
+#define NTP_MAX_EXTENSION_FIELDS 8
 
 static const char *ntp_mode_name(uint8_t mode) {
     switch (mode) {
@@ -80,7 +93,50 @@ static void ntp_dissect(const uint8_t *payload, uint16_t len,
     dissect_result_add(out, "ntp_reference_id_hex", refid_hex);
 
     if (len > NTP_HDR_LEN) {
-        dissect_result_add(out, "ntp_extension_or_mac_present", "true");
+        /* Extension fields (RFC 7822): Field Type(2) + Length(2,
+         * includes itself + any padding) + Value + Padding to a
+         * 4-byte boundary. Minimum valid field length is 16 octets
+         * per RFC 7822 (a raw MAC with no extension field can be
+         * shorter — a bare MAC has no Field Type/Length framing at
+         * all, so a small trailing remainder that doesn't parse as a
+         * well-formed extension field is reported as a MAC instead of
+         * misread as one). */
+        size_t pos = NTP_HDR_LEN;
+        int n_ext = 0;
+        while (pos + 4 <= len && n_ext < NTP_MAX_EXTENSION_FIELDS) {
+            uint16_t field_type = (payload[pos] << 8) | payload[pos + 1];
+            uint16_t field_len = (payload[pos + 2] << 8) | payload[pos + 3];
+            if (field_len < 16 || pos + field_len > len) break;   /* not a
+                                                                      well-formed
+                                                                      extension
+                                                                      field —
+                                                                      stop, don't
+                                                                      guess */
+
+            char key[40], val[16];
+            snprintf(key, sizeof(key), "ntp_extension_%d_type", n_ext);
+            snprintf(val, sizeof(val), "0x%04x", field_type);
+            dissect_result_add(out, key, val);
+            snprintf(key, sizeof(key), "ntp_extension_%d_length", n_ext);
+            snprintf(val, sizeof(val), "%u", field_len);
+            dissect_result_add(out, key, val);
+            /* Field Type's specific meaning is defined in a separate
+             * IANA registry per RFC 7822 itself, not this project's
+             * to guess at — see file header. Value/Padding contents
+             * not decoded. */
+
+            pos += field_len;
+            n_ext++;
+        }
+
+        if (n_ext > 0) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", n_ext);
+            dissect_result_add(out, "ntp_extension_count", buf);
+        }
+        if (pos < len) {
+            dissect_result_add(out, "ntp_mac_present", "true");
+        }
     }
 }
 
@@ -89,4 +145,3 @@ static const uint16_t ntp_hint_ports[] = { NTP_PORT };
 void register_ntp_dissector(void) {
     register_dissector("NTP", ntp_detect, ntp_dissect, ntp_hint_ports, 1);
 }
-
