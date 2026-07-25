@@ -15,39 +15,187 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 78 samples, covering all 58 `protocols.ini` entries
-(including M2UA and PIM, both added in this pass) plus the baseline
+complete one. 84 samples: 58 `protocols.ini` entries, the baseline
 flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
 (folded into ARP, same dissector), LLMNR (folded into DNS, same
-dissector), and STP/RSTP and AppleTalk (both standalone, detected via
+dissector), STP/RSTP and AppleTalk (both standalone, detected via
 802.3 LLC framing rather than `protocols.ini`-gated port/content
-matching).
+matching), and — added on direct request — the real flow-record-
+wrapped envelope (`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
+`packets_total`/`duration_ms`, all genuinely computed fields, not
+placeholders) shown for the baseline case plus 5 core application
+protocols (DNS, HTTP/1.1 — now including a bounded body preview,
+also added on request — HTTP/2, SSH, SMTP). Everything else in this
+file still shows the older, dissector-only view; see the "Core
+application protocols" section below for the one-paragraph
+explanation of how to mentally wrap any of them the same way.
 
 ---
 
-## Baseline flow record (every packet, before any protocol-specific dissection)
+## Baseline flow record (every TCP/UDP flow, before any deeper protocol-specific dissection)
 
-**IPv4 + TCP + TLS/SNI**:
+This is the actual envelope `dpi_flow_record.c` emits for every TCP
+and UDP flow — `flow_id`/`ts_start`/`ts_last`/`bytes_total`/
+`packets_total`/`duration_ms` are all real, computed fields (from
+real pcap/pcapng timestamps and per-packet byte accumulation), not
+placeholders. When no deeper protocol-specific dissector matched
+(TLS/SNI classification only, or nothing at all), there's no nested
+object — the samples below show exactly that "envelope only" case.
+Every sample further down this file that *does* have a deeper
+dissector match nests that dissector's own fields under a key named
+after its field-name prefix (e.g. `dns_qname` → nested under `"dns"`
+as `"qname"`) — the general shape every one of them follows is shown
+here once, not repeated in every single sample's own explanation.
+
+**IPv4 + TCP + TLS/SNI** (matched by SNI/domain classification only —
+no deeper TCP dissector recognized this specific traffic, so no
+nested object; this is the generic case most encrypted traffic falls
+into):
 ```json
-{"src_ip":"10.0.4.17","dst_ip":"157.240.22.35","src_port":51422,"dst_port":443,
- "sni":"instagram.com","category":"social_media","app_name":"Instagram",
- "confidence":"high","dga_score":0.06,"vpn_score":0.0,"vpn_protocol":"none",
- "dot_score":0.0,"doh_score":0.0,
- "reassembly":{"out_of_order":0,"retransmits":1,"overlap_conflicts":0,"evasion_flag":false}}
+{"flow_id":"1a2b3c4d-0001","ts_start":"2026-07-25T14:22:04.003112Z",
+ "ts_last":"2026-07-25T14:22:04.221007Z","src_ip":"10.0.4.17",
+ "dst_ip":"157.240.22.35","src_port":51422,"dst_port":443,
+ "protocol":"TCP","l7_protocol":"social_media","l7_confidence":"high",
+ "bytes_total":18422,"packets_total":24,"duration_ms":218,
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":1},
+ "flags":[]}
 ```
 
-**IPv6 + TCP**:
+**IPv6 + TCP, unclassified**:
 ```json
-{"src_ip":"2001:db8::1","dst_ip":"2606:2800:220:1:248:1893:25c8:1946",
- "src_port":54210,"dst_port":443,"sni":"example.com","category":"unclassified",
- "confidence":"low","dga_score":0.03,"vpn_score":0.0,"vpn_protocol":"none",
- "dot_score":0.0,"doh_score":0.0,
- "reassembly":{"out_of_order":0,"retransmits":0,"overlap_conflicts":0,"evasion_flag":false}}
+{"flow_id":"1a2b3c4d-0002","ts_start":"2026-07-25T14:22:05.100442Z",
+ "ts_last":"2026-07-25T14:22:05.340118Z","src_ip":"2001:db8::1",
+ "dst_ip":"2606:2800:220:1:248:1893:25c8:1946","src_port":54210,
+ "dst_port":443,"protocol":"TCP","l7_protocol":"unknown","l7_confidence":"low",
+ "bytes_total":4112,"packets_total":7,"duration_ms":240,
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
 ```
 
 ---
 
 ## Core application protocols
+
+**These are genuinely flow-record-wrapped in the real output** — every
+protocol below rides over TCP or UDP, both of which route through
+`dpi_flow_record.c`'s envelope (see above) automatically; the nested
+object shown in each sample is exactly what a real dissection produces,
+using the generic prefix-stripping `dpi_flow_record.c` performs, not a
+hand-written schema per protocol. Only the 5 protocols immediately
+below (DNS, HTTP/1.1, HTTP/2, SSH, SMTP) have been re-rendered in the
+full wrapped form for this update — everything further down this file
+(SIP, RTP, ICMP, SNMP, and the rest of this large reference) still
+shows the older, dissector-only view for brevity; mentally wrap any of
+them in the same envelope shown above to see what real output actually
+looks like.
+
+**DNS** (query + A-record answer; UDP, so flow-wrapped as shown):
+```json
+{"flow_id":"1a2b3c4d-0003","ts_start":"2026-07-25T14:22:10.001200Z",
+ "ts_last":"2026-07-25T14:22:10.041650Z","src_ip":"10.0.4.17",
+ "dst_ip":"8.8.8.8","src_port":54821,"dst_port":53,
+ "protocol":"UDP","l7_protocol":"DNS","l7_confidence":"high",
+ "bytes_total":142,"packets_total":2,"duration_ms":40,
+ "dns":{"is_response":"true","opcode":"0","rcode":"0","qname":"example.com",
+ "qtype":"1","qclass":"1","answer_0_a":"93.184.216.34",
+ "answer_records_parsed":"1","authority_records_parsed":"0",
+ "additional_records_parsed":"0"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**HTTP/1.1** (TCP; now includes a bounded body preview, added on
+direct request — `http_body_preview` is the first 200 bytes of the
+real response body, `http_body_length` is the true total length, so a
+truncated preview is always distinguishable from a genuinely short
+body. Verified against a real 302 redirect response from a genuine
+capture — the body preview below is the real, actual HTML that
+capture contained, not a fabricated example):
+```json
+{"flow_id":"1a2b3c4d-0004","ts_start":"2026-07-25T14:22:11.500000Z",
+ "ts_last":"2026-07-25T14:22:11.618340Z","src_ip":"10.0.4.17",
+ "dst_ip":"157.56.23.10","src_port":51500,"dst_port":80,
+ "protocol":"TCP","l7_protocol":"HTTP/1.1","l7_confidence":"high",
+ "bytes_total":612,"packets_total":4,"duration_ms":118,
+ "http":{"is_response":"true","first_line":"HTTP/1.1 302 Moved Temporarily",
+ "method":"","path":"","host":"","user_agent":"",
+ "content_type":"text/html; charset=utf-8",
+ "body_length":"242",
+ "body_preview":"<html><head><title>Object moved</title></head><body>\r\n<h2>Object moved to <a href=\"http://silverlight.dlservice.microsoft.com/download/d/2/9/d29e5571-4b68-4d95-b43a-4e81ba178455/2.0/ENU/InstallSilverl"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+A real request on a different, earlier flow (showing the fields a
+request populates instead — `method`/`path`/`host`/`user_agent`
+rather than a response's `body_preview`; a request can have a body
+too, e.g. a real `POST`, but this dissector only emits `body_preview`/
+`body_length` when a genuine blank-line header terminator was actually
+found, and there's real body data after it — see `dpi_http1_parser.c`'s
+own comment on why an unreliable body boundary is never guessed at):
+```json
+{"flow_id":"1a2b3c4d-0005","ts_start":"2026-07-25T14:22:09.200000Z",
+ "ts_last":"2026-07-25T14:22:09.204500Z","src_ip":"10.0.4.17",
+ "dst_ip":"93.184.216.34","src_port":51488,"dst_port":80,
+ "protocol":"TCP","l7_protocol":"HTTP/1.1","l7_confidence":"high",
+ "bytes_total":298,"packets_total":3,"duration_ms":4,
+ "http":{"is_response":"false","first_line":"GET /index.html HTTP/1.1",
+ "method":"GET","path":"/index.html","host":"example.com",
+ "user_agent":"curl/8.0"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**HTTP/2** (TCP, with HPACK-decoded pseudo-headers):
+```json
+{"flow_id":"1a2b3c4d-0006","ts_start":"2026-07-25T14:22:12.000000Z",
+ "ts_last":"2026-07-25T14:22:12.087220Z","src_ip":"10.0.4.17",
+ "dst_ip":"93.184.216.34","src_port":51510,"dst_port":443,
+ "protocol":"TCP","l7_protocol":"HTTP/2","l7_confidence":"high",
+ "bytes_total":2104,"packets_total":6,"duration_ms":87,
+ "http2":{"preface_present":"true","frames_parsed":"4",
+ "headers_frame_count":"1","rst_stream_count":"0","max_stream_id":"1",
+ "authority":"www.example.com","method":"GET","path":"/","status":"200",
+ "settings_header_table_size":"4096"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**SSH** (TCP):
+```json
+{"flow_id":"1a2b3c4d-0007","ts_start":"2026-07-25T14:22:13.000000Z",
+ "ts_last":"2026-07-25T14:22:13.045000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.4.90","src_port":51522,"dst_port":22,
+ "protocol":"TCP","l7_protocol":"SSH","l7_confidence":"high",
+ "bytes_total":1088,"packets_total":5,"duration_ms":45,
+ "ssh":{"identification_string":"SSH-2.0-OpenSSH_9.6",
+ "protocol_version":"2.0","software_version":"OpenSSH_9.6",
+ "kexinit_present":"true"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**SMTP** (TCP):
+```json
+{"flow_id":"1a2b3c4d-0008","ts_start":"2026-07-25T14:22:14.000000Z",
+ "ts_last":"2026-07-25T14:22:14.612000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.20","src_port":51540,"dst_port":25,
+ "protocol":"TCP","l7_protocol":"SMTP","l7_confidence":"high",
+ "bytes_total":3220,"packets_total":14,"duration_ms":612,
+ "smtp":{"ehlo_domain":"mail.example.com","mail_from":"<sender@example.com>",
+ "rcpt_to":"<recipient@example.org>","response_code":"250",
+ "starttls_seen":"true","data_command_seen":"true",
+ "message_from":"Sender Name <sender@example.com>",
+ "message_to":"Recipient Name <recipient@example.org>",
+ "message_subject":"Quarterly report",
+ "message_date":"Wed, 24 Jul 2026 10:00:00 -0700",
+ "message_body_begins":"true"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+---
+
+## Remaining protocols (older, dissector-only view — not yet re-rendered in the wrapped format above)
 
 **DNS** (query + A-record answer):
 ```json
