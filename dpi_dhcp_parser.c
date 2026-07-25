@@ -22,6 +22,8 @@
 #define DHCP_OPT_REQUESTED_IP   50
 #define DHCP_OPT_HOSTNAME       12
 #define DHCP_OPT_VENDOR_CLASS   60
+#define DHCP_OPT_RELAY_AGENT_INFO 82
+#define DHCP_OPT_AUTHENTICATION 90
 #define DHCP_OPT_END           255
 #define DHCP_OPT_PAD             0
 
@@ -117,6 +119,104 @@ static void dhcp_dissect(const uint8_t *payload, uint16_t len,
                 memcpy(vcbuf, opt_val, n);
                 vcbuf[n] = '\0';
                 dissect_result_add(out, "dhcp_vendor_class", vcbuf);
+                break;
+            }
+            case DHCP_OPT_AUTHENTICATION: {
+                /* RFC 3118. Verified against a real option (31 bytes)
+                 * found in a real capture: Protocol(1)+Algorithm(1)+
+                 * RDM(1)+Replay Detection(8)+Authentication
+                 * Information(remaining) — for the real Algorithm=1
+                 * (HMAC-MD5) case found, Authentication Information
+                 * splits exactly into a 4-byte Secret ID + 16-byte
+                 * HMAC-MD5 digest per RFC 3118 S4's "delayed
+                 * authentication" format for that algorithm, 20 bytes
+                 * total, matching this real option's length exactly.
+                 * Only a digest is extracted here, never anything
+                 * that could reconstruct the shared secret — same
+                 * "extract identity, never credentials" discipline as
+                 * every other dissector in this project; an HMAC
+                 * digest doesn't reveal the key it was computed with. */
+                if (opt_len < 11) break;   /* too short for even the fixed fields */
+                uint8_t protocol = opt_val[0];
+                uint8_t algorithm = opt_val[1];
+                uint8_t rdm = opt_val[2];
+
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u", protocol);
+                dissect_result_add(out, "dhcp_auth_protocol", buf);
+                dissect_result_add(out, "dhcp_auth_algorithm",
+                                    algorithm == 1 ? "HMAC-MD5" : "Unknown");
+                dissect_result_add(out, "dhcp_auth_rdm",
+                                    rdm == 0 ? "Monotonically Increasing Counter" : "Unknown");
+
+                char hexbuf[80];
+                size_t hex_n = 0;
+                for (int i = 3; i < 11 && hex_n + 2 < sizeof(hexbuf); i++) {
+                    snprintf(hexbuf + hex_n, 3, "%02x", opt_val[i]);
+                    hex_n += 2;
+                }
+                hexbuf[hex_n] = '\0';
+                dissect_result_add(out, "dhcp_auth_replay_detection_hex", hexbuf);
+
+                if (opt_len > 11) {
+                    hex_n = 0;
+                    for (int i = 11; i < opt_len && hex_n + 2 < sizeof(hexbuf); i++) {
+                        snprintf(hexbuf + hex_n, 3, "%02x", opt_val[i]);
+                        hex_n += 2;
+                    }
+                    hexbuf[hex_n] = '\0';
+                    dissect_result_add(out, "dhcp_auth_info_hex", hexbuf);
+                }
+                break;
+            }
+            case DHCP_OPT_RELAY_AGENT_INFO: {
+                /* RFC 3046. Sub-options are TLV-encoded: SubOpt(1) +
+                 * SubOptLen(1) + SubOptValue. Verified against a real
+                 * option (22 bytes, one sub-option) in the same real
+                 * capture as the Authentication option above:
+                 * sub-option 1 (Agent Circuit ID) containing a real,
+                 * printable ASCII circuit identifier from real access
+                 * equipment (" PON 1/1/07/01:1.0.1" — a passive-
+                 * optical-network port identifier). Sub-option 2
+                 * (Agent Remote ID) is named the same way per RFC
+                 * 3046 but wasn't present in the real capture checked
+                 * — extracted with the identical printable-ASCII-or-
+                 * hex-fallback approach as sub-option 1, not
+                 * separately real-traffic-verified. */
+                size_t sp = 0;
+                int n_suboptions = 0;
+                while (sp + 2 <= (size_t)opt_len && n_suboptions < 8) {
+                    uint8_t subopt = opt_val[sp];
+                    uint8_t sublen = opt_val[sp + 1];
+                    if (sp + 2 + sublen > (size_t)opt_len) break;
+                    const uint8_t *subval = opt_val + sp + 2;
+
+                    bool printable = sublen > 0;
+                    for (int i = 0; i < sublen; i++) {
+                        if (subval[i] < 0x20 || subval[i] > 0x7E) { printable = false; break; }
+                    }
+
+                    const char *key = subopt == 1 ? "dhcp_relay_agent_circuit_id" :
+                                       subopt == 2 ? "dhcp_relay_agent_remote_id" : NULL;
+                    if (key) {
+                        char subbuf[128];
+                        if (printable) {
+                            size_t n = sublen < sizeof(subbuf) - 1 ? sublen : sizeof(subbuf) - 1;
+                            memcpy(subbuf, subval, n);
+                            subbuf[n] = '\0';
+                        } else {
+                            size_t hex_n = 0;
+                            for (int i = 0; i < sublen && hex_n + 2 < sizeof(subbuf); i++) {
+                                snprintf(subbuf + hex_n, 3, "%02x", subval[i]);
+                                hex_n += 2;
+                            }
+                            subbuf[hex_n] = '\0';
+                        }
+                        dissect_result_add(out, key, subbuf);
+                    }
+                    sp += 2 + sublen;
+                    n_suboptions++;
+                }
                 break;
             }
             default:

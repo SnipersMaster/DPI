@@ -343,7 +343,7 @@ fully-parsed table above. What remains:
 | `dpi_http1_parser.c` | HTTP/1.1 request/status line + Host/User-Agent header extraction. | `dpi_dissector_registry.c` |
 | `dpi_http2_parser.c` | HTTP/2 connection preface + frame-level metadata, HPACK-decoded headers (via `dpi_hpack_decoder.c`), real SETTINGS_HEADER_TABLE_SIZE tracking, and — when called with real flow context — CONTINUATION reassembly across TCP delivery boundaries plus a persistent per-connection dynamic table (via `dpi_hpack_connection_state.c`). See the fully-parsed table above for the full detail and remaining scope limits. | `dpi_dissector_registry.c`, `dpi_hpack_decoder.c`, `dpi_hpack_connection_state.c` |
 | `dpi_ssh_parser.c` | SSH identification string + KEXINIT algorithm name-list extraction (plaintext, sent before encryption begins — same pattern as TLS's ClientHello). | `dpi_dissector_registry.c` |
-| `dpi_dhcp_parser.c` | DHCP message type, requested IP, hostname, vendor class — plaintext TLV options. | `dpi_dissector_registry.c` |
+| `dpi_dhcp_parser.c` | DHCP message type, requested IP, hostname, vendor class, RFC 3118 authentication (protocol/algorithm/RDM/digest), RFC 3046 relay agent circuit/remote ID — plaintext TLV options. | `dpi_dissector_registry.c` |
 | `dpi_sip_rtp_parser.c` | SIP (text-based signaling) + RTP (fixed binary media header) in one file, since they're the two halves of a VoIP call though structurally very different. | `dpi_dissector_registry.c` |
 | `dpi_icmp_parser.c` | ICMP (RFC 792) + ICMPv6 (RFC 4443/4861) dissectors. Runs directly over IP, not TCP/UDP — the capture path has dedicated branches for IP protocol 1 / IPv6 next_header 58, since there's no port to dispatch on. ICMPv6 checksum verification happens in the capture path (needs IPv6 addresses the generic interface doesn't pass through), not inside the dissector. | `dpi_dissector_registry.c` |
 | `dpi_hpack_connection_state.c` | Per-flow persistent HPACK dynamic table, keyed by the same `tcp_flow_key` `dpi_tcp_flow_reassembly.c` uses — closes the "HPACK dynamic table is per-frame, not per-connection" gap. Partitioned per-lcore (reuses `TCP_REASSEMBLY_NUM_PARTITIONS`), with its own (longer) timeout since HTTP/2 connections are typically longer-lived than raw TCP flows. | `dpi_tcp_flow_reassembly.c`, `dpi_hpack_decoder.c` |
@@ -386,7 +386,7 @@ stated plainly too, not left ambiguous.
 | `dpi_http1_parser.c` | No | No | No chunked transfer-encoding or body parsing; only Host/User-Agent headers extracted |
 | `dpi_http2_parser.c` | No | **Logic yes, via construction** | CONTINUATION reassembly now covers both a clean frame-boundary split AND a split in the middle of a CONTINUATION frame's own payload (verified against constructed multi-delivery scenarios — two-way split, three-way split, split-then-more-frames-follow, all byte-for-byte correct). No real capture available happened to include a TCP boundary landing inside a CONTINUATION frame's payload specifically — stated honestly as logic-verified, not real-traffic-verified, for that specific path. SETTINGS_HEADER_TABLE_SIZE correctly resizes the opposite direction's table (a real directional bug was found and fixed). |
 | `dpi_ssh_parser.c` | No | No | Only 8 of RFC 4253's 10 KEXINIT name-lists extracted; nothing past KEXINIT is parsed (correctly encrypted from there) |
-| `dpi_dhcp_parser.c` | No | **Yes, base fields** | Real DHCP/BOOTP traffic confirmed across 6 captures. A real gap found: DHCP option 90 (Authentication, RFC 3118) and option 82 (Relay Agent Information) are both present with real data in real captures but not yet extracted — only options 53/50/12/60 are decoded today, flagged as the next breadth-extension candidate. |
+| `dpi_dhcp_parser.c` | No | **Yes, base fields + a breadth extension** | Real DHCP/BOOTP traffic confirmed across 6 captures. Options 90 (Authentication, RFC 3118) and 82 (Relay Agent Information, RFC 3046) — flagged earlier as a real, found-but-not-yet-extracted gap — are now decoded too: verified against the same real capture that surfaced the gap, a real HMAC-MD5 authentication option (protocol/algorithm/RDM named, replay-detection and the Secret-ID+digest extracted as hex, never anything that could reconstruct the shared secret) and a real Relay Agent Circuit ID sub-option decoding to a genuine, printable access-circuit identifier (" PON 1/1/07/01:1.0.1"). Sub-option 2 (Remote ID) is named and extracted the same way but wasn't present in the real capture checked, stated honestly. |
 | `dpi_sip_rtp_parser.c` | No | No | SIP: only Call-ID/From/To headers extracted. RTP: no port hint exists by protocol design (negotiated via SDP) |
 | `dpi_icmp_parser.c` | No | No | Embedded original-packet dissection implemented for both ICMPv4 (ports only) and ICMPv6 (full TCP/UDP header) — verified against constructed test packets, no real ICMP capture checked yet |
 | `dpi_smtp_parser.c` | No | No | RFC 5322 message headers extracted when in the same buffer as DATA — verified against a constructed multi-header message, not yet a real capture |
@@ -1723,7 +1723,7 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **271 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **272 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
@@ -1872,9 +1872,10 @@ already done elsewhere in this project.
 | **AppleTalk** (SNAP, Apple OUI) | Real frames in `Paging_Request.pcap` | Low — legacy, minimal current relevance |
 | Cisco SNAP protocol (OUI Cisco, PID 0x010b) | Real frames in `Paging_Request.pcap` | Low, and uncertain — OUI identifiable, exact sub-protocol not confidently named from what's available; same discipline as not guessing at Bearer QoS's bit layout without the spec text |
 
-**Recommended build order, updated now that SCTP, M3UA, and AMQP are
-all done**: the DHCP option breadth extension next (cheap, can go
-anytime) → LLMNR (cheap) → STP → M2UA/PIM/AppleTalk as time allows.
+**Recommended build order, updated now that SCTP, M3UA, AMQP, and the
+DHCP option breadth extension are all done**: LLMNR next (cheap,
+likely foldable into the existing DNS dissector) → STP →
+M2UA/PIM/AppleTalk as time allows.
 
 ## Suggested next steps, roughly in priority order
 
