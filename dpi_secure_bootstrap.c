@@ -184,6 +184,7 @@
 #include "dpi_pim_parser.c"
 #include "dpi_stp_parser.c"
 #include "dpi_appletalk_parser.c"
+#include "dpi_pppoe_parser.c"
 /* 802.11 is a genuinely different link layer from everything else
  * this file processes — see dpi_80211_parser.c's own header comment.
  * Included here specifically to support the optional --link-type=80211
@@ -1127,11 +1128,46 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
      * would have silently meant AppleTalk's own dissector was never
      * actually reachable — caught and fixed before AppleTalk support
      * was ever real-traffic-verified, not after. */
+    /* IEEE 802.3's own length/EtherType ambiguity rule: values below
+     * 0x0600 (1536) are a LENGTH field (802.3 framing), values at or
+     * above are a real EtherType (Ethernet II framing) — not guessed
+     * at, this is how the wire format itself distinguishes the two.
+     *
+     * Within 802.3 framing, TWO genuinely distinct sub-styles exist,
+     * not one — a real, structural distinction, not just "LLC or
+     * not": LLC-encapsulated (a DSAP/SSAP/Control header follows the
+     * length field — STP's DSAP=SSAP=0x42, AppleTalk's SNAP-over-LLC
+     * DSAP=SSAP=0xAA, both handled below) versus "raw" 802.3 framing
+     * (no LLC header at all — historically Novell NetWare's original
+     * IPX framing, where the length field is followed directly by
+     * IPX's own header). A length-field frame that doesn't match
+     * either LLC signature checked below is reported explicitly as
+     * unrecognized, not silently dropped — a real, previously-
+     * invisible gap, caught when a real capture showed a length-field
+     * frame (declared length 0x32/50) that matched neither STP's nor
+     * AppleTalk's DSAP/SSAP signature. Its actual inner content isn't
+     * decoded here yet — this project doesn't guess at wire-level
+     * structure without real bytes to verify against, the same
+     * discipline that kept it from guessing at DNP3's field layout or
+     * IEEE 802.3br's mPacket SMD values; extending this to a real
+     * raw-802.3/IPX dissector once real sample bytes are available is
+     * a well-scoped, bounded piece of future work, not a guess made
+     * now to fill the gap. */
     if (ethertype < 0x0600 && payload_len >= 0) {
         if (payload_len >= 2 && payload[0] == 0x42 && payload[1] == 0x42) {
             stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
         } else if (payload_len >= 2 && payload[0] == 0xAA && payload[1] == 0xAA) {
             appletalk_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        } else {
+            /* Neither known LLC signature — could be raw/non-LLC 802.3
+             * framing (e.g. Novell's original IPX framing) or an LLC
+             * DSAP/SSAP pair this project doesn't recognize yet.
+             * Reported honestly rather than silently dropped. */
+            fprintf(stderr, "unrecognized 802.3 length-field frame (declared length %u, "
+                            "first bytes %02x %02x) — neither STP nor AppleTalk SNAP; "
+                            "possibly raw/non-LLC framing (e.g. legacy Novell IPX) not yet "
+                            "decoded, see dispatch_by_ethertype()'s own comment\n",
+                    ethertype, payload_len >= 1 ? payload[0] : 0, payload_len >= 2 ? payload[1] : 0);
         }
         return;
     }
@@ -1141,6 +1177,12 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
 #endif
     if (ethertype == ETH_P_IPV6) {
         dissect_ipv6_packet((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x8863 || ethertype == 0x8864) {
+        pppoe_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len,
+                                         ethertype == 0x8863);
         return;
     }
 
