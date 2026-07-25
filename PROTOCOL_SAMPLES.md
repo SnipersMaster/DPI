@@ -15,7 +15,7 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 72 samples, covering all 55 `protocols.ini` entries plus
+complete one. 74 samples, covering all 56 `protocols.ini` entries plus
 the baseline flow record, 802.11 (standalone, not `protocols.ini`-
 gated), and RARP (folded into ARP, same dissector).
 
@@ -235,6 +235,24 @@ boundary, not a gap):
 {"protocol":"M3UA","m3ua_message":"Transfer/DATA",
  "m3ua_network_appearance":"0x00000008","m3ua_routing_context":"0x00000015",
  "m3ua_protocol_data_hex":"00e39a0a00d167360302020f04646f837d48410300"}
+```
+
+**AMQP 0-9-1** (a real Basic.Publish frame — verified against 42 real,
+complete frames across 3 genuine captures, real Celery task-queue
+traffic; only reached this clean result after finding and fixing a
+real bug in this project's own verification methodology, not the
+protocol — see the README for the full story):
+```json
+{"protocol":"AMQP","amqp_frame_type":"METHOD","amqp_channel":"1",
+ "amqp_method":"Basic.Publish","amqp_exchange":"celeryev",
+ "amqp_routing_key":"worker.heartbeat"}
+```
+A real Queue.Declare (an anonymous, exclusive, auto-delete temporary
+queue — the standard real-world pattern for a client-side reply
+queue):
+```json
+{"protocol":"AMQP","amqp_frame_type":"METHOD","amqp_channel":"1",
+ "amqp_method":"Queue.Declare","amqp_queue":"(server-generated)"}
 ```
 
 **RADIUS**:
