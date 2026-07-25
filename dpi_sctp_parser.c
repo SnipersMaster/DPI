@@ -237,3 +237,4 @@ static const uint16_t sctp_hint_ports[] = { 0 };   /* no port concept at
 void register_sctp_dissector(void) {
     register_dissector("SCTP", sctp_detect, sctp_dissect, sctp_hint_ports, 0);
 }
+
