@@ -167,6 +167,7 @@
 #include "dpi_mysql_parser.c"
 #include "dpi_postgresql_parser.c"
 #include "dpi_tds_parser.c"
+#include "dpi_serialnumberd_parser.c"
 #include "dpi_m2ua_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
@@ -185,6 +186,37 @@
 /* Provides the lock-free per-lcore output ring buffer + drain thread
  * that replaces the hot-path printf() used before this change. */
 #include "dpi_async_output.c"
+
+/* STP, AppleTalk, CDP, EAPOL, LACP, PPPoE, DECnet, Banyan VINES, and
+ * PIM all still use direct printf()/fprintf() internally, the same
+ * as their offline-path versions — a deliberate choice, not an
+ * oversight, and not a reintroduction of the hot-path printf()
+ * problem the comment above describes. Every one of these is a
+ * low-frequency control-plane or discovery-plane protocol: STP Hello
+ * BPDUs every ~2 seconds, CDP advertisements every ~60 seconds, LACP
+ * PDUs at most ~5/second, EAPOL/PPPoE/DECnet/VINES only during
+ * connection setup (not per data packet), PIM Hellos on a similar
+ * multi-second cadence — fundamentally different traffic volume from
+ * the regular per-packet TCP/UDP data path that motivated moving to
+ * the ring buffer in the first place. Routing these through the ring
+ * buffer too would be more architecturally uniform, but would also
+ * mean threading each of these 9 protocols' own field sets into
+ * `struct flow_log_record` (which doesn't have slots for BPDU
+ * timers, LACP state flags, CDP TLVs, and so on) — real, substantial
+ * additional work for protocols whose volume was never the
+ * performance concern in the first place. Stated here explicitly so
+ * this reasoning is visible rather than silently reusing printf()
+ * without acknowledging the tension with the comment two paragraphs
+ * up. */
+#include "dpi_stp_parser.c"
+#include "dpi_appletalk_parser.c"
+#include "dpi_cdp_parser.c"
+#include "dpi_eapol_parser.c"
+#include "dpi_lacp_parser.c"
+#include "dpi_pppoe_parser.c"
+#include "dpi_decnet_parser.c"
+#include "dpi_vines_parser.c"
+#include "dpi_pim_parser.c"
 
 #define RX_RING_SIZE      4096
 #define TX_RING_SIZE      1024
@@ -275,6 +307,7 @@ static inline void dissect_eigrp_datagram(const struct ipv4_result *ip_result, u
 static inline void dissect_ah_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_l2tpv3_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
 static inline void dissect_sctp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id);
+static inline void dissect_pim_datagram(const struct ipv4_result *ip_result);
 static inline void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len, uint16_t queue_id);
 
 static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
@@ -315,6 +348,58 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
          * from is a reasonable, contained follow-up. */
         (void)vlan.vlan_id_outer;
         (void)vlan.vlan_id_inner;
+    }
+
+    /* IEEE 802.3's length/EtherType ambiguity rule (see
+     * dpi_secure_bootstrap.c's dispatch_by_ethertype() for the full
+     * explanation this mirrors exactly) — checked first since none
+     * of the real EtherTypes below are ever < 0x0600. */
+    if (ethertype < 0x0600) {
+        if (ip_len >= 2 && ip_start[0] == 0x42 && ip_start[1] == 0x42) {
+            stp_dissect_llc_payload(ip_start, ip_len, ethertype);
+        } else if (ip_len >= 2 && ip_start[0] == 0xAA && ip_start[1] == 0xAA) {
+            appletalk_dissect_snap_payload(ip_start, ip_len);
+            cdp_dissect_snap_payload(ip_start, ip_len);
+        }
+        /* Unlike the offline path, an unrecognized length-field frame
+         * here is simply dropped without a diagnostic message — this
+         * is the per-packet hot path across potentially many lcores,
+         * where an fprintf() per unrecognized frame really would be
+         * the hot-path-printf problem the ring buffer was built to
+         * avoid, unlike the low-frequency protocols this whole block
+         * handles. */
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x8863 || ethertype == 0x8864) {
+        pppoe_dissect_ethertype_payload(ip_start, ip_len, ethertype == 0x8863);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x888E) {
+        eapol_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x8809) {
+        lacp_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x6003) {
+        decnet_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
+        vines_dissect_ethertype_payload(ip_start, ip_len, ethertype);
+        rte_pktmbuf_free(m);
+        return;
     }
 
     if (ethertype == RTE_ETHER_TYPE_IPV6) {
@@ -510,6 +595,12 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    if (ip_result.protocol == 103 /* PIM */) {
+        dissect_pim_datagram(&ip_result);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     if (ip_result.protocol == 17 /* UDP */) {
         dissect_udp_datagram(&ip_result, queue_id);
         rte_pktmbuf_free(m);
@@ -517,7 +608,7 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     }
 
     if (ip_result.protocol != 6 /* TCP */) {
-        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, nor SCTP: not handled */
+        rte_pktmbuf_free(m);   /* neither TCP, UDP, ICMP, GRE, OSPF, IGMP, ESP, 6in4, EIGRP, AH, L2TPv3, SCTP, nor PIM: not handled */
         return;
     }
 
@@ -966,17 +1057,45 @@ static inline void dissect_sctp_datagram(const struct ipv4_result *ip_result, ui
      * just "SCTP" generically — same "name the most specific thing
      * actually found" preference as every other tunnel/transport
      * dissector in this project. */
-    const char *inner_proto = dissect_result_get(&dissect_out, "sctp_chunk_0_inner_protocol");
-    if (inner_proto) {
-        DPI_SAFE_STRNCPY(rec.app_name, inner_proto, sizeof(rec.app_name));
-        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
-    } else {
-        const char *chunk0_type = dissect_result_get(&dissect_out, "sctp_chunk_0_type");
-        if (chunk0_type) DPI_SAFE_STRNCPY(rec.app_name, chunk0_type, sizeof(rec.app_name));
-        DPI_SAFE_STRNCPY(rec.confidence, "high", sizeof(rec.confidence));
-    }
-
     log_ring_try_push(queue_id, &rec);
+}
+
+/* Uses printf() directly rather than the ring buffer, unlike its SCTP
+ * neighbor above — see the file's own top-of-file comment (next to
+ * the STP/AppleTalk/CDP/etc. includes) for the full reasoning: PIM
+ * Hello messages are periodic, multi-second-interval control-plane
+ * traffic, not per-packet data volume, so this doesn't reintroduce
+ * the hot-path printf() problem the ring buffer exists to avoid. */
+static inline void dissect_pim_datagram(const struct ipv4_result *ip_result) {
+    if (ip_result->payload_len == 0) return;
+
+    struct dissect_result dissect_out;
+    bool matched = dispatch_dissection(ip_result->payload, ip_result->payload_len,
+                                        0, "PIM", &dissect_out);
+    if (!matched) return;
+
+    char src_ip_str[16], dst_ip_str[16];
+    snprintf(src_ip_str, sizeof(src_ip_str), "%u.%u.%u.%u",
+             (ip_result->src_addr>>24)&0xFF, (ip_result->src_addr>>16)&0xFF,
+             (ip_result->src_addr>>8)&0xFF, ip_result->src_addr&0xFF);
+    snprintf(dst_ip_str, sizeof(dst_ip_str), "%u.%u.%u.%u",
+             (ip_result->dst_addr>>24)&0xFF, (ip_result->dst_addr>>16)&0xFF,
+             (ip_result->dst_addr>>8)&0xFF, ip_result->dst_addr&0xFF);
+
+    const char *version = dissect_result_get(&dissect_out, "pim_version");
+    const char *type = dissect_result_get(&dissect_out, "pim_type");
+    const char *holdtime = dissect_result_get(&dissect_out, "pim_hello_holdtime_sec");
+    const char *prop_delay = dissect_result_get(&dissect_out, "pim_hello_propagation_delay_ms");
+    const char *override_interval = dissect_result_get(&dissect_out, "pim_hello_override_interval_ms");
+
+    printf("{\"protocol\":\"PIM\",\"src_ip\":\"%s\",\"dst_ip\":\"%s\","
+           "\"pim_version\":\"%s\",\"pim_type\":\"%s\","
+           "\"pim_hello_holdtime_sec\":\"%s\",\"pim_hello_propagation_delay_ms\":\"%s\","
+           "\"pim_hello_override_interval_ms\":\"%s\"}\n",
+           src_ip_str, dst_ip_str,
+           version ? version : "", type ? type : "",
+           holdtime ? holdtime : "", prop_delay ? prop_delay : "",
+           override_interval ? override_interval : "");
 }
 
 static inline void dissect_esp_datagram(const struct ipv4_result *ip_result, uint16_t queue_id) {

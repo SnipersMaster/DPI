@@ -228,6 +228,7 @@ everything else is not touched by this engine at all yet.
 | TDS | MS-TDS (SQL Server) | `dpi_tds_parser.c` | TCP port 1433. Verified against Microsoft's own official MS-TDS specification plus a complete, real, byte-exact PRELOGIN response example (from a public SQL-Server-version-probe write-up) — the encoded server version bytes decoded to exactly "12.00.2000", matching what the original example's author independently stated, genuine cross-verification. The universal 8-byte packet header (all types named) plus PRELOGIN's VERSION token are decoded; LOGIN7's substantially more involved OffsetLength/parameter structure, and all subsequent token-stream messages, are not. |
 | DECnet Phase IV | DEC's proprietary network architecture | `dpi_decnet_parser.c` | **Deliberately detection-only, stated honestly** — real EtherType 0x6003, confirmed across 4 independent sources (OpenBSD/RTEMS/INET Framework headers, Wikipedia). The routing-layer header itself is NOT decoded: what's publicly available on its byte-level layout came only from a patent filing describing hardware-forwarding logic, not a clean primary spec, and even that source gives a range ("23 to 29 bytes depending on pad length") rather than a fixed, verifiable offset. Reporting detection honestly rather than guessing at field offsets from that thin a foundation. |
 | Banyan VINES | VIP (VINES Internetwork Protocol), XNS-derived | `dpi_vines_parser.c` | **Deliberately detection-only, stated honestly** — real EtherTypes 0x0BAD/0x0BAE/0x0BAF, confirmed across 6 independent sources (OpenBSD, FreeBSD/NetBSD, Wireshark's own etypes.h, and more). Same situation as DECnet: only architectural background was available for VIP's own header, not a byte-exact verified layout, so detection is reported honestly without guessing at structure. |
+| serialnumberd | Apple Mac OS X Server serial number tracking | `dpi_serialnumberd_parser.c` | **Found via this project's own systematic pcap survey** — after the last major batch, every capture in this project's working set was scanned for any TCP/UDP port with real traffic and no matching dissector; UDP port 626 turned up 8,640 real packets in a genuine capture, immediately recognizable as plaintext ASCII (`SNQUERY:domex.nps.edu:yWQBLA:xsvr` — a real hostname, the Naval Postgraduate School's domain). Independently cross-checked against the Nmap version-probe database's own documented `serialnumberd` probe, which uses the identical colon-delimited structure with a different real example — genuine agreement between this project's own capture and an independent public reference. Query format fully decoded (hostname, token, suffix); the server's response format is not — no real response packets were available to verify a byte-exact reply structure against. |
 | STP / RSTP | IEEE 802.1D / 802.1w | `dpi_stp_parser.c` | **A genuinely different framing style from every other protocol in this project** — STP BPDUs don't carry a real EtherType at all; they ride on 802.3 LLC framing (the bytes at the EtherType position are actually a length field, per 802.3's own length-vs-EtherType rule), with DSAP=SSAP=0x42 identifying Spanning Tree. Detected inside `dispatch_by_ethertype()` itself — the one choke point every link type this project supports (Ethernet, LINKTYPE_RAW, Linux SLL, mPacket) already funnels through — so every one of those gets STP support automatically, not just plain Ethernet. Verified against 7 real, identical BPDU frames (identical because bridges send Hello BPDUs periodically — expected, not a parsing artifact) from a genuine capture: every field decoded to a real, sensible value — RSTP version 2, a Designated Port in the Forwarding state with Agreement set (a converged topology), a root bridge genuinely distinct from this bridge's own ID, and all four timers matching the textbook 802.1D defaults (2s/20s/2s/15s) exactly. A real precision catch made during verification: the capture's own declared length said 36 bytes of real BPDU content, but the captured frame was longer — the extra bytes were standard Ethernet padding (real frames below the 60-byte minimum get padded), not additional fields; this dissector bounds its parsing to the declared length specifically because of that finding, not to however much buffer happens to be captured. MSTP (version 3) extensions are named as present but not decoded — no real MSTP traffic was available to verify a byte-exact layout against. |
 
 ### Detected / scored, not fully dissected
@@ -336,7 +337,7 @@ fully-parsed table above. What remains:
 | `dpi_async_output.c` | Lock-free per-lcore SPSC ring buffer + dedicated drain pthread, replacing the DPDK worker's earlier hot-path `printf()`. Producers (lcores) never block — a full ring drops and counts, never stalls. Formatting happens only in the drain thread, which now writes through `dpi_output_sink.c`'s pluggable backend instead of `printf`ing directly, with a periodic (1s default) flush schedule. Deliberately a plain pthread, not another DPDK lcore. | `dpi_output_sink.c` |
 | `dpi_rfc_parser.c` | RFC-conformant IPv4 (RFC 791), TCP (RFC 9293), and now UDP (RFC 768) parsing: checksum verification, options parsing, IPv4 fragmentation reassembly. States an explicit open decision on TCP overlap-resolution policy (first-wins vs last-wins) rather than silently picking one — implemented in `dpi_tcp_flow_reassembly.c`, see below. | none (self-contained) |
 | `dpi_tcp_flow_reassembly.c` | Per-flow TCP stream reassembly sitting on top of the per-segment parsing above. Implements the overlap-resolution policy (configurable FIRST_WINS/LAST_WINS) and, more importantly, detects the actual evasion-relevant case: overlapping segments whose bytes *disagree* at the same position (vs. benign identical retransmission). Timeout eviction + hard flow-count ceiling included. **Flow table is now partitioned per-lcore** (`partition_id` parameter) — an earlier version shared one global table across all lcores with no locking, a real data race caught while wiring this into the multi-core worker. Wired into both capture paths. Includes a test-only reset helper for the fuzz harness. | none (self-contained) |
-| `fuzz_*.c` (75 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser, ipv4_fragmentation, http2_continuation_reassembly, wow_parser, bt_dht_parser, sctp_parser, m3ua_parser, amqp_parser, stp_parser, m2ua_parser, pim_parser, appletalk_parser, pppoe_parser, cdp_parser, eapol_parser, lacp_parser, rtsp_parser, mysql_parser, postgresql_parser, tds_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). `fuzz_http2_continuation_reassembly.c` is a second, separate HTTP/2 harness targeting specifically the stateful, multi-delivery `http2_dissect_with_flow_state()` path (mid-frame CONTINUATION splits across TCP boundaries) that the first one doesn't reach at all. `fuzz_sctp_parser.c` explicitly registers both `dpi_m3ua_parser.c` and `dpi_m2ua_parser.c` so SCTP's internal PPID-keyed recursion is genuinely exercised for both real inner protocols, not silently a no-op — a lesson learned directly from `fuzz_80211_parser.c`'s own registration gap being found and fixed earlier in this project, and followed through on a second time once M2UA actually existed (this harness's own comment had explicitly flagged that follow-up as needed). `fuzz_stp_parser.c`, `fuzz_appletalk_parser.c`, `fuzz_cdp_parser.c`, `fuzz_eapol_parser.c`, and `fuzz_lacp_parser.c` all target their link-layer dissectors' entry points directly rather than through the normal registry dispatch, since none of them are reached via port/content matching — `fuzz_stp_parser.c` additionally fuzzes the declared-length field independently of the buffer size, the exact mismatch a real precision bug was caught over during that dissector's own verification, and `fuzz_lacp_parser.c` targets the TLV walk where a similar real bug (an off-by-2 length constant) was caught and fixed during LACP's own verification. DECnet and Banyan VINES have no dedicated fuzz harnesses — both are deliberately detection-only with no parsing logic beyond a length check, so there's nothing meaningful to fuzz. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
+| `fuzz_*.c` (76 harnesses: rfc_parser, tcp_reassembly, radius, gtp, dns, quic_header, quic_frames, ipv6, http1, http2, http2_continuation, ssh, dhcp, sip_rtp, hpack_decoder, icmp, smtp, arp, mqtt, ntp, snmp, stun, modbus, dnp3, vlan_parser, gre_parser, mpls_parser, ospf_parser, bgp_parser, ldap_parser, ftp_parser, igmp_parser, rip_parser, ssdp_parser, syslog_parser, mdns_parser, esp_parser, hsrp_parser, 6in4_parser, isakmp_parser, ldp_parser, eigrp_parser, s7comm_parser, telnet_parser, ah_parser, netbios_parser, pop3_parser, msnp_parser, smb1_parser, 80211_parser, lldp_parser, kerberos_parser, l2tpv3_parser, whois_parser, tftp_parser, wol_parser, ipv4_fragmentation, http2_continuation_reassembly, wow_parser, bt_dht_parser, sctp_parser, m3ua_parser, amqp_parser, stp_parser, m2ua_parser, pim_parser, appletalk_parser, pppoe_parser, cdp_parser, eapol_parser, lacp_parser, rtsp_parser, mysql_parser, postgresql_parser, tds_parser, serialnumberd_parser) | libFuzzer harnesses for every dissector added so far. QUIC gets two harnesses split at its crypto boundary (see `FUZZING.md` for why). `fuzz_hpack_decoder.c` targets the HPACK decoder directly — the highest-risk new component in this project, worth prioritizing. `fuzz_http2_continuation.c` is a dedicated, structure-aware harness (constructs real multi-frame sequences from fuzz input rather than relying on generic byte fuzzing to stumble into valid structure). `fuzz_http2_continuation_reassembly.c` is a second, separate HTTP/2 harness targeting specifically the stateful, multi-delivery `http2_dissect_with_flow_state()` path (mid-frame CONTINUATION splits across TCP boundaries) that the first one doesn't reach at all. `fuzz_sctp_parser.c` explicitly registers both `dpi_m3ua_parser.c` and `dpi_m2ua_parser.c` so SCTP's internal PPID-keyed recursion is genuinely exercised for both real inner protocols, not silently a no-op — a lesson learned directly from `fuzz_80211_parser.c`'s own registration gap being found and fixed earlier in this project, and followed through on a second time once M2UA actually existed (this harness's own comment had explicitly flagged that follow-up as needed). `fuzz_stp_parser.c`, `fuzz_appletalk_parser.c`, `fuzz_cdp_parser.c`, `fuzz_eapol_parser.c`, and `fuzz_lacp_parser.c` all target their link-layer dissectors' entry points directly rather than through the normal registry dispatch, since none of them are reached via port/content matching — `fuzz_stp_parser.c` additionally fuzzes the declared-length field independently of the buffer size, the exact mismatch a real precision bug was caught over during that dissector's own verification, and `fuzz_lacp_parser.c` targets the TLV walk where a similar real bug (an off-by-2 length constant) was caught and fixed during LACP's own verification. DECnet and Banyan VINES have no dedicated fuzz harnesses — both are deliberately detection-only with no parsing logic beyond a length check, so there's nothing meaningful to fuzz. Reviewed but **not compiled or run** — no clang/libFuzzer toolchain available in this sandbox. | See `fuzz_build.sh` |
 | `fuzz_build.sh` | Build commands for all five harnesses (libFuzzer + ASan/UBSan), plus an AFL++ alternative note. Not executed here. | clang, libssl-dev |
 | `fuzz_seeds/` | A small, hand-verified seed corpus per harness — chosen to represent the cases that matter (e.g. the TCP reassembly seeds specifically cover in-order, benign-overlap, and conflicting-overlap cases), not just arbitrary valid packets. | none |
 | `FUZZING.md` | Methodology (especially the QUIC crypto-boundary split), runtime/coverage expectations, and a crash triage checklist. | none |
@@ -1745,13 +1746,48 @@ valuable real packets (a real VLAN+IPv6 RIPng frame, a real
 VLAN+PPPoE frame, a real VLAN-tagged gratuitous ARP, three real Modbus
 requests, and the real maximum-length DNS query) were added to the
 fuzz seed corpora as genuinely superior ground truth compared to
-synthetic seeds — **287 seed files total now** (7 from VLAN/Modbus/DNS
+synthetic seeds — **288 seed files total now** (7 from VLAN/Modbus/DNS
 validation, plus 6 for GRE: 4 real — inner-IPv4, inner-IPv6, ERSPAN,
 keepalive — and 2 synthetic edge cases — GRE-in-GRE nesting and an
 all-flags-set header — since real traffic didn't happen to include
 those bounded/adversarial cases).
 
-## What a real compiler found: missing link libraries and a widespread strncpy bug
+## Bringing the live-capture path (DPDK worker) up to parity with offline analysis
+
+STP, AppleTalk, CDP, EAPOL, LACP, PPPoE, DECnet, Banyan VINES, and PIM
+were all built and verified against the offline pcap-file path
+(`dpi_secure_bootstrap.c`) first, with the live-capture path
+(`dpi_dpdk_worker.c`) deliberately scoped out at the time — a real,
+stated boundary, not silently incomplete. This closes that gap: all 9
+are now wired into `dissect_packet()` (the DPDK worker's Ethernet-
+frame entry point), mirroring `dispatch_by_ethertype()`'s logic
+exactly.
+
+**A real architectural tension, addressed explicitly rather than
+glossed over.** This project had already documented a deliberate move
+away from hot-path `printf()` in the DPDK worker, in favor of a
+lock-free per-lcore ring buffer (`dpi_async_output.c`) — direct
+`printf()` on a 100G, multi-core packet path is a genuine performance
+hazard. Reusing these 9 dissectors' existing `printf()`-based
+functions unchanged in the DPDK worker looks, at a glance, like
+walking that decision back. It isn't: every one of these 9 protocols
+is fundamentally low-frequency, control-plane or discovery-plane
+traffic — STP Hello BPDUs roughly every 2 seconds, CDP advertisements
+roughly every 60, LACP PDUs at most a few per second, EAPOL/PPPoE/
+DECnet/VINES only during connection setup (not per data packet), PIM
+Hellos on a similar multi-second cadence — categorically different
+traffic volume from the regular per-packet TCP/UDP data path that
+motivated the ring buffer in the first place. Threading all 9
+protocols' own field sets into `struct flow_log_record` (which has no
+slots for BPDU timers, LACP state flags, CDP TLVs, and so on) would
+be real, substantial additional work for protocols whose volume was
+never the actual performance concern — so `printf()` is kept for
+these 9 specifically, with the reasoning stated directly in both this
+file and a code comment at the point of inclusion in
+`dpi_dpdk_worker.c` itself, rather than silently reusing it without
+acknowledging the tension.
+
+
 
 This project finally got run through a real compiler and linker, and
 it's worth documenting what that surfaced precisely — this is the
@@ -1894,22 +1930,38 @@ already done elsewhere in this project.
 | **AppleTalk** (SNAP, Apple OUI) | Real frames in `Paging_Request.pcap` | **Done** — see `dpi_appletalk_parser.c`; both real frames decode to an internally coherent RTMP broadcast, including a real dispatch-routing bug caught and fixed while wiring this in |
 | Cisco SNAP protocol (OUI Cisco, PID 0x010b) | Real frames in `Paging_Request.pcap` | Not done — low priority, and uncertain: OUI identifiable, exact sub-protocol not confidently named from what's available; same discipline as not guessing at Bearer QoS's bit layout without the spec text. The one item remaining on this roadmap, deliberately left undone rather than guessed at. |
 
-**Roadmap status: complete, with two deliberate exceptions.** SCTP,
-M3UA, M2UA, AMQP, the DHCP option breadth extension, LLMNR, STP, PIM,
-AppleTalk, PPPoE, CDP, EAPOL, LACP, RTSP, MySQL, PostgreSQL, TDS, NTP
-extension fields, DECnet, and Banyan VINES are all done (the last two
-deliberately detection-only, stated honestly — see their own table
-entries above). The Cisco SNAP protocol and IrDA remain unbuilt. Cisco
-SNAP — not from lack of time, but because this project doesn't have
-confident, verified knowledge of its exact sub-protocol format, and
-won't guess at wire-level structure the way it has consistently
-declined to elsewhere (DNP3's field layout, IEEE 802.3br's mPacket
-SMD values, MTP2/MTP3 content inside M2UA/M3UA's own Protocol Data
-parameters). IrDA — a genuinely different case: it's an infrared
-physical-layer protocol, not something that shows up as capturable
-Ethernet/IP traffic in a pcap the way every other protocol in this
-project does, so there's no meaningful "dissector" to build for it at
-all in this engine's architecture, not a gap in coverage.
+**Roadmap status: complete, with two deliberate exceptions, plus one
+protocol found through this project's own pcap survey rather than a
+predetermined list.** SCTP, M3UA, M2UA, AMQP, the DHCP option breadth
+extension, LLMNR, STP, PIM, AppleTalk, PPPoE, CDP, EAPOL, LACP, RTSP,
+MySQL, PostgreSQL, TDS, NTP extension fields, DECnet, Banyan VINES,
+and — found by systematically checking every capture in this
+project's working set for a TCP/UDP port with real traffic and no
+matching dissector — Apple's `serialnumberd` are all done (DECnet and
+Banyan VINES deliberately detection-only, stated honestly — see their
+own table entries above). The flow-record correlation envelope
+(`flow_id`/`ts_start`/`ts_last`/`bytes_total`/`packets_total`/
+`duration_ms`) has also been confirmed to apply to AMQP, MySQL,
+PostgreSQL, TDS, RTSP, SIP, MQTT, and FTP automatically, since they
+all route through the same generic TCP/UDP dispatch the envelope is
+built on — a real naming inconsistency was caught and fixed in the
+process (PostgreSQL's fields used a `pg_` prefix while its registered
+name is "PostgreSQL", which would have nested its nonstandard fields
+under `"pg"` instead of `"postgresql"`; fixed by renaming the fields
+for consistency with the other 7). And the live-capture path (DPDK
+worker) has been brought up to parity with the offline path — see the
+dedicated section above. The Cisco SNAP protocol and IrDA remain
+unbuilt. Cisco SNAP — not from lack of time, but because this project
+doesn't have confident, verified knowledge of its exact sub-protocol
+format, and won't guess at wire-level structure the way it has
+consistently declined to elsewhere (DNP3's field layout, IEEE
+802.3br's mPacket SMD values, MTP2/MTP3 content inside M2UA/M3UA's
+own Protocol Data parameters). IrDA — a genuinely different case:
+it's an infrared physical-layer protocol, not something that shows up
+as capturable Ethernet/IP traffic in a pcap the way every other
+protocol in this project does, so there's no meaningful "dissector"
+to build for it at all in this engine's architecture, not a gap in
+coverage.
 
 ## Suggested next steps, roughly in priority order
 

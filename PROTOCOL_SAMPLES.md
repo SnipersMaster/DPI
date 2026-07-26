@@ -15,14 +15,14 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 95 samples: 62 `protocols.ini` entries, the baseline
+complete one. 104 samples: 63 `protocols.ini` entries, the baseline
 flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
 (folded into ARP, same dissector), LLMNR (folded into DNS, same
 dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet, and
 Banyan VINES (all standalone, detected via 802.3 LLC framing or real
 EtherTypes rather than `protocols.ini`-gated port/content matching),
-and — added on direct request — the real flow-record-
-wrapped envelope (`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
+and the real flow-record-wrapped envelope
+(`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
 `packets_total`/`duration_ms`, all genuinely computed fields, not
 placeholders) shown for the baseline case plus 5 core application
 protocols (DNS, HTTP/1.1 — now including a bounded body preview,
@@ -190,6 +190,114 @@ own comment on why an unreliable body boundary is never guessed at):
  "message_subject":"Quarterly report",
  "message_date":"Wed, 24 Jul 2026 10:00:00 -0700",
  "message_body_begins":"true"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**AMQP** (TCP; real Basic.Publish fields from this project's own Celery-traffic
+verification):
+```json
+{"flow_id":"1a2b3c4d-0009","ts_start":"2026-07-25T14:22:15.000000Z",
+ "ts_last":"2026-07-25T14:22:15.032000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.40","src_port":51560,"dst_port":5672,
+ "protocol":"TCP","l7_protocol":"AMQP","l7_confidence":"high",
+ "bytes_total":410,"packets_total":3,"duration_ms":32,
+ "amqp":{"frame_type":"METHOD","channel":"1","method":"Basic.Publish",
+ "exchange":"celeryev","routing_key":"worker.heartbeat"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**MySQL** (TCP; real Initial Handshake fields, verified against the
+mysql-proxy project's own documented example):
+```json
+{"flow_id":"1a2b3c4d-0010","ts_start":"2026-07-25T14:22:16.000000Z",
+ "ts_last":"2026-07-25T14:22:16.008000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.60","src_port":51580,"dst_port":3306,
+ "protocol":"TCP","l7_protocol":"MySQL","l7_confidence":"high",
+ "bytes_total":58,"packets_total":1,"duration_ms":8,
+ "mysql":{"packet_length":"54","sequence_id":"0","protocol_version":"10",
+ "server_version":"5.5.2-m2","connection_id":"82","capability_flags_lower":"0xffff"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**PostgreSQL** (TCP; real StartupMessage fields, verified against a real
+example from the PostgreSQL mailing list archives):
+```json
+{"flow_id":"1a2b3c4d-0011","ts_start":"2026-07-25T14:22:17.000000Z",
+ "ts_last":"2026-07-25T14:22:17.006000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.80","src_port":51600,"dst_port":5432,
+ "protocol":"TCP","l7_protocol":"PostgreSQL","l7_confidence":"high",
+ "bytes_total":42,"packets_total":1,"duration_ms":6,
+ "postgresql":{"message_length":"38","message_type":"StartupMessage",
+ "protocol_version":"3.0","user":"postgres","database":"maach"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**TDS** (TCP; real PRELOGIN response fields — the encoded server version
+decoded to exactly "12.00.2000", matching the original real example's own
+stated value):
+```json
+{"flow_id":"1a2b3c4d-0012","ts_start":"2026-07-25T14:22:18.000000Z",
+ "ts_last":"2026-07-25T14:22:18.005000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.100","src_port":51620,"dst_port":1433,
+ "protocol":"TCP","l7_protocol":"TDS","l7_confidence":"high",
+ "bytes_total":20,"packets_total":1,"duration_ms":5,
+ "tds":{"type":"Tabular_Result","eom":"true","length":"20","spid":"0",
+ "packet_id":"1","prelogin_server_version":"12.00.2000"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**RTSP** (TCP):
+```json
+{"flow_id":"1a2b3c4d-0013","ts_start":"2026-07-25T14:22:19.000000Z",
+ "ts_last":"2026-07-25T14:22:19.014000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.120","src_port":51640,"dst_port":554,
+ "protocol":"TCP","l7_protocol":"RTSP","l7_confidence":"high",
+ "bytes_total":84,"packets_total":2,"duration_ms":14,
+ "rtsp":{"is_response":"false","first_line":"DESCRIBE rtsp://example.com/media.mp4 RTSP/1.0",
+ "method":"DESCRIBE","url":"rtsp://example.com/media.mp4","cseq":"1"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**SIP** (UDP — SIP's own dissector accepts both transports; this shows the
+more common UDP signaling case, so it's wrapped by the generic UDP flow
+path rather than TCP's):
+```json
+{"flow_id":"1a2b3c4d-0014","ts_start":"2026-07-25T14:22:20.000000Z",
+ "ts_last":"2026-07-25T14:22:20.210000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.140","src_port":5060,"dst_port":5060,
+ "protocol":"UDP","l7_protocol":"SIP","l7_confidence":"high",
+ "bytes_total":572,"packets_total":2,"duration_ms":210,
+ "sip":{"is_response":"false","first_line":"INVITE sip:bob@example.com SIP/2.0"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**MQTT** (TCP):
+```json
+{"flow_id":"1a2b3c4d-0015","ts_start":"2026-07-25T14:22:21.000000Z",
+ "ts_last":"2026-07-25T14:22:21.180000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.160","src_port":51660,"dst_port":1883,
+ "protocol":"TCP","l7_protocol":"MQTT","l7_confidence":"high",
+ "bytes_total":220,"packets_total":4,"duration_ms":180,
+ "mqtt":{"message_type":"CONNECT","protocol_level":"4"},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "flags":[]}
+```
+
+**FTP** (TCP, control channel):
+```json
+{"flow_id":"1a2b3c4d-0016","ts_start":"2026-07-25T14:22:22.000000Z",
+ "ts_last":"2026-07-25T14:22:22.320000Z","src_ip":"10.0.4.17",
+ "dst_ip":"10.0.5.180","src_port":51680,"dst_port":21,
+ "protocol":"TCP","l7_protocol":"FTP","l7_confidence":"high",
+ "bytes_total":96,"packets_total":4,"duration_ms":320,
+ "ftp":{"is_response":"false","command":"USER"},
  "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
  "flags":[]}
 ```
@@ -528,6 +636,14 @@ README for why):
 ```json
 {"protocol":"BanyanVINES","vines_subtype":"IP","vines_length":"38",
  "note":"detected via EtherType only; VIP header not decoded"}
+```
+
+**serialnumberd** (Apple Mac OS X Server — a real query found via this
+project's own pcap survey, cross-verified against the Nmap probe database):
+```json
+{"protocol":"serialnumberd","serialnumberd_message_type":"SNQUERY",
+ "serialnumberd_hostname":"domex.nps.edu","serialnumberd_token":"yWQBLA",
+ "serialnumberd_suffix":"xsvr"}
 ```
 
 **RADIUS**:

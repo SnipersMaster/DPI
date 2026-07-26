@@ -93,19 +93,19 @@ static void postgresql_dissect(const uint8_t *payload, uint16_t len,
 
     char buf[16];
     snprintf(buf, sizeof(buf), "%u", msg_len);
-    dissect_result_add(out, "pg_message_length", buf);
+    dissect_result_add(out, "postgresql_message_length", buf);
 
     if (major == 1234) {
         const char *req_name = minor == 5679 ? "SSLRequest" :
                                 minor == 5678 ? "CancelRequest" :
                                 minor == 5680 ? "GSSAPIRequest" : "UnknownSpecialRequest";
-        dissect_result_add(out, "pg_message_type", req_name);
+        dissect_result_add(out, "postgresql_message_type", req_name);
         return;
     }
 
-    dissect_result_add(out, "pg_message_type", "StartupMessage");
+    dissect_result_add(out, "postgresql_message_type", "StartupMessage");
     snprintf(buf, sizeof(buf), "%u.%u", major, minor);
-    dissect_result_add(out, "pg_protocol_version", buf);
+    dissect_result_add(out, "postgresql_protocol_version", buf);
 
     size_t pos = PG_STARTUP_HDR_LEN;
     int n_params = 0;
@@ -133,9 +133,9 @@ static void postgresql_dissect(const uint8_t *payload, uint16_t len,
         value[vn] = '\0';
 
         if (strcmp(name, "user") == 0) {
-            dissect_result_add(out, "pg_user", value);
+            dissect_result_add(out, "postgresql_user", value);
         } else if (strcmp(name, "database") == 0) {
-            dissect_result_add(out, "pg_database", value);
+            dissect_result_add(out, "postgresql_database", value);
         }
 
         n_params++;
