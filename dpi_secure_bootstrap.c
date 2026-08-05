@@ -182,6 +182,9 @@
 #include "dpi_amqp_parser.c"
 #include "dpi_m2ua_parser.c"
 #include "dpi_pim_parser.c"
+#include "dpi_macsec_parser.c"
+#include "dpi_homeplugav_parser.c"
+#include "dpi_ethloopback_parser.c"
 #include "dpi_rtsp_parser.c"
 #include "dpi_mysql_parser.c"
 #include "dpi_postgresql_parser.c"
@@ -1213,6 +1216,21 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
     if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
         vines_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len,
                                          ethertype);
+        return;
+    }
+
+    if (ethertype == 0x88E5) {
+        macsec_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x88E1) {
+        homeplugav_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x9000) {
+        ethloopback_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
         return;
     }
 

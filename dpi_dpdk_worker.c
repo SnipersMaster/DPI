@@ -217,6 +217,9 @@
 #include "dpi_decnet_parser.c"
 #include "dpi_vines_parser.c"
 #include "dpi_pim_parser.c"
+#include "dpi_macsec_parser.c"
+#include "dpi_homeplugav_parser.c"
+#include "dpi_ethloopback_parser.c"
 
 #define RX_RING_SIZE      4096
 #define TX_RING_SIZE      1024
@@ -398,6 +401,24 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 
     if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
         vines_dissect_ethertype_payload(ip_start, ip_len, ethertype);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x88E5) {
+        macsec_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x88E1) {
+        homeplugav_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x9000) {
+        ethloopback_dissect_ethertype_payload(ip_start, ip_len);
         rte_pktmbuf_free(m);
         return;
     }

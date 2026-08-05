@@ -15,13 +15,14 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 104 samples: 63 `protocols.ini` entries, the baseline
+complete one. 107 samples: 63 `protocols.ini` entries, the baseline
 flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
 (folded into ARP, same dissector), LLMNR (folded into DNS, same
-dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet, and
-Banyan VINES (all standalone, detected via 802.3 LLC framing or real
-EtherTypes rather than `protocols.ini`-gated port/content matching),
-and the real flow-record-wrapped envelope
+dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet,
+Banyan VINES, MACsec, HomePlug AV, and Ethernet Loopback (all
+standalone, detected via 802.3 LLC framing or real EtherTypes rather
+than `protocols.ini`-gated port/content matching), and the real
+flow-record-wrapped envelope
 (`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
 `packets_total`/`duration_ms`, all genuinely computed fields, not
 placeholders) shown for the baseline case plus 5 core application
@@ -644,6 +645,31 @@ project's own pcap survey, cross-verified against the Nmap probe database):
 {"protocol":"serialnumberd","serialnumberd_message_type":"SNQUERY",
  "serialnumberd_hostname":"domex.nps.edu","serialnumberd_token":"yWQBLA",
  "serialnumberd_suffix":"xsvr"}
+```
+
+**MACsec** (a real SecTAG — found via a second, EtherType-focused survey
+pass; the Secure Channel Identifier's MAC component is a genuine, real
+VMware-registered OUI, independently confirming the byte offsets):
+```json
+{"protocol":"MACsec","macsec_version":"false","macsec_end_station":"false",
+ "macsec_sci_present":"true","macsec_single_copy_broadcast":"false",
+ "macsec_encrypted":"true","macsec_changed_text":"true",
+ "macsec_association_number":"0","macsec_short_length":"0",
+ "macsec_packet_number":"16","macsec_sci":"00:0c:29:55:9b:4b/1"}
+```
+
+**HomePlug AV** (a real management-frame header — the decoded OUI is
+Intellon Corporation's own genuine, historically-registered OUI):
+```json
+{"protocol":"HomePlugAV","homeplugav_mm_version":"0",
+ "homeplugav_mm_type":"0x68a0","homeplugav_oui":"00:b0:52"}
+```
+
+**Ethernet Loopback** (deliberately detection-only — no formal spec exists
+for this protocol at all, a different situation from DECnet/Banyan VINES):
+```json
+{"protocol":"EthernetLoopback","loopback_length":"60",
+ "note":"detected via EtherType 0x9000 only; no formal spec exists to decode a payload structure against"}
 ```
 
 **RADIUS**:
