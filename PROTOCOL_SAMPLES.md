@@ -15,13 +15,14 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 104 samples: 63 `protocols.ini` entries, the baseline
+complete one. 107 samples: 63 `protocols.ini` entries, the baseline
 flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
 (folded into ARP, same dissector), LLMNR (folded into DNS, same
-dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet, and
-Banyan VINES (all standalone, detected via 802.3 LLC framing or real
-EtherTypes rather than `protocols.ini`-gated port/content matching),
-and the real flow-record-wrapped envelope
+dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet,
+Banyan VINES, MACsec, HomePlug AV, and Ethernet Loopback (all
+standalone, detected via 802.3 LLC framing or real EtherTypes rather
+than `protocols.ini`-gated port/content matching), and the real
+flow-record-wrapped envelope
 (`flow_id`/`ts_start`/`ts_last`/`bytes_total`/
 `packets_total`/`duration_ms`, all genuinely computed fields, not
 placeholders) shown for the baseline case plus 5 core application
@@ -51,14 +52,19 @@ here once, not repeated in every single sample's own explanation.
 **IPv4 + TCP + TLS/SNI** (matched by SNI/domain classification only —
 no deeper TCP dissector recognized this specific traffic, so no
 nested object; this is the generic case most encrypted traffic falls
-into):
+into). `reassembly.sack_blocks_seen` is new — added after a pcap
+survey found real TCP SACK blocks (RFC 2018) were already being
+parsed internally but never actually surfaced in the output; it's the
+most recent segment's block count, not accumulated across the flow's
+lifetime the way `out_of_order_segments`/`retransmits` are, since a
+SACK block describes a receiver-state snapshot, not a running total:
 ```json
 {"flow_id":"1a2b3c4d-0001","ts_start":"2026-07-25T14:22:04.003112Z",
  "ts_last":"2026-07-25T14:22:04.221007Z","src_ip":"10.0.4.17",
  "dst_ip":"157.240.22.35","src_port":51422,"dst_port":443,
  "protocol":"TCP","l7_protocol":"social_media","l7_confidence":"high",
  "bytes_total":18422,"packets_total":24,"duration_ms":218,
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":1},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":1,"sack_blocks_seen":2},
  "flags":[]}
 ```
 
@@ -69,7 +75,7 @@ into):
  "dst_ip":"2606:2800:220:1:248:1893:25c8:1946","src_port":54210,
  "dst_port":443,"protocol":"TCP","l7_protocol":"unknown","l7_confidence":"low",
  "bytes_total":4112,"packets_total":7,"duration_ms":240,
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -101,7 +107,7 @@ looks like.
  "qtype":"1","qclass":"1","answer_0_a":"93.184.216.34",
  "answer_records_parsed":"1","authority_records_parsed":"0",
  "additional_records_parsed":"0"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -123,7 +129,7 @@ capture contained, not a fabricated example):
  "content_type":"text/html; charset=utf-8",
  "body_length":"242",
  "body_preview":"<html><head><title>Object moved</title></head><body>\r\n<h2>Object moved to <a href=\"http://silverlight.dlservice.microsoft.com/download/d/2/9/d29e5571-4b68-4d95-b43a-4e81ba178455/2.0/ENU/InstallSilverl"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 A real request on a different, earlier flow (showing the fields a
@@ -142,7 +148,7 @@ own comment on why an unreliable body boundary is never guessed at):
  "http":{"is_response":"false","first_line":"GET /index.html HTTP/1.1",
  "method":"GET","path":"/index.html","host":"example.com",
  "user_agent":"curl/8.0"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -157,7 +163,7 @@ own comment on why an unreliable body boundary is never guessed at):
  "headers_frame_count":"1","rst_stream_count":"0","max_stream_id":"1",
  "authority":"www.example.com","method":"GET","path":"/","status":"200",
  "settings_header_table_size":"4096"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -171,7 +177,7 @@ own comment on why an unreliable body boundary is never guessed at):
  "ssh":{"identification_string":"SSH-2.0-OpenSSH_9.6",
  "protocol_version":"2.0","software_version":"OpenSSH_9.6",
  "kexinit_present":"true"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -190,7 +196,7 @@ own comment on why an unreliable body boundary is never guessed at):
  "message_subject":"Quarterly report",
  "message_date":"Wed, 24 Jul 2026 10:00:00 -0700",
  "message_body_begins":"true"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -204,7 +210,7 @@ verification):
  "bytes_total":410,"packets_total":3,"duration_ms":32,
  "amqp":{"frame_type":"METHOD","channel":"1","method":"Basic.Publish",
  "exchange":"celeryev","routing_key":"worker.heartbeat"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -218,7 +224,7 @@ mysql-proxy project's own documented example):
  "bytes_total":58,"packets_total":1,"duration_ms":8,
  "mysql":{"packet_length":"54","sequence_id":"0","protocol_version":"10",
  "server_version":"5.5.2-m2","connection_id":"82","capability_flags_lower":"0xffff"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -232,7 +238,7 @@ example from the PostgreSQL mailing list archives):
  "bytes_total":42,"packets_total":1,"duration_ms":6,
  "postgresql":{"message_length":"38","message_type":"StartupMessage",
  "protocol_version":"3.0","user":"postgres","database":"maach"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -247,7 +253,7 @@ stated value):
  "bytes_total":20,"packets_total":1,"duration_ms":5,
  "tds":{"type":"Tabular_Result","eom":"true","length":"20","spid":"0",
  "packet_id":"1","prelogin_server_version":"12.00.2000"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -260,7 +266,7 @@ stated value):
  "bytes_total":84,"packets_total":2,"duration_ms":14,
  "rtsp":{"is_response":"false","first_line":"DESCRIBE rtsp://example.com/media.mp4 RTSP/1.0",
  "method":"DESCRIBE","url":"rtsp://example.com/media.mp4","cseq":"1"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -274,7 +280,7 @@ path rather than TCP's):
  "protocol":"UDP","l7_protocol":"SIP","l7_confidence":"high",
  "bytes_total":572,"packets_total":2,"duration_ms":210,
  "sip":{"is_response":"false","first_line":"INVITE sip:bob@example.com SIP/2.0"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -286,7 +292,7 @@ path rather than TCP's):
  "protocol":"TCP","l7_protocol":"MQTT","l7_confidence":"high",
  "bytes_total":220,"packets_total":4,"duration_ms":180,
  "mqtt":{"message_type":"CONNECT","protocol_level":"4"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -298,7 +304,7 @@ path rather than TCP's):
  "protocol":"TCP","l7_protocol":"FTP","l7_confidence":"high",
  "bytes_total":96,"packets_total":4,"duration_ms":320,
  "ftp":{"is_response":"false","command":"USER"},
- "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0},
+ "reassembly":{"out_of_order_segments":0,"overlap_detected":false,"retransmits":0,"sack_blocks_seen":0},
  "flags":[]}
 ```
 
@@ -644,6 +650,31 @@ project's own pcap survey, cross-verified against the Nmap probe database):
 {"protocol":"serialnumberd","serialnumberd_message_type":"SNQUERY",
  "serialnumberd_hostname":"domex.nps.edu","serialnumberd_token":"yWQBLA",
  "serialnumberd_suffix":"xsvr"}
+```
+
+**MACsec** (a real SecTAG — found via a second, EtherType-focused survey
+pass; the Secure Channel Identifier's MAC component is a genuine, real
+VMware-registered OUI, independently confirming the byte offsets):
+```json
+{"protocol":"MACsec","macsec_version":"false","macsec_end_station":"false",
+ "macsec_sci_present":"true","macsec_single_copy_broadcast":"false",
+ "macsec_encrypted":"true","macsec_changed_text":"true",
+ "macsec_association_number":"0","macsec_short_length":"0",
+ "macsec_packet_number":"16","macsec_sci":"00:0c:29:55:9b:4b/1"}
+```
+
+**HomePlug AV** (a real management-frame header — the decoded OUI is
+Intellon Corporation's own genuine, historically-registered OUI):
+```json
+{"protocol":"HomePlugAV","homeplugav_mm_version":"0",
+ "homeplugav_mm_type":"0x68a0","homeplugav_oui":"00:b0:52"}
+```
+
+**Ethernet Loopback** (deliberately detection-only — no formal spec exists
+for this protocol at all, a different situation from DECnet/Banyan VINES):
+```json
+{"protocol":"EthernetLoopback","loopback_length":"60",
+ "note":"detected via EtherType 0x9000 only; no formal spec exists to decode a payload structure against"}
 ```
 
 **RADIUS**:

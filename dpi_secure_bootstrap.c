@@ -182,6 +182,9 @@
 #include "dpi_amqp_parser.c"
 #include "dpi_m2ua_parser.c"
 #include "dpi_pim_parser.c"
+#include "dpi_macsec_parser.c"
+#include "dpi_homeplugav_parser.c"
+#include "dpi_ethloopback_parser.c"
 #include "dpi_rtsp_parser.c"
 #include "dpi_mysql_parser.c"
 #include "dpi_postgresql_parser.c"
@@ -1015,6 +1018,7 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
                                         tcp_matched ? &tcp_out : NULL);
                     flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
                         stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+                    flow_record_set_sack_blocks(fr, tcp_result.options.n_sack_blocks);
                     flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
                         classification.vpn_protocol, classification.dot_score, classification.doh_score);
                 }
@@ -1030,6 +1034,7 @@ static void dissect_ipv6_packet(const uint8_t *ip_start, uint16_t ip_len) {
             flow_record_set_l7(fr, effective_category, effective_confidence, NULL);
             flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
                 stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+            flow_record_set_sack_blocks(fr, tcp_result.options.n_sack_blocks);
             flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
                 classification.vpn_protocol, classification.dot_score, classification.doh_score);
         }
@@ -1213,6 +1218,21 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
     if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
         vines_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len,
                                          ethertype);
+        return;
+    }
+
+    if (ethertype == 0x88E5) {
+        macsec_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x88E1) {
+        homeplugav_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x9000) {
+        ethloopback_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
         return;
     }
 
@@ -1530,6 +1550,7 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
                             tcp_matched ? &tcp_out : NULL);
         flow_record_set_evasion_stats(fr, stats.out_of_order_segments,
             stats.retransmit_count, stats.overlap_conflict_count, stats.evasion_flag);
+        flow_record_set_sack_blocks(fr, tcp_result.options.n_sack_blocks);
         flow_record_set_scores(fr, classification.dga_score, classification.vpn_score,
             classification.vpn_protocol, classification.dot_score, classification.doh_score);
     }

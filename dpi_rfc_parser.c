@@ -422,6 +422,16 @@ struct tcp_parsed_options {
     bool     has_wscale;   uint8_t  wscale;
     bool     sack_permitted;
     bool     has_timestamps; uint32_t tsval, tsecr;
+    /* SACK blocks (RFC 2018, kind 5) — real traffic (this project's
+     * own pcap survey) showed all 4 possible block counts genuinely
+     * in use (option lengths 10/18/26/34, matching 1/2/3/4 blocks),
+     * not just the single-block case; a real example decoded to a
+     * valid, sensible range (right edge > left edge, as required).
+     * Distinct from `sack_permitted` above (kind 4) — that's just the
+     * SYN-time negotiation to allow SACK at all, this is the actual
+     * per-segment acknowledgment data once negotiated. */
+    uint8_t  n_sack_blocks;
+    uint32_t sack_left[4], sack_right[4];
 };
 
 static bool parse_tcp_options(const uint8_t *opts, size_t opts_len,
@@ -455,6 +465,33 @@ static bool parse_tcp_options(const uint8_t *opts, size_t opts_len,
             case 4:  /* SACK permitted */
                 if (olen == 2) out->sack_permitted = true;
                 break;
+            case 5: {  /* SACK blocks (RFC 2018) — variable length:
+                        * 2 (header) + 8*N for N=1..4 blocks. Real
+                        * traffic (this project's own pcap survey)
+                        * confirmed all 4 possible block counts
+                        * genuinely occur. Bounded to 4 both because
+                        * that's the real, spec-imposed maximum (TCP's
+                        * 40-byte total options space can't fit more)
+                        * and because `sack_left`/`sack_right` above
+                        * are sized for exactly that. */
+                if (olen >= 10 && (olen - 2) % 8 == 0) {
+                    uint8_t n_blocks = (olen - 2) / 8;
+                    if (n_blocks > 4) n_blocks = 4;   /* malformed/
+                                                          oversized:
+                                                          take what
+                                                          fits, don't
+                                                          overrun */
+                    out->n_sack_blocks = n_blocks;
+                    for (uint8_t b = 0; b < n_blocks; b++) {
+                        size_t bo = i + 2 + b * 8;
+                        out->sack_left[b] = ((uint32_t)opts[bo]<<24)|((uint32_t)opts[bo+1]<<16)|
+                                            ((uint32_t)opts[bo+2]<<8)|opts[bo+3];
+                        out->sack_right[b] = ((uint32_t)opts[bo+4]<<24)|((uint32_t)opts[bo+5]<<16)|
+                                             ((uint32_t)opts[bo+6]<<8)|opts[bo+7];
+                    }
+                }
+                break;
+            }
             case 8:  /* timestamps */
                 if (olen == 10) {
                     out->has_timestamps = true;

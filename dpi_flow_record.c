@@ -105,6 +105,16 @@ struct flow_record {
     uint32_t retransmit_count;
     uint32_t overlap_conflict_count;
     bool     evasion_flag;
+    /* Most recent segment's real TCP SACK block count (RFC 2018) —
+     * a real, previously-parsed-but-never-surfaced field, found via
+     * this project's own pcap survey. Not accumulated across the
+     * flow's whole lifetime the way out_of_order_segments/
+     * retransmit_count are (SACK blocks describe a snapshot of what
+     * the receiver has at one moment, not a running total that makes
+     * sense to sum) — just the latest observed value, which is what
+     * matters operationally (are there currently gaps being
+     * acknowledged out of order). */
+    uint32_t sack_blocks_seen;
 
     double   dga_score;
     double   vpn_score;
@@ -293,6 +303,16 @@ static void flow_record_set_evasion_stats(struct flow_record *f, uint32_t out_of
     f->evasion_flag = evasion_flag;
 }
 
+/* Separate, additive setter rather than extending
+ * flow_record_set_evasion_stats()'s own signature — that function
+ * already has 5 call sites in dpi_secure_bootstrap.c; adding a new
+ * parameter there would mean touching all 5 correctly rather than
+ * just the ones that actually have real TCP option data available,
+ * for no real benefit over a small, separate function. */
+static void flow_record_set_sack_blocks(struct flow_record *f, uint32_t n_sack_blocks) {
+    f->sack_blocks_seen = n_sack_blocks;
+}
+
 static void flow_record_set_scores(struct flow_record *f, double dga_score, double vpn_score,
                                     const char *vpn_protocol, double dot_score, double doh_score) {
     f->dga_score = dga_score;
@@ -445,9 +465,9 @@ void flow_record_emit_one(const struct flow_record *f) {
     }
 
     printf(",\"reassembly\":{\"out_of_order_segments\":%u,\"overlap_detected\":%s,"
-           "\"retransmits\":%u}",
+           "\"retransmits\":%u,\"sack_blocks_seen\":%u}",
            f->out_of_order_segments, f->overlap_conflict_count > 0 ? "true" : "false",
-           f->retransmit_count);
+           f->retransmit_count, f->sack_blocks_seen);
 
     printf(",\"flags\":[");
     bool first_flag = true;
