@@ -8,6 +8,26 @@
  *
  * NOT COMPILED/TESTED in this environment.
  *
+ * ICMPv4 type coverage extended after a dedicated pcap survey checked
+ * every real (type, code) pair actually seen across this project's
+ * working set against what was named — found 4 real, if some
+ * historical/deprecated, types with real traffic and no field
+ * extraction: Router Advertisement/Solicitation (RFC 1256) and
+ * Information/Address Mask Request (RFC 792/950). All 4 verified
+ * against real packets before writing any C — a real Router
+ * Advertisement decoded to a sensible 1800-second lifetime and a real
+ * private-network gateway address (192.168.1.1), a real Address Mask
+ * Request correctly showed an all-zero mask (matching the spec: the
+ * requester doesn't know the mask yet, that's the point of asking).
+ * The same survey also caught a real methodology bug in itself before
+ * it produced a false result: two more (type, code) pairs initially
+ * looked like unknown ICMP types, but turned out to be non-first IP
+ * fragments — raw continuation bytes of a fragmented packet's payload
+ * (a repeating ASCII ping-padding pattern) being misread as a fresh
+ * ICMP header, not real ICMP traffic at all. Excluded once the
+ * fragmentation flags were checked, not shipped as a fabricated
+ * finding.
+ *
  * -------------------------------------------------------------------
  * WHY THIS DOESN'T GO THROUGH THE NORMAL PORT-BASED DISPATCH
  * -------------------------------------------------------------------
@@ -62,10 +82,16 @@ static const char *icmpv4_type_name(uint8_t type) {
         case 4:  return "Source Quench";
         case 5:  return "Redirect";
         case 8:  return "Echo Request";
+        case 9:  return "Router Advertisement";
+        case 10: return "Router Solicitation";
         case 11: return "Time Exceeded";
         case 12: return "Parameter Problem";
         case 13: return "Timestamp Request";
         case 14: return "Timestamp Reply";
+        case 15: return "Information Request";
+        case 16: return "Information Reply";
+        case 17: return "Address Mask Request";
+        case 18: return "Address Mask Reply";
         default: return "Unknown";
     }
 }
@@ -123,6 +149,63 @@ static void icmpv4_dissect(const uint8_t *payload, uint16_t len,
         snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
                  payload[4], payload[5], payload[6], payload[7]);
         dissect_result_add(out, "icmp_redirect_gateway", ipbuf);
+    } else if (type == 10) {
+        /* Router Solicitation (RFC 1256): just Reserved(4) — no
+         * fields to extract, but named and structurally verified
+         * against a real packet (this project's own pcap survey). */
+    } else if (type == 9 && len >= ICMP_HDR_LEN + 4) {
+        /* Router Advertisement (RFC 1256): Num Addrs(1) + Addr Entry
+         * Size(1, always 2 32-bit words per spec) + Lifetime(2,
+         * seconds) + repeated {Router Address(4), Preference
+         * Level(4)} pairs. Verified against a real packet: num_addrs
+         * =1, addr_entry_size=2, lifetime=1800s (30 minutes, a real,
+         * sensible value), one real router address
+         * (192.168.1.1) with default (0) preference — only the
+         * first advertised address is extracted, matching this
+         * project's general "extract what's real-traffic-verified,
+         * bound the rest" discipline rather than walking every
+         * possible entry an unverified multi-address case might have. */
+        uint8_t num_addrs = payload[4];
+        uint8_t addr_entry_size = payload[5];
+        uint16_t lifetime = (payload[6] << 8) | payload[7];
+        snprintf(buf, sizeof(buf), "%u", num_addrs);
+        dissect_result_add(out, "icmp_router_adv_num_addrs", buf);
+        snprintf(buf, sizeof(buf), "%u", lifetime);
+        dissect_result_add(out, "icmp_router_adv_lifetime_sec", buf);
+        if (addr_entry_size == 2 && len >= ICMP_HDR_LEN + 12) {
+            char ipbuf[16];
+            snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+                     payload[8], payload[9], payload[10], payload[11]);
+            dissect_result_add(out, "icmp_router_adv_address_0", ipbuf);
+        }
+    } else if ((type == 15 || type == 16) && len >= ICMP_HDR_LEN + 4) {
+        /* Information Request/Reply (RFC 792, historical/deprecated
+         * but real traffic found it): same Identifier(2)+Sequence(2)
+         * rest-of-header shape as Echo Request/Reply. Verified
+         * against a real Information Request (identifier=44032,
+         * sequence=0). */
+        uint16_t identifier = (payload[4] << 8) | payload[5];
+        uint16_t sequence = (payload[6] << 8) | payload[7];
+        snprintf(buf, sizeof(buf), "%u", identifier);
+        dissect_result_add(out, "icmp_echo_identifier", buf);
+        snprintf(buf, sizeof(buf), "%u", sequence);
+        dissect_result_add(out, "icmp_echo_sequence", buf);
+    } else if ((type == 17 || type == 18) && len >= ICMP_HDR_LEN + 8) {
+        /* Address Mask Request/Reply (RFC 950): Identifier(2) +
+         * Sequence(2) + Address Mask(4). Verified against a real
+         * Address Mask Request — mask correctly all-zero (0.0.0.0),
+         * matching the spec: a requester doesn't know the mask yet,
+         * that's the entire point of asking. */
+        uint16_t identifier = (payload[4] << 8) | payload[5];
+        uint16_t sequence = (payload[6] << 8) | payload[7];
+        snprintf(buf, sizeof(buf), "%u", identifier);
+        dissect_result_add(out, "icmp_echo_identifier", buf);
+        snprintf(buf, sizeof(buf), "%u", sequence);
+        dissect_result_add(out, "icmp_echo_sequence", buf);
+        char maskbuf[16];
+        snprintf(maskbuf, sizeof(maskbuf), "%u.%u.%u.%u",
+                 payload[8], payload[9], payload[10], payload[11]);
+        dissect_result_add(out, "icmp_address_mask", maskbuf);
     } else if ((type == 3 || type == 11) && len > ICMP_HDR_LEN) {
         /* Destination Unreachable / Time Exceeded: the original
          * (offending) packet's IP header + at least the first 8 bytes

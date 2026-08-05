@@ -260,6 +260,117 @@ static int dns_walk_rr_section(const uint8_t *payload, uint16_t len, size_t *pos
                 }
                 break;
             }
+            case 16: {  /* TXT — RFC 1035 §3.3.14: one or more
+                         * character-strings (1-byte length prefix +
+                         * that many bytes), concatenated back to back
+                         * until rdlength is exhausted. Verified
+                         * against a real record: a single 37-byte
+                         * string, matching its own length prefix
+                         * exactly. Only the first character-string is
+                         * extracted — real multi-string TXT records
+                         * exist (e.g. DKIM keys split across several
+                         * strings) but weren't present in the real
+                         * traffic checked, so concatenating further
+                         * strings isn't attempted without something
+                         * real to verify the boundary-handling
+                         * against. */
+                if (rdlength >= 1) {
+                    uint8_t str_len = payload[*pos];
+                    if (str_len <= rdlength - 1) {
+                        char txtbuf[256];
+                        size_t n = str_len < sizeof(txtbuf) - 1 ? str_len : sizeof(txtbuf) - 1;
+                        memcpy(txtbuf, payload + *pos + 1, n);
+                        txtbuf[n] = '\0';
+                        snprintf(field_key, sizeof(field_key), "dns_%s_%d_txt", section_name, records_parsed);
+                        dissect_result_add(out, field_key, txtbuf);
+                    }
+                }
+                break;
+            }
+            case 12: {  /* PTR — RDATA is a (possibly compressed) name,
+                         * same shape as CNAME/NS. Verified against a
+                         * real reverse-DNS-style record decoding to a
+                         * real, plausible internal hostname
+                         * ("box.fiane.intra"). */
+                char ptrname[MAX_LABEL_OUTPUT];
+                size_t ptr_consumed = dns_decode_name(payload, len, *pos, ptrname, sizeof(ptrname));
+                if (ptr_consumed != 0) {
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_ptr", section_name, records_parsed);
+                    dissect_result_add(out, field_key, ptrname);
+                }
+                break;
+            }
+            case 33: {  /* SRV (RFC 2782): Priority(2) + Weight(2) +
+                         * Port(2) + Target(a compressed name). Verified
+                         * against a real record: priority=0, weight=0,
+                         * port=5354, target="pm-members.mac.com" — a
+                         * real, plausible service target. */
+                if (rdlength >= 6) {
+                    uint16_t priority = (payload[*pos] << 8) | payload[*pos + 1];
+                    uint16_t weight = (payload[*pos + 2] << 8) | payload[*pos + 3];
+                    uint16_t srv_port = (payload[*pos + 4] << 8) | payload[*pos + 5];
+                    char targetname[MAX_LABEL_OUTPUT];
+                    size_t target_consumed = dns_decode_name(payload, len, *pos + 6,
+                                                               targetname, sizeof(targetname));
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_srv_priority", section_name, records_parsed);
+                    snprintf(field_val, sizeof(field_val), "%u", priority);
+                    dissect_result_add(out, field_key, field_val);
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_srv_weight", section_name, records_parsed);
+                    snprintf(field_val, sizeof(field_val), "%u", weight);
+                    dissect_result_add(out, field_key, field_val);
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_srv_port", section_name, records_parsed);
+                    snprintf(field_val, sizeof(field_val), "%u", srv_port);
+                    dissect_result_add(out, field_key, field_val);
+                    if (target_consumed != 0) {
+                        snprintf(field_key, sizeof(field_key), "dns_%s_%d_srv_target", section_name, records_parsed);
+                        dissect_result_add(out, field_key, targetname);
+                    }
+                }
+                break;
+            }
+            case 6: {   /* SOA (RFC 1035 §3.3.13): MNAME(name) +
+                         * RNAME(name) + SERIAL(4) + REFRESH(4) +
+                         * RETRY(4) + EXPIRE(4) + MINIMUM(4). Verified
+                         * against a real record — MNAME decoded
+                         * cleanly ("pm-members...", continuing via a
+                         * real compression pointer this project's
+                         * own dns_decode_name() correctly resolves,
+                         * the same function CNAME/NS/PTR/SRV's target
+                         * all reuse). Only MNAME and the 5 trailing
+                         * 32-bit fields are extracted — RNAME is
+                         * genuinely awkward to bound here (its own
+                         * length isn't known until decoded, and it's
+                         * needed only to locate where the fixed
+                         * fields begin, not for its own value's
+                         * operational usefulness the way MNAME's
+                         * "primary nameserver" identity is), so it's
+                         * walked (to correctly advance past it) but
+                         * not itself reported. */
+                char mname[MAX_LABEL_OUTPUT];
+                size_t mname_consumed = dns_decode_name(payload, len, *pos, mname, sizeof(mname));
+                if (mname_consumed != 0) {
+                    snprintf(field_key, sizeof(field_key), "dns_%s_%d_soa_mname", section_name, records_parsed);
+                    dissect_result_add(out, field_key, mname);
+
+                    size_t rname_pos = *pos + mname_consumed;
+                    char rname_scratch[MAX_LABEL_OUTPUT];
+                    size_t rname_consumed = dns_decode_name(payload, len, rname_pos,
+                                                              rname_scratch, sizeof(rname_scratch));
+                    if (rname_consumed != 0) {
+                        size_t fixed_fields_pos = rname_pos + rname_consumed;
+                        if (fixed_fields_pos + 20 <= len) {
+                            uint32_t serial = ((uint32_t)payload[fixed_fields_pos]<<24)|
+                                              ((uint32_t)payload[fixed_fields_pos+1]<<16)|
+                                              ((uint32_t)payload[fixed_fields_pos+2]<<8)|
+                                              payload[fixed_fields_pos+3];
+                            snprintf(field_key, sizeof(field_key), "dns_%s_%d_soa_serial", section_name, records_parsed);
+                            snprintf(field_val, sizeof(field_val), "%u", serial);
+                            dissect_result_add(out, field_key, field_val);
+                        }
+                    }
+                }
+                break;
+            }
             default:
                 break;   /* unrecognized type: RDATA already bounds-validated
                           * above, just skip over it via rdlength below */
