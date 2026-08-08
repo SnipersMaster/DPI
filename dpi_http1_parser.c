@@ -188,7 +188,18 @@ static void http1_dissect(const uint8_t *payload, uint16_t len,
             bodybuf[n] = '\0';
             dissect_result_add(out, "http_body_preview", bodybuf);
 
-            char lenbuf[16];
+            char lenbuf[24];   /* sized for any size_t value (up to 20
+                                   digits on a 64-bit size_t) + NUL,
+                                   not just the realistic range this
+                                   value actually takes — a real
+                                   compiler warning (-Wformat-
+                                   truncation) caught the previous
+                                   16-byte buffer being provably too
+                                   small for what %zu can print,
+                                   even though body_len itself can't
+                                   actually reach that range in
+                                   practice (derived from a uint16_t
+                                   packet length) */
             snprintf(lenbuf, sizeof(lenbuf), "%zu", body_len);
             dissect_result_add(out, "http_body_length", lenbuf);
         }

@@ -149,6 +149,18 @@ static void tds_dissect(const uint8_t *payload, uint16_t len,
         uint16_t offset = (body[pos+1] << 8) | body[pos+2];
         uint16_t tok_len = (body[pos+3] << 8) | body[pos+4];
 
+        /* Every token's name is reported generically — real, if
+         * previously unused, code: this function existed but was
+         * never actually called anywhere, a real bug a compiler
+         * warning caught (-Wunused-function). Fixed by wiring it in
+         * properly rather than just silencing the warning; naming
+         * every token seen is a genuine improvement to the output,
+         * not just warning suppression. */
+        const char *token_name = tds_prelogin_token_name(token);
+        char key[40];
+        snprintf(key, sizeof(key), "tds_prelogin_token_%d_name", n_tokens);
+        dissect_result_add(out, key, token_name ? token_name : "unknown");
+
         if (token == 0x00 /* VERSION */ && tok_len >= 4 && offset + 4 <= body_len) {
             const uint8_t *v = body + offset;
             char verbuf[24];
