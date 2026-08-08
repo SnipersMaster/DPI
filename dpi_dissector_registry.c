@@ -297,6 +297,8 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "postgresql", "PostgreSQL" },
     { "tds", "TDS" },
     { "serialnumberd", "serialnumberd" },
+    { "openvpn", "OpenVPN" },
+    { "xmpp", "XMPP" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -463,6 +465,8 @@ static void register_all_dissectors(void) {
     extern void register_postgresql_dissector(void);
     extern void register_tds_dissector(void);
     extern void register_serialnumberd_dissector(void);
+    extern void register_openvpn_dissector(void);
+    extern void register_xmpp_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -535,6 +539,8 @@ static void register_all_dissectors(void) {
     register_postgresql_dissector();
     register_tds_dissector();
     register_serialnumberd_dissector();
+    register_openvpn_dissector();
+    register_xmpp_dissector();
 
     apply_protocol_config_to_registry();
 

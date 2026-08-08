@@ -15,9 +15,10 @@ real message types actually seen on the wire).
 This file exists as a single, complete reference — the README's own
 "Sample JSON output" section predates roughly 30 of the protocols
 below and was never fully caught up; this file is the current,
-complete one. 107 samples: 63 `protocols.ini` entries, the baseline
-flow record, 802.11 (standalone, not `protocols.ini`-gated), RARP
-(folded into ARP, same dissector), LLMNR (folded into DNS, same
+complete one. 110 samples: 65 `protocols.ini` entries (including
+OpenVPN and XMPP, both found via this project's own pcap survey), the
+baseline flow record, 802.11 (standalone, not `protocols.ini`-gated),
+RARP (folded into ARP, same dissector), LLMNR (folded into DNS, same
 dissector), STP/RSTP, AppleTalk, PPPoE, CDP, EAPOL, LACP, DECnet,
 Banyan VINES, MACsec, HomePlug AV, and Ethernet Loopback (all
 standalone, detected via 802.3 LLC framing or real EtherTypes rather
@@ -675,6 +676,23 @@ for this protocol at all, a different situation from DECnet/Banyan VINES):
 ```json
 {"protocol":"EthernetLoopback","loopback_length":"60",
  "note":"detected via EtherType 0x9000 only; no formal spec exists to decode a payload structure against"}
+```
+
+**OpenVPN** (found via a fifth pcap survey pass — a real P_DATA_V1 packet,
+1,778 real occurrences; opcode/key_id cross-verified against 4 independent
+sources including the Wireshark project's own dissector source):
+```json
+{"protocol":"OpenVPN","openvpn_opcode":"P_DATA_V1","openvpn_key_id":"0"}
+```
+
+**XMPP** (found via the same pass — a real client stream-open addressed to
+Gmail's XMPP service, and the real server's response):
+```json
+{"protocol":"XMPP","xmpp_stream_to":"gmail.com","xmpp_is_response":"false"}
+```
+Server response:
+```json
+{"protocol":"XMPP","xmpp_stream_from":"gmail.com","xmpp_is_response":"true"}
 ```
 
 **RADIUS**:
