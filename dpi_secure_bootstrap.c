@@ -190,6 +190,8 @@
 #include "dpi_postgresql_parser.c"
 #include "dpi_tds_parser.c"
 #include "dpi_serialnumberd_parser.c"
+#include "dpi_openvpn_parser.c"
+#include "dpi_xmpp_parser.c"
 #include "dpi_stp_parser.c"
 #include "dpi_appletalk_parser.c"
 #include "dpi_pppoe_parser.c"
