@@ -299,6 +299,9 @@ static const struct protocol_key_name_pair g_protocol_key_names[] = {
     { "serialnumberd", "serialnumberd" },
     { "openvpn", "OpenVPN" },
     { "xmpp", "XMPP" },
+    { "socks4", "SOCKS4" },
+    { "socks5", "SOCKS5" },
+    { "vxlan", "VXLAN" },
 };
 #define N_PROTOCOL_KEY_NAMES (sizeof(g_protocol_key_names) / sizeof(g_protocol_key_names[0]))
 
@@ -467,6 +470,9 @@ static void register_all_dissectors(void) {
     extern void register_serialnumberd_dissector(void);
     extern void register_openvpn_dissector(void);
     extern void register_xmpp_dissector(void);
+    extern void register_socks4_dissector(void);
+    extern void register_socks5_dissector(void);
+    extern void register_vxlan_dissector(void);
 
     /* Every dissector is now registered UNCONDITIONALLY — this is the
      * change that makes runtime toggling possible at all. An earlier
@@ -541,6 +547,9 @@ static void register_all_dissectors(void) {
     register_serialnumberd_dissector();
     register_openvpn_dissector();
     register_xmpp_dissector();
+    register_socks4_dissector();
+    register_socks5_dissector();
+    register_vxlan_dissector();
 
     apply_protocol_config_to_registry();
 
