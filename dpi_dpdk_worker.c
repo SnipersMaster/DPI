@@ -37,7 +37,15 @@
  *
  * Build (once DPDK is installed and pkg-config sees it):
  *   gcc -O3 -march=native $(pkg-config --cflags libdpdk) \
- *       -o dpi_dpdk_worker dpi_dpdk_worker.c $(pkg-config --libs libdpdk)
+ *       -o dpi_dpdk_worker dpi_dpdk_worker.c $(pkg-config --libs libdpdk) \
+ *       -lssl -lcrypto -lm
+ * (-lssl/-lcrypto: dpi_quic_parser.c's QUIC decryption; -lm: log2()
+ * in DGA entropy scoring, pulled in transitively through the same
+ * shared dissector files the offline path uses — a real, previously
+ * undocumented gap here specifically, caught only when a real
+ * compiler's linker actually failed on it, the exact same flags this
+ * project's offline build has documented since the first time a real
+ * compiler was run against it.)
  *
  * Run as the unprivileged service account, not root:
  *   sudo -u dpi-svc ./dpi_dpdk_worker -l 0-7 -n 4 -- -p 0x1
@@ -168,6 +176,16 @@
 #include "dpi_postgresql_parser.c"
 #include "dpi_tds_parser.c"
 #include "dpi_serialnumberd_parser.c"
+#include "dpi_openvpn_parser.c"
+#include "dpi_xmpp_parser.c"
+#include "dpi_socks4_parser.c"
+#include "dpi_socks5_parser.c"
+#include "dpi_vxlan_parser.c"
+#include "dpi_pptp_parser.c"
+#include "dpi_teredo_parser.c"
+#include "dpi_nsh_parser.c"
+#include "dpi_dhcp6_parser.c"
+#include "dpi_geneve_parser.c"
 #include "dpi_m2ua_parser.c"
 #include "dpi_bgp_parser.c"
 #include "dpi_ldap_parser.c"
@@ -217,6 +235,9 @@
 #include "dpi_decnet_parser.c"
 #include "dpi_vines_parser.c"
 #include "dpi_pim_parser.c"
+#include "dpi_macsec_parser.c"
+#include "dpi_homeplugav_parser.c"
+#include "dpi_ethloopback_parser.c"
 
 #define RX_RING_SIZE      4096
 #define TX_RING_SIZE      1024
@@ -398,6 +419,30 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
 
     if (ethertype == 0x0BAD || ethertype == 0x0BAE || ethertype == 0x0BAF) {
         vines_dissect_ethertype_payload(ip_start, ip_len, ethertype);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x88E5) {
+        macsec_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x88E1) {
+        homeplugav_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x9000) {
+        ethloopback_dissect_ethertype_payload(ip_start, ip_len);
+        rte_pktmbuf_free(m);
+        return;
+    }
+
+    if (ethertype == 0x894F) {
+        nsh_dissect_ethertype_payload(ip_start, ip_len);
         rte_pktmbuf_free(m);
         return;
     }

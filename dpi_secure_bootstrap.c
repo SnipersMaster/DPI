@@ -192,6 +192,14 @@
 #include "dpi_serialnumberd_parser.c"
 #include "dpi_openvpn_parser.c"
 #include "dpi_xmpp_parser.c"
+#include "dpi_socks4_parser.c"
+#include "dpi_socks5_parser.c"
+#include "dpi_vxlan_parser.c"
+#include "dpi_pptp_parser.c"
+#include "dpi_teredo_parser.c"
+#include "dpi_nsh_parser.c"
+#include "dpi_dhcp6_parser.c"
+#include "dpi_geneve_parser.c"
 #include "dpi_stp_parser.c"
 #include "dpi_appletalk_parser.c"
 #include "dpi_pppoe_parser.c"
@@ -1235,6 +1243,11 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
 
     if (ethertype == 0x9000) {
         ethloopback_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
+        return;
+    }
+
+    if (ethertype == 0x894F) {
+        nsh_dissect_ethertype_payload((const uint8_t *)payload, (uint16_t)payload_len);
         return;
     }
 
