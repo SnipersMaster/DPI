@@ -36,10 +36,22 @@
  * and the three most useful ones decoded as text (Service-Name,
  * AC-Name, Host-Uniq — all UTF-8/opaque per spec, not further
  * structured); other TAG types are named only. For Session-stage
- * packets, only the PPP Protocol field is identified (against RFC
- * 1661's well-known, stable values — IP, LCP, PAP, CHAP); the actual
- * PPP payload itself is not decoded further — a deeper layer this
- * project doesn't attempt without real traffic to verify against.
+ * packets, the PPP Protocol field is identified against the full
+ * table this project has verified (including LQR and both Van
+ * Jacobson compression variants, added after cross-checking against
+ * NetBSD's own real `ppp_defs.h` source code). When the field
+ * indicates LCP, IPCP, or IPv6CP specifically, their shared Code+
+ * Identifier+Length outer packet format (confirmed directly by RFC
+ * 1661's own diagram, and reused by IPCP/IPv6CP without redefinition
+ * per RFC 1332) is decoded too. Configuration-option contents within
+ * that packet (MRU, Authentication-Protocol, IP-Address, and so on —
+ * each option has its own distinct internal layout) are not decoded
+ * — real, substantial additional work this project has no real PPP
+ * traffic to verify any specific option's byte-exact layout against.
+ * The actual PPP payload (IP/IPv6 packets, or LQR/VJC's own bodies
+ * once negotiated) is likewise not decoded further — a deeper layer
+ * this project doesn't attempt without real traffic to verify
+ * against.
  */
 
 #include <stdint.h>
@@ -68,12 +80,41 @@ static const char *ppp_protocol_name(uint16_t proto) {
     switch (proto) {
         case 0x0021: return "IP";
         case 0x0057: return "IPv6";
+        case 0x002D: return "VJ-Compressed-TCP";    /* RFC 1332, confirmed
+                                                         against NetBSD's own
+                                                         ppp_defs.h source */
+        case 0x002F: return "VJ-Uncompressed-TCP";
         case 0xC021: return "LCP";   /* Link Control Protocol */
         case 0xC023: return "PAP";   /* Password Authentication Protocol */
         case 0xC223: return "CHAP";  /* Challenge Handshake Authentication Protocol */
+        case 0xC025: return "LQR";   /* Link Quality Report, RFC 1989 */
         case 0x8021: return "IPCP";  /* IP Control Protocol */
         case 0x8057: return "IPv6CP";
         default:      return "Unknown";
+    }
+}
+
+/* LCP (RFC 1661), IPCP (RFC 1332), and IPv6CP all share the same
+ * outer packet format — Code(1) + Identifier(1) + Length(2) + Data —
+ * confirmed directly by RFC 1661's own diagram. Named per LCP's own
+ * code table (RFC 1661 §5); IPCP/IPv6CP reuse the same code space for
+ * their own Configure-Request/Ack/Nak/Reject and
+ * Terminate-Request/Ack (they don't define new codes of their own),
+ * so the same name table applies to all three protocols. */
+static const char *ppp_lcp_code_name(uint8_t code) {
+    switch (code) {
+        case 1: return "Configure-Request";
+        case 2: return "Configure-Ack";
+        case 3: return "Configure-Nak";
+        case 4: return "Configure-Reject";
+        case 5: return "Terminate-Request";
+        case 6: return "Terminate-Ack";
+        case 7: return "Code-Reject";
+        case 8: return "Protocol-Reject";   /* LCP-specific */
+        case 9: return "Echo-Request";      /* LCP-specific */
+        case 10: return "Echo-Reply";       /* LCP-specific */
+        case 11: return "Discard-Request";  /* LCP-specific */
+        default:  return "Unknown";
     }
 }
 
@@ -156,6 +197,22 @@ static void pppoe_dissect_ethertype_payload(const uint8_t *payload, uint16_t len
             uint16_t ppp_proto = (body[0] << 8) | body[1];
             written += snprintf(buf + written, sizeof(buf) - written,
                                  ",\"pppoe_ppp_protocol\":\"%s\"", ppp_protocol_name(ppp_proto));
+
+            /* LCP/IPCP/IPv6CP all share the same Code+Identifier+
+             * Length outer format, confirmed by RFC 1661's own
+             * diagram — decoded generically for all three rather
+             * than duplicated per protocol, see ppp_lcp_code_name()'s
+             * own comment for why this is valid across all three. */
+            if ((ppp_proto == 0xC021 || ppp_proto == 0x8021 || ppp_proto == 0x8057) &&
+                body_len >= 6) {
+                uint8_t code = body[2];
+                uint8_t identifier = body[3];
+                uint16_t pkt_len = (body[4] << 8) | body[5];
+                written += snprintf(buf + written, sizeof(buf) - written,
+                                     ",\"pppoe_ppp_code\":\"%s\",\"pppoe_ppp_identifier\":\"%u\","
+                                     "\"pppoe_ppp_length\":\"%u\"",
+                                     ppp_lcp_code_name(code), identifier, pkt_len);
+            }
         }
     }
 
