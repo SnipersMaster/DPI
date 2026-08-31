@@ -183,6 +183,7 @@
 #include "dpi_vxlan_parser.c"
 #include "dpi_pptp_parser.c"
 #include "dpi_teredo_parser.c"
+#include "dpi_mobileip_parser.c"
 #include "dpi_nsh_parser.c"
 #include "dpi_dhcp6_parser.c"
 #include "dpi_geneve_parser.c"
@@ -227,8 +228,14 @@
  * without acknowledging the tension with the comment two paragraphs
  * up. */
 #include "dpi_stp_parser.c"
+#include "dpi_isl_parser.c"
+#include "dpi_garp_parser.c"
+#include "dpi_ipxsap_parser.c"
+#include "dpi_ipx_parser.c"
 #include "dpi_appletalk_parser.c"
 #include "dpi_cdp_parser.c"
+#include "dpi_cgmp_parser.c"
+#include "dpi_dtp_parser.c"
 #include "dpi_eapol_parser.c"
 #include "dpi_lacp_parser.c"
 #include "dpi_pppoe_parser.c"
@@ -338,6 +345,22 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
         return;
     }
 
+    /* ISL check happens here, before any standard header extraction —
+     * mirroring dpi_secure_bootstrap.c's own parse_ethernet_frame()
+     * wiring exactly, see dpi_isl_parser.c's own header comment for
+     * why this is the only structurally correct place. The 8-byte
+     * check itself (5-byte DA prefix + 3-byte AAAA03 constant) is
+     * small and branch-predictable — a bounded per-packet cost, not
+     * the unbounded hot-path printf() concern this file's own
+     * comments discuss elsewhere; ISL's own output uses printf()
+     * directly (matching STP/CDP/etc.'s established reasoning) since
+     * it's a low-frequency, largely legacy protocol in modern
+     * networks even where it does still appear. */
+    if (isl_dissect_raw_frame(rte_pktmbuf_mtod(m, const uint8_t *), len)) {
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t ethertype = rte_be_to_cpu_16(eth->ether_type);
     const uint8_t *ip_start = (const uint8_t *)(eth + 1);
@@ -378,9 +401,17 @@ static inline void dissect_packet(struct rte_mbuf *m, uint16_t queue_id) {
     if (ethertype < 0x0600) {
         if (ip_len >= 2 && ip_start[0] == 0x42 && ip_start[1] == 0x42) {
             stp_dissect_llc_payload(ip_start, ip_len, ethertype);
+            garp_dissect_llc_payload(ip_start, ip_len);
         } else if (ip_len >= 2 && ip_start[0] == 0xAA && ip_start[1] == 0xAA) {
             appletalk_dissect_snap_payload(ip_start, ip_len);
             cdp_dissect_snap_payload(ip_start, ip_len);
+            cgmp_dissect_snap_payload(ip_start, ip_len);
+            dtp_dissect_snap_payload(ip_start, ip_len);
+        } else {
+            /* IPX's own classic "raw 802.3" framing — no diagnostic
+             * on a miss, matching this hot-path's established design
+             * (see the comment below this block). */
+            ipx_dissect_raw_8023_payload(ip_start, ip_len);
         }
         /* Unlike the offline path, an unrecognized length-field frame
          * here is simply dropped without a diagnostic message — this
