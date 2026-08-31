@@ -197,13 +197,20 @@
 #include "dpi_vxlan_parser.c"
 #include "dpi_pptp_parser.c"
 #include "dpi_teredo_parser.c"
+#include "dpi_mobileip_parser.c"
 #include "dpi_nsh_parser.c"
 #include "dpi_dhcp6_parser.c"
 #include "dpi_geneve_parser.c"
 #include "dpi_stp_parser.c"
+#include "dpi_isl_parser.c"
+#include "dpi_garp_parser.c"
+#include "dpi_ipxsap_parser.c"
+#include "dpi_ipx_parser.c"
 #include "dpi_appletalk_parser.c"
 #include "dpi_pppoe_parser.c"
 #include "dpi_cdp_parser.c"
+#include "dpi_cgmp_parser.c"
+#include "dpi_dtp_parser.c"
 #include "dpi_eapol_parser.c"
 #include "dpi_lacp_parser.c"
 #include "dpi_decnet_parser.c"
@@ -1087,6 +1094,20 @@ static void parse_ethernet_frame(const unsigned char *buf, ssize_t len) {
         return;
     }
 
+    /* ISL check happens here, before any standard header extraction —
+     * see dpi_isl_parser.c's own header comment for why this is the
+     * only structurally correct place: ISL's own DA/SA/LEN fields
+     * occupy the same byte positions the code below is about to
+     * extract as a normal destination/source MAC and EtherType, so
+     * by the time dispatch_by_ethertype() would run, the information
+     * needed to recognize ISL has already been misinterpreted. */
+    if (isl_dissect_raw_frame((const uint8_t *)buf, len)) {
+        return;   /* the encapsulated inner frame is a real, separate
+                     Ethernet frame, but recursively re-entering this
+                     function from here is deliberately out of scope,
+                     see dpi_isl_parser.c's own file header */
+    }
+
     uint16_t ethertype = ntohs(*(const uint16_t *)(buf + 12));
     const unsigned char *payload = buf + ETH_HDR_LEN;
     ssize_t payload_len = len - ETH_HDR_LEN;
@@ -1172,7 +1193,13 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
      * verified, not after. */
     if (ethertype < 0x0600 && payload_len >= 0) {
         if (payload_len >= 2 && payload[0] == 0x42 && payload[1] == 0x42) {
+            /* STP and GVRP share this same DSAP/SSAP — told apart by
+             * their own Protocol Identifier field, each function
+             * checking and simply returning without effect if it's
+             * not theirs, the same "try, don't crash if it's not
+             * yours" pattern already used for the SNAP branch below. */
             stp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len, ethertype);
+            garp_dissect_llc_payload((const uint8_t *)payload, (uint16_t)payload_len);
         } else if (payload_len >= 2 && payload[0] == 0xAA && payload[1] == 0xAA) {
             /* Both AppleTalk and CDP use SNAP (DSAP=SSAP=0xAA) — told
              * apart by their own OUI+embedded-type fields inside the
@@ -1182,16 +1209,28 @@ static void dispatch_by_ethertype(uint16_t ethertype, const unsigned char *paylo
              * pattern used elsewhere in this dispatch. */
             appletalk_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
             cdp_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
+            cgmp_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
+            dtp_dissect_snap_payload((const uint8_t *)payload, (uint16_t)payload_len);
         } else {
-            /* Neither known LLC signature — could be raw/non-LLC 802.3
-             * framing (e.g. Novell's original IPX framing) or an LLC
-             * DSAP/SSAP pair this project doesn't recognize yet.
-             * Reported honestly rather than silently dropped. */
-            fprintf(stderr, "unrecognized 802.3 length-field frame (declared length %u, "
-                            "first bytes %02x %02x) — neither STP nor AppleTalk SNAP; "
-                            "possibly raw/non-LLC framing (e.g. legacy Novell IPX) not yet "
-                            "decoded, see dispatch_by_ethertype()'s own comment\n",
-                    ethertype, payload_len >= 1 ? payload[0] : 0, payload_len >= 2 ? payload[1] : 0);
+            /* Neither known LLC signature — try IPX's own classic
+             * "raw 802.3" framing next (no LLC header at all; the
+             * length field is followed directly by a 30-byte IPX
+             * header). This is exactly the case that motivated this
+             * whole fallback branch's existence — a real capture
+             * showed a length-field frame that matched neither STP
+             * nor AppleTalk/CDP, and IPX's own raw framing was the
+             * suspected explanation from the start. */
+            bool matched_ipx = ipx_dissect_raw_8023_payload((const uint8_t *)payload, (uint16_t)payload_len);
+            if (!matched_ipx) {
+                /* Still unrecognized — could be an LLC DSAP/SSAP pair
+                 * this project doesn't know, or a non-IPX raw framing.
+                 * Reported honestly rather than silently dropped. */
+                fprintf(stderr, "unrecognized 802.3 length-field frame (declared length %u, "
+                                "first bytes %02x %02x) — neither STP, AppleTalk/CDP SNAP, nor "
+                                "IPX's own raw-802.3 framing; not yet decoded, see "
+                                "dispatch_by_ethertype()'s own comment\n",
+                        ethertype, payload_len >= 1 ? payload[0] : 0, payload_len >= 2 ? payload[1] : 0);
+            }
         }
         return;
     }
