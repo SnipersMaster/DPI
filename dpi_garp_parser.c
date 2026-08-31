@@ -107,7 +107,7 @@ static bool garp_dissect_llc_payload(const uint8_t *llc, uint16_t llc_len) {
                             protocol_id);
 
     bool reported_first = false;
-    while (pos < garp_len) {
+    while (pos < garp_len && written < (int)sizeof(buf) - 128) {
         uint8_t msg_type = garp[pos];
         if (msg_type == 0x00) break;   /* End-of-PDU mark */
         pos++;
@@ -117,7 +117,7 @@ static bool garp_dissect_llc_payload(const uint8_t *llc, uint16_t llc_len) {
         }
 
         int n_attrs = 0;
-        while (pos < garp_len && n_attrs < GARP_MAX_ATTRS) {
+        while (pos < garp_len && n_attrs < GARP_MAX_ATTRS && written < (int)sizeof(buf) - 128) {
             uint8_t attr_len = garp[pos];
             if (attr_len == 0x00) { pos++; break; }   /* End-of-Attributes mark */
             if (attr_len < 2 || pos + attr_len > garp_len) break;
