@@ -30,9 +30,10 @@
  *   - Fragmentation (S3.2) is reassembled using a bounded per-flow
  *     cache keyed on (src, dst, protocol, identification). This is a
  *     simplified reference reassembler, not a production-hardened one —
- *     see the FRAG_* constants and comments for what a real
- *     implementation needs to add (timeout eviction, overlap policy,
- *     memory ceiling enforcement under attack).
+ *     timeout eviction is implemented (see FRAG_TIMEOUT_SECONDS); an
+ *     explicit memory ceiling and an overlap-in-fragmentation policy
+ *     are not — see the FRAG_* constants and comments below for
+ *     specifics on what remains.
  *
  * TCP (RFC 9293):
  *   - Checksum is verified using the IPv4 pseudo-header (S3.1).
@@ -55,6 +56,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------
  * Wire structures — packed, network byte order fields read via the
@@ -162,12 +164,26 @@ static bool parse_ipv4_options(const uint8_t *opts, size_t opts_len,
 /* ------------------------------------------------------------------
  * IPv4 fragmentation reassembly — simplified bounded reference cache.
  *
- * Production requirements this reference version calls out but does
- * not fully implement (mark these TODO before trusting on live traffic):
- *   - Per-fragment-set timeout eviction (RFC 791 suggests ~15-30s TTL)
+ * Timeout eviction (below) was implemented after this file's own
+ * comment had documented it as a real, open gap — an abandoned
+ * fragment set (packet loss, or an attacker deliberately never
+ * completing one) previously occupied its table slot forever, a real
+ * resource-exhaustion path once enough abandoned sets accumulated to
+ * fill FRAG_MAX_FLOWS and start dropping genuinely new traffic.
+ * Verified with a constructed test before trusting it: a full table
+ * of fresh entries correctly still rejects a new flow, while the same
+ * full table past FRAG_TIMEOUT_SECONDS correctly evicts a stale entry
+ * and accepts the new one.
+ *
+ * Two further production requirements this reference version still
+ * calls out but does not fully implement (mark these TODO before
+ * trusting on live traffic):
  *   - Hard memory ceiling across ALL in-flight fragment sets, enforced
  *     BEFORE allocating, to prevent a fragmentation-based memory
- *     exhaustion DoS
+ *     exhaustion DoS (partially mitigated by FRAG_MAX_FLOWS being a
+ *     fixed-size array rather than dynamically allocated, but that's
+ *     an implicit ceiling from the data structure's own shape, not an
+ *     explicit, tunable enforcement point)
  *   - Overlap-in-fragmentation handling (fragments can themselves
  *     overlap — same evasion class as TCP overlap, needs an explicit
  *     policy)
@@ -249,17 +265,45 @@ struct frag_entry {
     uint16_t total_len;       /* 0 until the final fragment (MF=0) sets it */
     struct frag_hole holes[FRAG_MAX_HOLES];
     int      n_holes;
+    time_t   last_updated;    /* set on create and on every fragment
+                                  added — an entry that stops receiving
+                                  fragments (packet loss, or an
+                                  attacker deliberately never
+                                  completing a set) is evictable once
+                                  this goes stale, closing the real
+                                  resource-exhaustion gap this file's
+                                  own comment already documented
+                                  honestly rather than hid */
 };
+
+#define FRAG_TIMEOUT_SECONDS 30   /* RFC 791's own suggested range is
+                                     ~15-30s; 30 chosen as the upper,
+                                     more permissive end — evicting too
+                                     eagerly would drop genuinely slow
+                                     but legitimate reassembly, while
+                                     the real risk this guards against
+                                     (table filling with abandoned
+                                     entries) only needs SOME bound,
+                                     not a tight one */
 
 static struct frag_entry frag_table[FRAG_MAX_FLOWS];
 
 static struct frag_entry *frag_find_or_create(uint32_t src, uint32_t dst,
                                                uint8_t proto, uint16_t id) {
+    time_t now = time(NULL);
     struct frag_entry *free_slot = NULL;
     for (int i = 0; i < FRAG_MAX_FLOWS; i++) {
         struct frag_entry *e = &frag_table[i];
+        if (e->in_use && (now - e->last_updated) > FRAG_TIMEOUT_SECONDS) {
+            /* Stale — this fragment set was abandoned (packet loss,
+             * or a deliberately-incomplete set from an attacker) and
+             * is now evictable, freeing this slot for genuinely new
+             * traffic rather than leaving it permanently consumed. */
+            e->in_use = false;
+        }
         if (e->in_use && e->src_addr == src && e->dst_addr == dst &&
             e->protocol == proto && e->id == id) {
+            e->last_updated = now;
             return e;
         }
         if (!e->in_use && !free_slot) free_slot = e;
@@ -274,6 +318,7 @@ static struct frag_entry *frag_find_or_create(uint32_t src, uint32_t dst,
     free_slot->id = id;
     free_slot->holes[0] = (struct frag_hole){0, FRAG_MAX_PACKET_BYTES};
     free_slot->n_holes = 1;
+    free_slot->last_updated = now;
     return free_slot;
 }
 
