@@ -28,12 +28,11 @@
  *     every step. Unknown option types are skipped by their declared
  *     length, never assumed.
  *   - Fragmentation (S3.2) is reassembled using a bounded per-flow
- *     cache keyed on (src, dst, protocol, identification). This is a
- *     simplified reference reassembler, not a production-hardened one —
- *     timeout eviction is implemented (see FRAG_TIMEOUT_SECONDS); an
- *     explicit memory ceiling and an overlap-in-fragmentation policy
- *     are not — see the FRAG_* constants and comments below for
- *     specifics on what remains.
+ *     cache keyed on (src, dst, protocol, identification). Timeout
+ *     eviction, a per-source quota, and an explicit first-wins
+ *     overlap policy are all implemented — see the FRAG_* constants
+ *     and comments below for the real gaps these closed and how each
+ *     was verified before being trusted.
  *
  * TCP (RFC 9293):
  *   - Checksum is verified using the IPv4 pseudo-header (S3.1).
@@ -164,29 +163,47 @@ static bool parse_ipv4_options(const uint8_t *opts, size_t opts_len,
 /* ------------------------------------------------------------------
  * IPv4 fragmentation reassembly — simplified bounded reference cache.
  *
- * Timeout eviction (below) was implemented after this file's own
- * comment had documented it as a real, open gap — an abandoned
- * fragment set (packet loss, or an attacker deliberately never
- * completing one) previously occupied its table slot forever, a real
- * resource-exhaustion path once enough abandoned sets accumulated to
- * fill FRAG_MAX_FLOWS and start dropping genuinely new traffic.
- * Verified with a constructed test before trusting it: a full table
- * of fresh entries correctly still rejects a new flow, while the same
- * full table past FRAG_TIMEOUT_SECONDS correctly evicts a stale entry
- * and accepts the new one.
+ * Three real, previously-documented gaps in this file's own comments
+ * are now all closed, each verified with a constructed simulation
+ * before being trusted rather than assumed correct from a read-
+ * through:
  *
- * Two further production requirements this reference version still
- * calls out but does not fully implement (mark these TODO before
- * trusting on live traffic):
- *   - Hard memory ceiling across ALL in-flight fragment sets, enforced
- *     BEFORE allocating, to prevent a fragmentation-based memory
- *     exhaustion DoS (partially mitigated by FRAG_MAX_FLOWS being a
- *     fixed-size array rather than dynamically allocated, but that's
- *     an implicit ceiling from the data structure's own shape, not an
- *     explicit, tunable enforcement point)
- *   - Overlap-in-fragmentation handling (fragments can themselves
- *     overlap — same evasion class as TCP overlap, needs an explicit
- *     policy)
+ *   1. Timeout eviction — an abandoned fragment set (packet loss, or
+ *      an attacker deliberately never completing one) previously
+ *      occupied its table slot forever. Fixed via FRAG_TIMEOUT_SECONDS
+ *      below; verified that a full table of fresh entries still
+ *      correctly rejects a new flow, while the same full table past
+ *      the timeout correctly evicts a stale entry and accepts the new
+ *      one.
+ *
+ *   2. Per-source quota — closing the rest of the original "memory
+ *      ceiling" gap: FRAG_MAX_FLOWS's fixed-size array already hard-
+ *      bounds TOTAL memory (a static 64MB, fixed at compile time), but
+ *      nothing previously stopped ONE source address from occupying
+ *      ALL slots and starving every other source. Fixed via
+ *      FRAG_MAX_PER_SOURCE below; verified an attacker capped at
+ *      exactly the quota while a legitimate source from elsewhere
+ *      still got served, and that the quota and timeout interact
+ *      correctly together (a source's stale entries become evictable
+ *      and free up its own quota again, not just the raw slot count).
+ *
+ *   3. Overlap-in-fragmentation policy — previously an unconditional
+ *      memcpy silently let a later, overlapping fragment overwrite an
+ *      earlier one's data (implicit, undocumented last-wins) — the
+ *      same evasion class this file's own TCP code already handles
+ *      deliberately. Fixed in frag_insert() below: an explicit,
+ *      documented first-wins policy, only writing into byte ranges
+ *      the current hole list still shows as genuinely uncovered.
+ *      Verified against both a constructed overlapping-fragment case
+ *      (confirming the first fragment's data survives a later,
+ *      overlapping write) and the normal sequential case (confirming
+ *      no regression against real, non-overlapping traffic).
+ *
+ * As with TCP's own overlap policy elsewhere in this file, first-wins
+ * is a CHOICE, not a neutral default — different real endpoints
+ * resolve fragment overlaps differently, and a DPI engine that
+ * doesn't match its protected hosts' actual OS can still be evaded
+ * via crafted overlaps either way.
  * ------------------------------------------------------------------ */
 #define FRAG_MAX_FLOWS        1024
 #define FRAG_MAX_PACKET_BYTES 65535
@@ -286,12 +303,41 @@ struct frag_entry {
                                      entries) only needs SOME bound,
                                      not a tight one */
 
+#define FRAG_MAX_PER_SOURCE 64   /* Explicit per-source-IP quota,
+                                     closing the remaining part of the
+                                     "memory ceiling" gap this file's
+                                     own comment had documented as
+                                     open: FRAG_MAX_FLOWS's fixed-size
+                                     array already hard-bounds TOTAL
+                                     memory (a static 64MB, fixed at
+                                     compile time — no dynamic growth
+                                     possible), but nothing previously
+                                     stopped ONE source address from
+                                     occupying ALL 1024 slots and
+                                     starving every OTHER source's
+                                     legitimate fragmented traffic
+                                     until the 30s timeout above
+                                     started freeing slots again. 64
+                                     is 1/16th of FRAG_MAX_FLOWS —
+                                     generous for any single real host
+                                     under normal conditions, while
+                                     still guaranteeing at least 15
+                                     other distinct sources can always
+                                     get a slot even if one source is
+                                     actively attacking. Verified with
+                                     a constructed simulation before
+                                     trusting it: an attacker capped at
+                                     exactly this quota, a legitimate
+                                     source from elsewhere still
+                                     served. */
+
 static struct frag_entry frag_table[FRAG_MAX_FLOWS];
 
 static struct frag_entry *frag_find_or_create(uint32_t src, uint32_t dst,
                                                uint8_t proto, uint16_t id) {
     time_t now = time(NULL);
     struct frag_entry *free_slot = NULL;
+    int src_count = 0;
     for (int i = 0; i < FRAG_MAX_FLOWS; i++) {
         struct frag_entry *e = &frag_table[i];
         if (e->in_use && (now - e->last_updated) > FRAG_TIMEOUT_SECONDS) {
@@ -306,9 +352,16 @@ static struct frag_entry *frag_find_or_create(uint32_t src, uint32_t dst,
             e->last_updated = now;
             return e;
         }
+        if (e->in_use && e->src_addr == src) src_count++;
         if (!e->in_use && !free_slot) free_slot = e;
     }
     if (!free_slot) return NULL;  /* table full: caller must drop the fragment */
+    if (src_count >= FRAG_MAX_PER_SOURCE) return NULL;   /* this source
+                                                              already has
+                                                              its fair
+                                                              share, see
+                                                              FRAG_MAX_PER_SOURCE's
+                                                              own comment */
 
     memset(free_slot, 0, sizeof(*free_slot));
     free_slot->in_use = true;
@@ -365,13 +418,39 @@ static bool frag_insert(struct frag_entry *e, uint16_t frag_off_bytes,
         return false;   /* would overflow the reassembly buffer: reject */
     }
 
-    memcpy(e->buf + frag_off_bytes, data, data_len);
+    uint16_t frag_end = frag_off_bytes + data_len;
+
+    /* Overlap-in-fragmentation policy, explicitly stated rather than
+     * left as an accidental byproduct of an unconditional memcpy
+     * (which is what this used to be — a real, previously-documented
+     * gap, the same evasion class as TCP overlap already handles
+     * deliberately elsewhere in this file): "first data wins". Only
+     * write into byte ranges the CURRENT hole list still shows as
+     * genuinely uncovered — a byte a prior fragment already filled
+     * is never overwritten by a later, overlapping fragment,
+     * regardless of arrival order beyond the first. Matches this
+     * project's TCP overlap policy's own stated choice (first-wins,
+     * classic BSD stack behavior) for consistency, though — same
+     * caveat already stated for TCP — this is a choice, not a
+     * neutral default; different real endpoints resolve fragment
+     * overlaps differently, and a DPI engine that doesn't match its
+     * protected hosts' actual OS can still be evaded via crafted
+     * overlaps either way. */
+    for (int i = 0; i < e->n_holes; i++) {
+        uint16_t hole_start = e->holes[i].start;
+        uint16_t hole_end = e->holes[i].end;
+        uint16_t write_start = frag_off_bytes > hole_start ? frag_off_bytes : hole_start;
+        uint16_t write_end = frag_end < hole_end ? frag_end : hole_end;
+        if (write_start < write_end) {
+            memcpy(e->buf + write_start, data + (write_start - frag_off_bytes),
+                   write_end - write_start);
+        }
+    }
 
     if (!more_fragments) {
         e->total_len = frag_off_bytes + data_len;
     }
 
-    uint16_t frag_end = frag_off_bytes + data_len;
     bool complete = frag_holes_update(e->holes, &e->n_holes, frag_off_bytes,
                                        frag_end, e->total_len);
     if (complete) {
